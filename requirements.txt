@@ -1,0 +1,22 @@
+# Sprint 1 - DataOps foundation
+pandas>=2.2
+numpy>=1.26
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+yfinance>=0.2.40
+python-dotenv>=1.0
+
+# Sprint 2-3 - RLOps (install when you reach these sprints)
+# stable-baselines3>=2.3
+# finrl
+# torch
+# mlflow>=2.17
+
+# Sprint 4 - Serving & orchestration
+# fastapi>=0.110
+# uvicorn[standard]>=0.29
+# prefect>=3.0
+# evidently>=0.4
+
+# Development
+pytest>=8.0

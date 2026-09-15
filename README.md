@@ -1,9 +1,9 @@
 # ⚡ MLOps Continuous Training Pipeline — Energy Markets RL Agent
 
-> **Final Year Undergraduate Thesis Project**
-> Caleb Kipchirchir · 169391 · ICS 4C
-> Strathmore University, School of Computing and Engineering Sciences · Nairobi, Kenya
-> Supervisor: Mr. Allan Vikiru
+> **Final Year Undergraduate Thesis Project**  
+> Caleb Kipchirchir · 169391 · ICS 4C  
+> Strathmore University, School of Computing and Engineering Sciences · Nairobi, Kenya  
+> Supervisor: Mr. Allan Vikiru  
 
 ---
 
@@ -14,11 +14,11 @@
 | Chapter 1 | Introduction & Problem Statement | ✅ Complete |
 | Chapter 2 | Literature Review | ✅ Complete |
 | Chapter 3 | Methodology & System Design | ✅ Complete |
-| Chapter 4 | System Implementation | 🔄 In Progress |
+| Chapter 4 | System Implementation | 🔄 In Progress (Sprint 1 Complete) |
 | Chapter 5 | Results, Testing & Evaluation | ⏳ Awaiting Chapter 4 |
 
-> **Proposal Defence:** Completed — June 2026
-> **Final Submission Target:** January 2027
+> **Proposal Defence:** Completed — June 2026  
+> **Final Submission Target:** January 2027  
 
 ---
 
@@ -52,17 +52,19 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 
 ### Architecture Layers
 
-| Layer | Technology | Function |
-|-------|-----------|---------|
-| **DataOps** | `yfinance` + PostgreSQL | Programmatic ingestion, rolling Z-score normalization, ACID-compliant time-series storage |
-| **RLOps / Intelligence** | FinRL + Stable Baselines3 | MDP environment, PPO agent training, policy updates |
-| **Serving** | FastAPI (ASGI) | Stateless async inference gateway; non-blocking background retraining |
-| **Presentation** | React.js SPA | Real-time portfolio telemetry, Sharpe Ratio monitoring, trading activity logs |
-| **CT Orchestrator** | Python (custom) | Monitors live Sharpe Ratio; triggers background retrain + redeploy on drift detection |
+| Layer | Responsibility | Technology | Package | Status |
+|---|---|---|---|---|
+| **DataOps** | Ingest, clean, enrich and persist market data | `yfinance` + PostgreSQL + SQLAlchemy | `src/dataops` | ✅ Sprint 1 Complete |
+| **RLOps** | MDP environment, PPO agent, model registry | FinRL + Stable Baselines3 + MLflow | `src/rlops` | 🔄 Sprint 2 & 3 |
+| **Orchestration** | Drift detection, continuous training cycle | Python (custom) | `src/orchestration` | ⏳ Sprint 4 |
+| **Serving** | Inference API, volatility fail-safe | FastAPI (ASGI) | `src/serving` | ⏳ Sprint 4 |
+| **Presentation** | Real-time telemetry dashboard | React.js SPA | `frontend/` | ⏳ Sprint 4 |
+
+Dependencies flow one way only — orchestration toward data and model concerns — with no cycles (NFR-06).
 
 ---
 
-## 🤖 The RL Agent
+## 🤖 The RL Agent & Universe
 
 - **Algorithm:** Proximal Policy Optimization (PPO) via Stable Baselines3
 - **Environment:** FinRL (OpenAI Gym–compatible MDP over energy equities)
@@ -74,7 +76,7 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 ### Target Equities
 
 | Ticker | Company | Exchange |
-|--------|---------|---------|
+|---|---|---|
 | XOM | ExxonMobil | NYSE |
 | CVX | Chevron | NYSE |
 | SHEL | Shell | NYSE |
@@ -89,6 +91,10 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 mlops-energy-trader/
 │
 ├── README.md
+├── requirements.txt
+├── docker-compose.yml
+├── .env.example
+├── .gitignore
 │
 ├── docs/
 │   ├── proposal/
@@ -100,49 +106,128 @@ mlops-energy-trader/
 │       ├── activity_diagram.md
 │       └── system_architecture_diagram.md
 │
-├── src/
-│   ├── dataops/          # Sprint 1 — ETL pipeline (yfinance → PostgreSQL)
-│   ├── rlops/            # Sprint 2 & 3 — FinRL env + PPO agent training
-│   ├── serving/          # Sprint 4 — FastAPI inference + CT orchestrator
-│   └── dashboard/        # Sprint 4 — React.js visualization frontend
+├── scripts/
+│   └── run_ingestion.py      # CLI runner for data ingestion pipeline
 │
-└── tests/                # Unit + integration tests (walk-forward backtesting)
+├── src/
+│   ├── config.py             # Database and project settings
+│   ├── dataops/              # Sprint 1 — ETL pipeline (yfinance → PostgreSQL)
+│   │   ├── ingestion.py
+│   │   ├── processing.py
+│   │   ├── models.py
+│   │   └── repository.py
+│   ├── rlops/                # Sprint 2 & 3 — FinRL env + PPO agent training
+│   ├── orchestration/        # Continuous Training loop & drift detection
+│   └── serving/              # Sprint 4 — FastAPI inference + CT orchestrator
+│
+└── tests/                    # Unit + integration tests
+    ├── test_processing.py
+    └── test_repository.py
 ```
 
 ---
 
-## 🗓️ Development Sprints (Agile)
+## 🚀 Setup & Installation
 
-| Sprint | Focus | Target |
-|--------|-------|--------|
-| Sprint 1 | DataOps Foundation — yfinance scrapers + PostgreSQL schema | Aug 2026 |
-| Sprint 2 | FinRL Environment Configuration — MDP state/action space | Sep 2026 |
-| Sprint 3 | PPO Agent Training + Risk-Averse Reward Engineering | Oct 2026 |
-| Sprint 4 | FastAPI Deployment + React Dashboard + CT Loop | Nov 2026 |
+Requires Python 3.11+ and Docker Desktop.
+
+```bash
+git clone https://github.com/C-Sawe/mlops-energy-trader.git
+cd mlops-energy-trader
+
+python3 -m venv mlops-env
+source mlops-env/bin/activate          # Windows: mlops-env\Scripts\activate
+pip install -r requirements.txt
+
+cp .env.example .env                   # edit credentials if needed
+docker compose up -d postgres          # spin up PostgreSQL container
+```
+
+On Apple Silicon, install the MPS-enabled PyTorch build when running Sprint 3; set `device="mps"` on the PPO model.
+
+---
+
+## 💻 Usage
+
+```bash
+# Fetch, enrich and persist the configured universe
+python scripts/run_ingestion.py --start 2015-01-01 --end 2025-12-31
+
+# Transform only, without writing to the database
+python scripts/run_ingestion.py --start 2024-01-01 --end 2024-03-01 --dry-run
+
+# A single ticker
+python scripts/run_ingestion.py --tickers XOM --start 2024-01-01 --end 2024-06-01
+```
+
+### Running Tests
+
+```bash
+python -m pytest tests/ -v
+```
+
+The test suite uses deterministic synthetic data and in-memory SQLite, so it requires neither a network connection nor a running database.
+
+---
+
+## ⚙️ Data Pipeline (Sprint 1 Implementation)
+
+`build_feature_frame()` applies transformations in a strict, fixed order to prevent look-ahead bias:
+
+1. **Corporate action adjustment** (DR-03) — before indicators, because an SMA computed across an unadjusted split is meaningless.
+2. **Imputation** (DR-04) — forward-fill only, every filled row flagged `is_imputed`. Leading gaps are dropped rather than back-filled.
+3. **Indicators** (FR-03) — SMA_20, and RSI_14 using Wilder's exponential smoothing rather than a simple rolling mean.
+4. **VIX join** (FR-03) — market-wide, merged on date and forward-filled.
+5. **Rolling Z-score** (FR-04, DR-07) — backward-looking windows only.
+
+### Look-Ahead Leakage Prevention
+
+The most consequential failure mode in financial ML is silent look-ahead leakage:
+- `test_zscore_uses_only_backward_looking_window` mutates a future observation and asserts that no past standardized value changes.
+- `partition_chronological()` raises rather than warns when the evaluation window does not begin strictly after the training window ends. The `model_run` table enforces this rule as a database `CHECK` constraint (`ck_eval_after_train`).
+
+---
+
+## 📋 Requirement Traceability
+
+| Requirement | Implementation | Test |
+|---|---|---|
+| FR-01 | `ingestion.fetch_market_data` | *(live, manual)* |
+| FR-02 | `processing.impute_missing`, `adjust_corporate_actions` | `test_missing_rows_are_forward_filled_and_flagged` |
+| FR-03 | `processing.compute_indicators`, `attach_vix` | `test_sma_matches_manual_calculation`, `test_rsi_bounded_and_correct_on_monotonic_series` |
+| FR-04 | `processing.normalize_rolling` | `test_zscore_uses_only_backward_looking_window` |
+| FR-05 | `repository.MarketRepository.persist` | `test_persist_and_reload_roundtrip` |
+| DR-03 | `processing.adjust_corporate_actions` | `test_corporate_action_adjustment_preserves_ratios` |
+| DR-04 | `is_imputed` column | `test_imputation_flag_survives_persistence` |
+| DR-05 | composite PK on `market_observation` | `test_reingestion_is_idempotent_not_duplicating` |
+| DR-06 | `partition_chronological`, `ck_eval_after_train` | `test_partition_rejects_overlapping_windows`, `test_model_run_rejects_evaluation_overlapping_training` |
+| DR-07 | backward-looking `rolling()` | `test_zscore_uses_only_backward_looking_window` |
+| IR-01 | `_fetch_one` exponential backoff | *(live, manual)* |
+| IR-02 | `strict=True` aborts whole batch | *(live, manual)* |
+| IR-03 | `config.DatabaseConfig` | — |
+| NFR-07 | `trading_decision → model_version → model_run` | `test_decision_traces_back_to_run_and_partition` |
+| NFR-10 | `DatabaseConfig.__repr__` masks password | — |
+
+---
+
+## 🗓️ Development Sprints & Roadmap
+
+- [x] **Sprint 1 — DataOps Foundation (Complete).** Ingestion, enrichment, persistence, schema, tests.
+- [ ] **Sprint 2 — FinRL Environment.** State space, continuous action space, drawdown-penalized reward.
+- [ ] **Sprint 3 — Training & Model Registry.** PPO on MPS, walk-forward validation, MLflow.
+- [ ] **Sprint 4 — Serving & CT Loop.** FastAPI, VIX fail-safe, React dashboard, orchestrator.
 
 ---
 
 ## 📐 UML Diagrams
 
-All system analysis and design diagrams are documented in [`docs/diagrams/`](./docs/diagrams/).
+All system analysis and design diagrams are documented in [`docs/diagrams/`](./docs/diagrams/):
 
 - [Use Case Diagram](./docs/diagrams/use_case_diagram.md)
 - [Class Diagram](./docs/diagrams/class_diagram.md)
 - [Sequence Diagram](./docs/diagrams/sequence_diagram.md)
 - [Activity Diagram](./docs/diagrams/activity_diagram.md)
 - [System Architecture Diagram](./docs/diagrams/system_architecture_diagram.md)
-
----
-
-## 🔑 Key Concepts
-
-**Alpha Decay** — The erosion of a trading algorithm's excess returns as markets adapt to its signals (Meng & Chen, 2026).
-
-**Deployment Chasm** — The gap between a well-trained academic ML prototype and a production-grade, continuously adapting live system (Xia et al., 2026).
-
-**Continuous Training (CT)** — An automated MLOps pattern where model drift triggers background retraining and redeployment without human intervention.
-
-**Walk-Forward Validation** — Time-series cross-validation using chronological rolling windows to prevent look-ahead bias; replaces standard k-fold CV.
 
 ---
 
@@ -154,7 +239,7 @@ All system analysis and design diagrams are documented in [`docs/diagrams/`](./d
 - **Supervisor:** Mr. Allan Vikiru
 - **Student:** Caleb Kipchirchir (Admission No. 169391)
 - **Contact:** caleb.Kipchirchir@strathmore.edu
-- **Turnitin Similarity:** 19% (bibliography and quoted text excluded)
+- **Proposal Document:** [`docs/proposal/Kipchirchir_169391_Proposal_Vikiru.pdf`](./docs/proposal/Kipchirchir_169391_Proposal_Vikiru.pdf)
 
 ---
 

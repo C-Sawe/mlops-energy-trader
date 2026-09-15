@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mlops_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mlops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlops}
+      POSTGRES_DB: ${POSTGRES_DB:-mlops_trading}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mlops}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.17.0
+    container_name: mlops_mlflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlruns:/mlruns
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-mlops}@postgres:5432/${POSTGRES_DB:-mlops_trading}
+      --default-artifact-root /mlruns
+
+volumes:
+  pgdata:
+  mlruns:
