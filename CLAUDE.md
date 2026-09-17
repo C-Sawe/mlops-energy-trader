@@ -376,12 +376,27 @@ into the past), which is always safe.
 The proposal names FinRL. **It does work.** An earlier claim in this project
 that it was broken was wrong and has been corrected.
 
-`StockTradingEnv` imports successfully once six further packages are installed:
-`alpaca_trade_api`, `exchange_calendars`, `pytz`, `stockstats`, `wrds`,
-`yfinance`. It is Gymnasium-based, 538 lines, and already models transaction
-costs (`buy_cost_pct`) and a `turbulence_threshold` close in spirit to the VIX
-fail-safe. The drawdown penalty *can* be added by post-processing
-`super().step()` in a subclass — this was verified working.
+`StockTradingEnv` imports successfully once further packages are installed.
+The list of six in the previous version of this file (`alpaca_trade_api`,
+`exchange_calendars`, `pytz`, `stockstats`, `wrds`, `yfinance`) turned out to
+be incomplete for the current PyPI release (FinRL 0.3.7, 2026-09-17): the
+actual chain that fires just from `import finrl` — it eagerly imports
+`finrl.test`, which imports the env module directly — needed `gymnasium`,
+`stable-baselines3`, and `matplotlib` as well, none of which are in that
+original list. `stockstats` was needed; `alpaca_trade_api`,
+`exchange_calendars`, `pytz`, `wrds`, `yfinance` were not, at least for
+reaching `StockTradingEnv` — they may matter for FinRL's live-data
+connectors, which nothing here touches. It is Gymnasium-based, 557 lines in
+this release, and already models transaction costs (`buy_cost_pct`) and a
+`turbulence_threshold` close in spirit to the VIX fail-safe. The drawdown
+penalty *can* be added by post-processing `super().step()` in a subclass —
+this was verified working.
+
+Installed into an isolated venv, not this project's own `.venv` — FinRL's
+dependency footprint is dated enough that pinning it alongside Sprint 1/2's
+numpy 2.x/pandas 2.x/gymnasium 1.x stack risked real conflict for a
+one-off validation experiment. See `scripts/finrl_crosscheck.py`'s docstring
+for the exact install steps if this needs re-running.
 
 It is not used as the primary environment for two reasons:
 
@@ -396,22 +411,47 @@ It is not used as the primary environment for two reasons:
 under test (30 tests across `test_environment.py` and `test_baselines.py`),
 passing Stable Baselines3's `check_env` (`test_conforms_to_gymnasium_api`).
 
-**Pending validation experiment.** Run one partition through both environments
-with the drawdown penalty disabled, so both reduce to plain PnL. Closely
-matching equity curves would corroborate this environment's accounting against
-a published implementation — turning the deviation from a liability into
-evidence of rigour. This is worth doing before the defence. Still not done —
-Sprint 2 built and tested `TradingEnvironment` on its own terms; it did not
-run this cross-check.
+**Validation experiment — done, 2026-09-17 (`scripts/finrl_crosscheck.py`).**
+Both environments hold the same fixed 100-share position in each of the
+5 tickers, bought on the same calendar date at the same (synthetic) price,
+with transaction costs and the drawdown penalty both disabled in both, so
+each reduces to plain PnL against an identical holding across a 222-day
+aligned window. Result:
+
+| | ours | FinRL |
+|---|---|---|
+| initial equity | 100,000.0000 | 100,000.0000 |
+| final equity | 102,108.6627 | 102,108.6627 |
+
+Max absolute difference **$0.00007237** on a ~$100–102K portfolio (max
+relative difference ~7×10⁻¹⁰), correlation **1.000000000000**. That residual
+is consistent with float32 action rounding on this project's side (the
+initial target weight is cast to float32 before `step()` upcasts it back to
+float64), not a real accounting divergence. This corroborates
+`TradingEnvironment`'s valuation and return accounting against FinRL's
+independently published implementation — the §8 deviation is now backed by
+evidence, not just a design justification. It does *not* validate the
+transaction-cost or reward mechanics specifically (both were disabled to
+isolate accounting), and it used single-step buy-and-hold, not a trading
+policy — see §7's transaction-cost note for what *is* tested there.
+
+One FinRL implementation detail this surfaced, worth knowing before anyone
+tries to reuse `StockTradingEnv` with `tech_indicator_list=[]`:
+`_buy_stock`/`_sell_stock` hard-code a "disabled" flag at
+`state[index + 2*stock_dim + 1]`, i.e. inside the first technical
+indicator's slot, regardless of whether indicators are otherwise used. An
+empty `tech_indicator_list` leaves that slot out of the state vector
+entirely, and every buy or sell raises `IndexError`. The workaround: supply
+one always-`False` dummy column, e.g. `tech_indicator_list=["disable"]`.
 
 ---
 
 ## 9. Verified empirical findings
 
-Measured, not assumed. Cite these rather than re-deriving them. Everything
-below this point in the section predates Sprint 2 and concerns Sprint 3
-(training), which has not started — none of it has been re-verified against
-this checkout. See §3 for why that distinction matters.
+Measured, not assumed. Cite these rather than re-deriving them. The items
+below predate Sprint 2 and concern Sprint 3 (training, not yet started) —
+most have now been re-verified against this checkout (dated where so); the
+ones that haven't are marked explicitly.
 
 **The policy network is tiny.** For 5 tickers × 8 features + positions + cash =
 46-dimensional observation, SB3's default `MlpPolicy` (two 64-unit hidden
@@ -420,22 +460,105 @@ layers for each of π and V) is **14,731 parameters, 57.5 KB**. ResNet-50 has
 `TradingEnvironment.observation_space` itself
 (`test_observation_and_action_space_shapes`), not just asserted.
 
-**Training is CPU-viable.** 875 steps/sec on a weak cloud CPU → ~500k timesteps
-in under 10 minutes. A full Sprint 3 run on the M5 will be faster.
+**MPS vs CPU, measured on the actual M5 (2026-09-17).**
+`scripts/benchmark_device.py` runs identical `PPO("MlpPolicy", ...).learn()`
+calls against `TradingEnvironment` on the real 5-ticker/46-dim observation
+space, on both devices, with an untimed 2048-step warm-up before each timed
+measurement (MPS pays a one-time kernel-compilation and device-transfer setup
+cost on first use that would otherwise be charged to the measurement, not to
+steady-state throughput). Two independent seeds, at 20,000 measured
+timesteps each:
 
-**`device="mps"` may be slower than CPU.** PPO alternates between rollout
-collection (thousands of forward passes on a *single* observation) and small
-minibatch updates. At 14k parameters, CPU↔GPU transfer overhead dominates the
-arithmetic. **Benchmark both on the M5 and keep whichever wins** — do not
-assume the GPU helps. A GPU would only pay off with `CnnPolicy` on image
-inputs or 50+ parallel environments.
+| device | seed 0 | seed 1 |
+|---|---|---|
+| cpu | 5,677 steps/sec | 5,718 steps/sec |
+| mps | 452.6 steps/sec | 438.5 steps/sec |
+
+**CPU wins by roughly 12–13×.** This confirms the hypothesis this section
+used to only speculate about: PPO alternates rollout collection (thousands of
+forward passes on a single observation) with small minibatch updates, and at
+14.7K parameters the CPU↔GPU transfer overhead dominates whatever the
+arithmetic would have gained from the GPU. **Use `device="cpu"` for Sprint
+3** — do not pass `device="mps"` to `PPO(...)`, it is not close. A GPU would
+only pay off with `CnnPolicy` on image inputs or with 50+ parallel
+environments, neither of which applies here.
+
+**Training is CPU-viable — now confirmed at full scale, not extrapolated.**
+500,000 timesteps ran in **87.0 seconds** (5,750 steps/sec) on the actual M5
+CPU, `scripts/benchmark_device.py --timesteps 500000`. The earlier "875
+steps/sec on a weak cloud CPU → under 10 minutes" figure was itself a
+measurement, just not one taken on this hardware — the M5 turns out to be
+about 6.5× faster than that reference point, not merely "faster" as
+previously hedged.
 
 **Colab is not needed** and carries a real cost: a dropped 12-hour session at
-the wrong moment.
+the wrong moment. (Unverified against this checkout — no Colab run has been
+attempted from here; the M5 CPU numbers above make it unnecessary to try.)
 
 **Yahoo Finance is unreachable from cloud containers** (403 on CONNECT,
-gateway policy). It works fine from a local machine. This is why
-`fetch_market_data()` has never been exercised against a real response.
+gateway policy). It works fine from a local machine.
+
+**Live ingestion verified against a real response (2026-09-17, this
+checkout).** `fetch_market_data()` had never been exercised against a real
+yfinance response before this. It now has, for the full 5-ticker universe
+plus VIX over 2024-01-01→2024-06-01, with `--dry-run` and by persisting the
+real fetched frame through the ORM into SQLite (Docker Desktop was not
+running locally, so this could not be run against actual PostgreSQL — see
+the gap that leaves, below). Findings:
+- **yfinance 1.7.0 returns MultiIndex columns even for a single-ticker
+  download** — `[('Adj Close', 'XOM'), ('Close', 'XOM'), ...]`, not the flat
+  frame the module's docstring implies is the single-ticker case. This is
+  more aggressive than the "changes periodically" warning anticipated, but
+  `_normalise_yf_frame()`'s existing `isinstance(df.columns, pd.MultiIndex)`
+  branch already handles it correctly — `get_level_values(0)` drops the
+  ticker level, which is safe here specifically *because* `_fetch_one` only
+  ever requests one symbol at a time (`fetch_market_data` loops per ticker
+  rather than batching). Flattening that same way on a genuine multi-ticker
+  batch download would silently collide two tickers' `Close` columns; that
+  path is not exercised anywhere in the current code, so it stayed latent
+  rather than becoming a bug — worth remembering if a future change ever
+  batches the download.
+- **`Adj Close` is returned** with `auto_adjust=False`, for both equities and
+  `^VIX` — confirmed non-trivially different from `Close` for XOM (dividend
+  drift over ~2.5 years from the 2024 dates to today), and correctly equal to
+  `Close` for `^VIX` (no dividends/splits on an index).
+  `adjust_corporate_actions()` consumed it without changes.
+- **`^VIX` returns `Volume=0`**, not a missing column — `_normalise_yf_frame`'s
+  required-column check passes without special-casing this.
+- Over 2024-01-01→2024-06-01, the real universe had **0 imputed rows** — all
+  five tickers traded on the same calendar for this window — and **230 of 525
+  rows** had a complete normalised feature vector, exactly matching
+  `5 tickers × (105 − 59) = 230` from the 60-day zscore warm-up. The math
+  checked out against real data, not just synthetic.
+- The persisted-and-reloaded frame round-tripped through
+  `MarketRepository.persist` / `load_partition` / `latest_state` correctly —
+  dtypes, NaN handling, and numeric precision all held up against real
+  values, not just the synthetic fixtures the test suite uses.
+
+**That gap is now closed too (2026-09-17, same session).** Started Docker
+Desktop, brought up `postgres` via `docker compose up -d postgres`, and ran
+`scripts/run_ingestion.py --start 2024-01-01 --end 2024-06-01` for real (no
+`--dry-run`) against it — the same 525-row universe as above, this time
+landing in actual PostgreSQL rather than SQLite. Also confirmed, against the
+real container, the two things `tests/test_repository.py` explicitly flags as
+unverified on SQLite:
+- **Idempotency (DR-05).** Running the exact same ingestion command a second
+  time left the store at 525 rows, not 1050 — `persist()`'s upsert behaviour
+  holds on Postgres.
+- **Both CHECK constraints actually fire.** Manually inserting a `ModelRun`
+  with `eval_start <= train_end` raised `IntegrityError` (`ck_eval_after_train`,
+  DR-06/I1); inserting a `MarketObservation` with `high_price < low_price`
+  raised `IntegrityError` (`ck_high_ge_low`) — both roundly rejected rather
+  than silently accepted, and the observation count stayed at 525 after each
+  rollback.
+
+`load_partition`, `latest_state`, and `scripts/run_baselines.py` were all
+re-run against this real Postgres-backed store and produced sane output
+(buy-and-hold Sharpe 1.99, random policy losing money to cost drag over the
+2024-04-01→2024-06-01 eval slice). The persistence path is genuinely closed
+now, not just on SQLite. Docker Desktop + the `mlops_postgres` container were
+left running locally after this — `docker compose down` to stop them if
+they're not wanted between sessions.
 
 ---
 
@@ -497,28 +620,20 @@ Also report: walk-forward validation across distinct market regimes (Section
 
 ## 12. Next tasks, in order
 
-**1. Verify live ingestion — do this first, it blocks everything.**
+**1. ~~Verify live ingestion~~ — done 2026-09-17, see §9.** No code change was
+needed: `_normalise_yf_frame()` already handled the real (MultiIndex, even
+for a single ticker) response shape correctly, and persistence — including
+both CHECK constraints and idempotency — is now confirmed against real
+PostgreSQL, not just SQLite. `mlops_postgres` is currently running locally
+with 525 real rows in it from this check (`docker compose down` to stop it).
 
-```bash
-python scripts/run_ingestion.py --tickers XOM --start 2024-01-01 --end 2024-06-01 --dry-run
-```
+**2. ~~Benchmark MPS vs CPU~~ — done 2026-09-17, see §9.** CPU wins by
+~12–13× on this hardware. Use `device="cpu"` when `src/rlops/agent.py` is
+built in Sprint 3 — this is now a settled decision, not an open question.
 
-`--dry-run` fetches and transforms without writing. `_normalise_yf_frame()` was
-written to spec in an environment where Yahoo was firewalled and has **never
-seen a real response**. Expect it to need adjustment: yfinance changes its
-response shape periodically — notably the `auto_adjust` default and whether
-`Adj Close` is returned at all. The code requests `auto_adjust=False`
-specifically so DR-03 can apply the adjustment factor itself. Also handle the
-MultiIndex-vs-flat column difference between multi- and single-ticker
-downloads.
-
-**2. Benchmark MPS vs CPU** on the M5 over an identical `learn()` call and
-record both numbers for Chapter 5.
-
-**3. Run the FinRL cross-check (§8's pending validation experiment)**, now
-that `TradingEnvironment` exists to compare against. This is cheap relative to
-Sprint 3 and strengthens the §8 deviation before more code is built on top of
-`TradingEnvironment`.
+**3. ~~Run the FinRL cross-check~~ — done 2026-09-17, see §8.** Max absolute
+difference $0.00007 on a ~$100K portfolio, correlation 1.000000000000. The §8
+deviation is now backed by a cross-check, not just a design justification.
 
 **4. Sprint 3 — training and registry.**
 - `src/rlops/agent.py` — PPO wrapper over Stable Baselines3
