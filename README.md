@@ -14,7 +14,7 @@
 | Chapter 1 | Introduction & Problem Statement | ✅ Complete |
 | Chapter 2 | Literature Review | ✅ Complete |
 | Chapter 3 | Methodology & System Design | ✅ Complete |
-| Chapter 4 | System Implementation | 🔄 In Progress (Sprints 1–3 Complete) |
+| Chapter 4 | System Implementation | 🔄 In Progress (Sprints 1–4 Complete) |
 | Chapter 5 | Results, Testing & Evaluation | ⏳ Awaiting Chapter 4 |
 
 > **Proposal Defence:** Completed — June 2026  
@@ -56,9 +56,9 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 |---|---|---|---|---|
 | **DataOps** | Ingest, clean, enrich and persist market data | `yfinance` + PostgreSQL + SQLAlchemy | `src/dataops` | ✅ Sprint 1 Complete |
 | **RLOps** | MDP environment, baseline policies, PPO agent, registry | Gymnasium + Stable Baselines3 + MLflow | `src/rlops` | ✅ Sprints 2 & 3 Complete |
-| **Orchestration** | Performance metrics, drift detection, CT cycle | Python (custom) | `src/orchestration` | ✅ Sprint 2 (metrics); ⏳ Sprint 4 (CT loop) |
-| **Serving** | Inference API, volatility fail-safe | FastAPI (ASGI) | `src/serving` | ⏳ Sprint 4 |
-| **Presentation** | Real-time telemetry dashboard | React.js SPA | `frontend/` | ⏳ Sprint 4 |
+| **Orchestration** | Performance metrics, drift detection, CT cycle | Python (custom) | `src/orchestration` | ✅ Sprints 2 & 4 Complete |
+| **Serving** | Inference API, volatility fail-safe | FastAPI (ASGI) | `src/serving` | ✅ Sprint 4 Complete |
+| **Presentation** | Real-time telemetry dashboard | React + Tailwind + Framer Motion | `frontend/` | ✅ Sprint 4 Complete |
 
 Dependencies flow one way only — orchestration toward data and model concerns — with no cycles (NFR-06).
 
@@ -130,29 +130,42 @@ mlops-energy-trader/
 │   └── train_agent.py        # Walk-forward PPO training + seed sweep (Sprint 3)
 │
 ├── src/
-│   ├── config.py             # Database, risk and environment settings
+│   ├── config.py             # Database, risk, environment and serving settings
 │   ├── dataops/              # Sprint 1 — ETL pipeline (yfinance → PostgreSQL)
 │   │   ├── ingestion.py
 │   │   ├── processing.py     # + walk_forward_splits (Sprint 3)
 │   │   ├── models.py
-│   │   └── repository.py
+│   │   └── repository.py     # + decisions/snapshots/versions (Sprint 4)
 │   ├── rlops/                # Sprint 2 — MDP environment + baselines
 │   │   ├── environment.py
 │   │   ├── baselines.py
 │   │   ├── agent.py          # PPOAgent wrapper over SB3 (Sprint 3)
 │   │   └── registry.py       # MLflow logging + model_version registration (Sprint 3)
-│   ├── orchestration/        # Sprint 2 — metrics; Sprint 4 — CT loop & drift detection
-│   │   └── evaluator.py
-│   └── serving/              # Sprint 4 — FastAPI inference + CT orchestrator
+│   ├── orchestration/
+│   │   ├── evaluator.py      # Sprint 2 — Sharpe, drawdown, deflated Sharpe
+│   │   └── ct_orchestrator.py  # Sprint 4 — drift trigger, non-blocking retrain, acceptance gate
+│   └── serving/               # Sprint 4 — inference gateway
+│       ├── schemas.py
+│       ├── inference.py      # fail-safe, action mapping, hot reload
+│       └── api.py            # FastAPI app: /predict /telemetry /decisions /ct-status
 │
-└── tests/                    # Unit + integration tests
+├── frontend/                  # Sprint 4 — React + TS + Tailwind + Framer Motion dashboard
+│   └── src/
+│       ├── App.tsx
+│       ├── components/       # GlassCard, StatusPill, PerformanceCharts, DecisionLog, ...
+│       └── lib/               # api.ts, usePolling.ts
+│
+└── tests/                    # Unit + integration tests (backend only — see Testing note below)
     ├── test_processing.py
     ├── test_repository.py
     ├── test_environment.py
     ├── test_baselines.py
     ├── test_evaluator.py
     ├── test_agent.py
-    └── test_registry.py
+    ├── test_registry.py
+    ├── test_inference.py
+    ├── test_ct_orchestrator.py
+    └── test_api.py
 ```
 
 ---
@@ -198,13 +211,47 @@ python scripts/train_agent.py
 python scripts/train_agent.py --timesteps 50000 --seeds 5
 ```
 
+### Running the Dashboard (Sprint 4)
+
+Backend (FastAPI):
+
+```bash
+uvicorn src.serving.api:app --host 0.0.0.0 --port 8000
+```
+
+Requires a populated database and at least one promoted `model_version` for
+`/predict` to do anything (otherwise it returns `503`) — run
+`scripts/run_ingestion.py` then `scripts/train_agent.py` first. The CT
+orchestrator's background scheduler (FR-13) runs automatically every
+`CT_EVALUATION_INTERVAL_SECONDS` (default 300); trigger one evaluation
+on demand instead of waiting via `POST /ct/evaluate`.
+
+Frontend (Vite dev server, proxies `/api` to `localhost:8000`):
+
+```bash
+cd frontend
+npm install
+npm run dev        # http://localhost:5173
+```
+
+Set `VITE_API_BEARER_TOKEN` in the frontend's environment if
+`API_BEARER_TOKEN` is set for the backend — see `src/config.py`'s
+`ServingConfig`. Neither is set by default (single-user local operation,
+CLAUDE.md §12).
+
 ### Running Tests
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -v       # backend
+cd frontend && npm run lint      # frontend type-check (no test suite yet)
 ```
 
-The test suite uses deterministic synthetic data and in-memory SQLite, so it requires neither a network connection nor a running database.
+The backend test suite uses deterministic synthetic data and (mostly)
+in-memory SQLite, so it requires neither a network connection nor a running
+database. The CT orchestrator's tests are the one exception — they use a
+temp-file-backed SQLite database instead, because `:memory:` isn't shared
+across the background thread the orchestrator actually spawns (see
+`CLAUDE.md` §7).
 
 ---
 
@@ -254,6 +301,20 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 | FR-08 | `ModelRegistry.log_run` | `test_log_run_records_hyperparameters_in_mlflow` |
 | FR-09 | `ModelRegistry.register_version` | `test_register_version_links_to_its_run` |
 | DR-08 | `ModelRegistry.log_run` → `model_run` partition columns | `test_log_run_persists_exact_partition_boundaries` |
+| FR-10 | `serving.api.predict` | `test_predict_succeeds_with_an_active_model_and_normal_vix` |
+| FR-11 | `InferenceService._discretize` | `test_discretize_maps_weight_to_action_at_configured_thresholds` |
+| FR-12 | `InferenceService.predict` (fail-safe before inference) | `test_failsafe_triggers_above_vix_threshold` |
+| FR-13 | `CTOrchestrator.evaluate` | `test_evaluate_persists_snapshots_and_computes_rolling_sharpe` |
+| FR-14 | `CTOrchestrator.evaluate` → `_trigger_retrain` | `test_evaluate_triggers_retrain_when_no_incumbent` |
+| FR-15 | `CTOrchestrator._retrain_and_maybe_promote` (own thread) | `test_evaluate_is_non_blocking` |
+| FR-16 | `InferenceService.reload` | `test_reload_picks_up_a_newly_promoted_version` |
+| FR-17 | promote-vs-retain comparison in `_retrain_and_maybe_promote` | `test_retrain_retains_incumbent_when_candidate_does_not_beat_it` |
+| FR-18 | `MarketRepository.list_snapshots` → `/telemetry` | `test_telemetry_returns_recorded_snapshots` |
+| FR-19 | `MarketRepository.list_decisions` → `/decisions` | `test_decisions_endpoint_paginates` |
+| FR-20 | `CTOrchestrator.status` → `/ct-status` | `test_ct_status_reflects_active_version` |
+| I5 | fail-safe lives in `InferenceService`, not the agent | `test_failsafe_does_not_trigger_below_threshold` |
+| NFR-08 | `PredictRequest` field validation | `test_predict_rejects_positions_missing_a_ticker` |
+| NFR-11 | fail-safe decisions logged with `vix_at_decision` | `test_failsafe_decision_is_logged_with_its_trigger_value` |
 
 ---
 
@@ -262,7 +323,7 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 - [x] **Sprint 1 — DataOps Foundation (Complete).** Ingestion, enrichment, persistence, schema, tests.
 - [x] **Sprint 2 — Trading Environment (Complete).** Gymnasium MDP, continuous action space, drawdown-incremented reward, baseline policies, evaluation metrics.
 - [x] **Sprint 3 — Training & Model Registry (Complete).** PPO on CPU (benchmarked ~12–13× faster than MPS), walk-forward cross-validation with a seed sweep, MLflow logging, `model_version` registration.
-- [ ] **Sprint 4 — Serving & CT Loop.** FastAPI, VIX fail-safe, React dashboard, orchestrator.
+- [x] **Sprint 4 — Serving & CT Loop (Complete).** FastAPI inference gateway with the VIX fail-safe checked before any model call, hot-reloadable model loading, a non-blocking CT orchestrator with a real out-of-sample acceptance gate, and a React + Tailwind + Framer Motion dashboard — verified running against a real trained model, screenshotted in light and dark mode.
 
 ---
 

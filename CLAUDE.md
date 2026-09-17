@@ -86,18 +86,24 @@ These are not code tasks, but they are open and they cost marks:
 | 1 | DataOps — ingestion, features, persistence, schema | **Complete** |
 | 2 | Environment — Gymnasium MDP, metrics, baselines | **Complete** |
 | 3 | Training — PPO, walk-forward validation, MLflow | **Complete** |
-| 4 | Serving — FastAPI, fail-safe, dashboard, CT loop | Not started |
+| 4 | Serving — FastAPI, fail-safe, dashboard, CT loop | **Complete** |
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 72 passing — keep it that way
+python -m pytest tests/ -q     # 107 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
-Branches (all local, none pushed): `main` is the trunk with everything
-merged in; `sprint-1` and `sprint-2` are retroactive markers at each
-sprint's completion commit, kept for reference; `sprint-3` is where Sprint 3
-was actually built, branched off `main` after Sprint 2's verification work
-landed — merge it back to `main` when ready, it hasn't been yet.
+Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
+`sprint-2` are retroactive markers at each sprint's completion commit, kept
+for reference. `sprint-3` **was merged into `main` (fast-forward)** in the
+same local session that built it — Sprint 4's serving layer depends on
+Sprint 3's `agent.py`/`registry.py`, so it had to land on `main` before
+`sprint-4` branched off it. `sprint-4` is where this sprint was built and,
+**as of this checkout, has not been merged to `main`** — the user
+explicitly asked for no further merges without asking first, after the
+sprint-3 merge already happened. Don't merge `sprint-4` (or anything else)
+into `main` without checking first, regardless of what any earlier version
+of this file implied about a normal merge cadence.
 
 Tests use deterministic synthetic data and in-memory SQLite. **No network and
 no database required.** If a test starts needing either, that is a regression
@@ -211,22 +217,52 @@ becoming a mechanism for compounding error.
 
 | ID | Requirement | Characteristic |
 |---|---|---|
-| NFR-01 | ≥95% of inference requests return within **[X] ms** over **[N]** requests | Performance |
-| NFR-02 | Latency degrades by no more than **[X]%** during retraining | Performance |
+| NFR-01 | ≥95% of inference requests return within **20 ms** over **100** requests | Performance |
+| NFR-02 | Latency degrades by no more than **10%** during retraining | Performance |
 | NFR-03 | Serving remains continuously available across a full CT cycle; zero failed requests | Reliability |
-| NFR-04 | Recover to serving within **[X] min** of unplanned termination, no data loss | Reliability |
+| NFR-04 | Recover to serving within **1 min** of unplanned termination, no data loss | Reliability |
 | NFR-05 | A failed retraining cycle leaves the incumbent serving and state consistent | Reliability |
 | NFR-06 | No circular dependencies between packages, verified by static analysis | Maintainability |
 | NFR-07 | Every served model traceable to run, partition boundaries, hyperparameters | Accountability |
 | NFR-08 | Payloads schema-validated; malformed input rejected, not crashed | Security |
-| NFR-09 | Dashboard renders without unbounded memory growth over **[X] h** | Performance |
+| NFR-09 | Dashboard renders without unbounded memory growth over **[X] h** — still unmeasured | Performance |
 | NFR-10 | No credential, key or connection string in source control or logs | Security |
 | NFR-11 | The fail-safe takes precedence over any model output and is logged with its trigger value | Human oversight |
 
-**The bracketed thresholds are deliberately unset.** They must be established
-by measuring a baseline on the target hardware, not asserted in advance. The
-departmental guide is explicit that thresholds must not be invented to make a
-requirement look measurable. Fill them during Sprint 4 and state the basis.
+**The bracketed thresholds were deliberately unset until measured on the
+target hardware** — the departmental guide is explicit that thresholds must
+not be invented to make a requirement look measurable. NFR-01/02/04 are now
+filled in from real measurements on the M5, taken 2026-09-17 via
+`fastapi.testclient.TestClient` against a real `/predict` call chain (real
+SQLite-backed repository, real loaded PPOAgent, real fail-safe check — the
+only thing not real is the HTTP transport itself, which `TestClient` calls
+in-process; a real deployment adds network round-trip on top of these
+numbers, but that's a constant offset, not something specific to this
+service):
+- **NFR-01: p95 = 16.9ms, p99 = 77.1ms, max = 78.3ms over 100 requests** — set
+  at 20ms with headroom over the measured p95, not at the median. The p99
+  tail (~4.5x the p50) is worth watching if this ever needs re-measuring
+  against real Postgres instead of SQLite.
+- **NFR-02: 2.1% p95 degradation while a real background retrain was
+  running** (triggered via `orchestrator._trigger_retrain()`, same code
+  path FR-14 uses) — set at 10% for margin. This is a genuinely good result,
+  not a lenient threshold chosen to pass: `predict()` and the retrain thread
+  touch different model instances and only briefly share
+  `InferenceService`'s lock at the moment of promotion, so FR-15's
+  "continue serving throughout retraining" holds up under actual
+  measurement, not just by design intent.
+- **NFR-04: ~8ms mean, ~11ms max (N=5) to reconstruct `InferenceService`
+  and reload the active model from scratch** — what a fresh process does on
+  startup. Set at 1 minute, which is almost entirely headroom: this number
+  is the *application's* readiness time once the process is actually
+  running again, not the OS/process-manager's crash-to-restart time (e.g.
+  systemd/supervisor restart delay), which is an infrastructure concern
+  outside this service's own code and wasn't part of this measurement.
+- **NFR-09 remains unmeasured** — it requires the dashboard to actually run
+  for hours in a browser, which a backend measurement pass can't produce.
+  Leaving it bracketed is the correct call here, not an oversight: inventing
+  a number to fill the row would be exactly what the departmental guide
+  warns against.
 
 ### Data
 
@@ -260,15 +296,18 @@ presentation ──▶ serving ──▶ rlops ──▶ dataops
 
 ```
 src/dataops/          ingestion · processing (+ walk_forward_splits)   [Sprint 1, 3]
-                      · repository · models
+                      · repository (+ decisions/snapshots/versions)    [Sprint 1, 4]
+                      · models
 src/rlops/            environment · baselines                         [Sprint 2]
                       · agent · registry                              [Sprint 3]
 src/orchestration/    evaluator                                       [Sprint 2]
-src/serving/          (empty)                                         [Sprint 4]
+                      · ct_orchestrator                                [Sprint 4]
+src/serving/          schemas · inference · api                       [Sprint 4]
+frontend/              React + Tailwind + Framer Motion dashboard      [Sprint 4]
 scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
-tests/                72 tests
+tests/                107 tests (backend; frontend has no test suite yet)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -378,6 +417,35 @@ still purely backward-looking (DR-07) and leaks nothing forward. This is
 distinct from DR-06/I1, which is about training never seeing evaluation data —
 here the flow of information is the reverse direction (eval reading further
 into the past), which is always safe.
+
+**`load_partition()` returns a correctly-shaped empty frame, not `pd.DataFrame([])`.**
+Found via the dashboard, not a test: `CTOrchestrator.evaluate()`'s "Force
+Check" button hit a real 500. `pd.DataFrame([])` for a query that matched no
+rows has zero *columns*, not just zero rows, so `normalize_rolling()`'s
+column check failed with "missing required columns" — a confusing error
+that has nothing to do with the actual problem (no market data in the
+requested range, e.g. ingestion hasn't caught up to `as_of` yet). Fixed in
+`MarketRepository.load_partition` to return a frame with the right columns
+and zero rows; `CTOrchestrator.evaluate()` also now checks for this
+explicitly and logs + returns to `SERVING` rather than letting a stale
+ingestion job crash the request that triggered the evaluation. This is a
+recoverable, expected condition (the next scheduled tick likely finds
+data), not a programming error, so it is handled, not raised.
+
+**`sqlite:///:memory:` is not safe across threads — use a file, even in tests.**
+Found writing `tests/test_ct_orchestrator.py`: an in-memory SQLite database
+is not shared across connections, and each new thread that calls
+`repo.session()` can get a genuinely different connection from the pool. The
+CT orchestrator's whole point is a background thread retraining while the
+main thread keeps serving — with `:memory:`, that background thread's
+connection sees a separate, empty database ("no such table:
+market_observation"), not the one the test just seeded. Every CT
+orchestrator test uses a temp-file-backed SQLite DB instead
+(`sqlite:///{tmp_path}/test.db`). This is purely a test-fixture concern —
+real deployments use Postgres or a file, both genuinely shared across
+connections — but it would bite anyone who reached for `:memory:` for "quick
+local testing" of anything that touches threading, which the CT loop
+inherently does.
 
 ---
 
@@ -680,22 +748,60 @@ deviation is now backed by a cross-check, not just a design justification.
   will otherwise leak a stray directory into the repo root on every test
   run — it did, once, before this fix; deleted, not committed).
 
-**5. Sprint 4 — serving and the CT loop.**
-- `src/serving/schemas.py` — Pydantic models (IR-05, NFR-08)
-- `src/serving/inference.py` — action mapping (FR-11), **fail-safe before
-  inference** (FR-12), hot reload (FR-16)
-- `src/serving/api.py` — FastAPI `/predict` (FR-10)
-- `src/orchestration/ct_orchestrator.py` — drift trigger (FR-14),
-  non-blocking retrain (FR-15), **candidate acceptance gate (FR-17)**
-- React dashboard (FR-18 – FR-20)
-- Establish the NFR-01/02/04/09 thresholds by measurement
+**5. ~~Sprint 4 — serving and the CT loop~~ — done 2026-09-17, on the
+`sprint-4` branch (branched off `main` after sprint-3 merged; not yet
+merged back — see §3).**
+- `src/serving/schemas.py` — Pydantic request/response models (IR-04, IR-05,
+  NFR-08). `PredictRequest.positions` validates its keys are exactly the
+  configured universe and every weight is in [-1, 1] — malformed input is a
+  422, never an unhandled crash.
+- `src/serving/inference.py` — `InferenceService`. Fail-safe checked
+  *before* any model call (I5/FR-12: fetches the latest VIX first, and only
+  builds the full observation / calls the agent if it's below
+  `vix_critical_threshold`); FR-11's weight→action thresholds; `reload()`
+  for hot-swapping the active model under a lock, so a promotion never
+  serves a half-loaded agent (FR-16).
+- `src/serving/api.py` — FastAPI app. `/predict` (FR-10), `/telemetry`
+  (FR-18), `/decisions` (FR-19, paginated), `/ct-status` (FR-20),
+  `/ct/evaluate` (on-demand trigger, same code path the scheduler uses).
+  Constructs its `repo`/`service`/`orchestrator` singletons in `lifespan`,
+  not at import time — `InferenceService.__init__` hits the database
+  immediately, and doing that at import time would make importing the
+  module reach for whatever `DATABASE_URL` happens to be set, including
+  from an unrelated earlier test.
+- `src/orchestration/ct_orchestrator.py` — `CTOrchestrator`. `evaluate()`
+  replays the incumbent over the most recent real market data through
+  `TradingEnvironment` (there's no live broker in this project's scope —
+  see the module's Sim2Real note), persists a snapshot per day (FR-13),
+  and triggers a background retrain (FR-14) if the resulting rolling Sharpe
+  is below target. The retrain thread trains a candidate, evaluates it
+  out-of-sample against the same window the incumbent was just evaluated
+  on, and only promotes if the candidate's Sharpe beats the incumbent's
+  (FR-17) — otherwise the incumbent is retained and nothing changes.
+  Measured, not assumed: triggering a real retrain and hammering `/predict`
+  throughout showed 2.1% p95 degradation (§9) — FR-15 holds up under load,
+  not just by design intent.
+- `frontend/` — React + TypeScript + Tailwind + Framer Motion, built to the
+  Apple HIG glass aesthetic the user specified: translucent `backdrop-blur`
+  cards, the SF system font stack, spring-physics interactions (a
+  `whileTap` press on every button, a fluid bottom sheet for decision
+  detail). Polls `/telemetry`, `/decisions`, `/ct-status` on a timer — no
+  websocket layer, this is single-user local operation. Verified by
+  actually running it: backend seeded with a trained+promoted model,
+  frontend driven with Playwright (`chromium-cli` wasn't available in this
+  environment), screenshotted in both light and dark mode, decision-detail
+  sheet opened and closed, "Force Check" clicked — `console --errors`
+  clean throughout. That run is what caught the `load_partition` bug above;
+  it would not have been caught by the backend test suite alone, since no
+  existing test exercised `/ct/evaluate` with `as_of` outside the seeded
+  data's range the way a real "today" default does.
+- NFR-01/02/04 established by measurement (§9); NFR-09 explicitly left
+  unmeasured (would require the dashboard actually running for hours).
 
-A note for Sprint 4: NFR-01 scopes the system to single-user local operation,
-and there is currently **no authentication**. Nothing is mutable over HTTP —
-thresholds are environment-driven — so the exposed surface is read telemetry
-and `/predict`. A single bearer token on the endpoints is proportionate; a
-users table is out of scope and would expand the proposal without serving any
-research objective. Multi-user access control belongs in Future Work.
+A note for Sprint 4 (from before this was built, still accurate): NFR-01
+scopes the system to single-user local operation, and there is **no user
+table** — a single optional bearer token (`SERVING.bearer_token`, off by
+default) guards the endpoints that matter, which is what got built.
 
 ---
 
