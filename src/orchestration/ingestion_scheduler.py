@@ -12,7 +12,9 @@ human running `scripts/run_ingestion.py` by hand.
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+import threading
+from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 
 from src.config import DATA
 from src.dataops.ingestion import fetch_market_data
@@ -66,3 +68,71 @@ def run_ingestion_tick(
     repo.persist(frame)
     logger.info("ingestion tick: persisted %d rows (%s to %s)", len(frame), start, end)
     return len(frame)
+
+
+class IngestionStatus(str, Enum):
+    """No FR/DR ID covers this directly — it exists so the dashboard can
+    show FR-01's "without manual intervention" actually happening, the
+    same way FR-20's CT-pipeline status shows FR-13/14 happening, rather
+    than asking anyone to trust it from the code alone."""
+
+    IDLE = "IDLE"
+    INGESTING = "INGESTING"
+
+
+class IngestionState:
+    """Thread-safe tracker for the last ingestion tick, shared by the
+    background scheduler and the on-demand `/ingest/run` endpoint in
+    `src/serving/api.py` — both call `.run()` instead of the bare
+    `run_ingestion_tick`, so whichever one is presently ticking is
+    reflected on `/ct-status` regardless of which one triggered it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._status = IngestionStatus.IDLE
+        self._last_attempted_at: datetime | None = None
+        self._last_ok: bool | None = None
+        self._last_error: str | None = None
+        self._last_rows: int | None = None
+
+    @property
+    def status(self) -> IngestionStatus:
+        with self._lock:
+            return self._status
+
+    @property
+    def last_attempted_at(self) -> datetime | None:
+        with self._lock:
+            return self._last_attempted_at
+
+    @property
+    def last_ok(self) -> bool | None:
+        with self._lock:
+            return self._last_ok
+
+    def run(
+        self,
+        repo: MarketRepository | None = None,
+        tickers: tuple[str, ...] | None = None,
+        window_days: int = DEFAULT_TRAILING_WINDOW_DAYS,
+        end: date | None = None,
+    ) -> int:
+        with self._lock:
+            self._status = IngestionStatus.INGESTING
+        try:
+            rows = run_ingestion_tick(repo, tickers, window_days, end)
+            with self._lock:
+                self._last_ok = True
+                self._last_error = None
+                self._last_rows = rows
+            return rows
+        except Exception as exc:  # noqa: BLE001 - recorded, then re-raised for the caller to log
+            with self._lock:
+                self._last_ok = False
+                self._last_error = str(exc)
+            raise
+        finally:
+            with self._lock:
+                self._status = IngestionStatus.IDLE
+                self._last_attempted_at = datetime.now(timezone.utc)

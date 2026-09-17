@@ -80,11 +80,21 @@ export const Button = forwardRef(function Button(
 });
 
 /* ------------------------------------------------------------ status strip */
-export function StatusStrip({ pipeline, model, lastIngest, vix, failSafeThreshold }) {
+export function StatusStrip({
+  pipeline, model, lastIngest, ingestionStatus, ingestionCheckedAt, ingestionOk, vix, failSafeThreshold,
+}) {
   const tripped = vix != null && failSafeThreshold != null && vix > failSafeThreshold;
   const tone = { SERVING: "good", EVALUATING: "idle", RETRAINING: "warn" }[pipeline] || "idle";
   const label = { SERVING: "Serving", EVALUATING: "Evaluating", RETRAINING: "Retraining" }[pipeline]
     || pipeline;
+
+  // Mirrors the CT pipeline pill above it: "actively doing something" reads
+  // warn, a clean last result reads good/crit, and "never run yet" (no
+  // ingestionStatus at all, e.g. the mock fallback) reads idle rather than
+  // claiming a status this build doesn't actually have.
+  const ingesting = ingestionStatus === "INGESTING";
+  const ingestTone = ingesting ? "warn" : ingestionOk === false ? "crit" : ingestionOk === true ? "good" : "idle";
+  const ingestLabel = ingesting ? "Ingesting" : ingestionOk === false ? "Failed" : ingestionOk === true ? "Idle" : "—";
 
   return (
     <section className="glass strip" aria-label="System status">
@@ -99,6 +109,11 @@ export function StatusStrip({ pipeline, model, lastIngest, vix, failSafeThreshol
       <div className="strip-cell">
         <span className="strip-k">Last ingest</span>
         <span className="strip-v num">{lastIngest ?? "—"}</span>
+      </div>
+      <div className="strip-cell">
+        <span className="strip-k">Ingestion</span>
+        <Pill tone={ingestTone}>{ingestLabel}</Pill>
+        {ingestionCheckedAt && <span className="strip-sub">Checked {ingestionCheckedAt}</span>}
       </div>
       <div className="strip-cell">
         <span className="strip-k">Volatility fail-safe</span>

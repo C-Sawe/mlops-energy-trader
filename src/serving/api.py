@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config import RISK, SERVING
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator
-from src.orchestration.ingestion_scheduler import DEFAULT_TRAILING_WINDOW_DAYS, run_ingestion_tick
+from src.orchestration.ingestion_scheduler import DEFAULT_TRAILING_WINDOW_DAYS, IngestionState
 from src.rlops.registry import ModelRegistry
 from src.serving.inference import InferenceService, NoActiveModelError
 from src.serving.schemas import (
@@ -54,6 +54,7 @@ repo: MarketRepository
 service: InferenceService
 registry: ModelRegistry
 orchestrator: CTOrchestrator
+ingestion: IngestionState
 _scheduler_task: asyncio.Task | None = None
 _ingestion_task: asyncio.Task | None = None
 
@@ -71,22 +72,26 @@ async def _run_ingestion_scheduler() -> None:
     """FR-01: ingest without manual intervention. Runs `fetch_market_data`'s
     blocking network I/O off the event loop via `asyncio.to_thread` so a
     slow or retrying fetch never stalls `/predict` (FR-15's "keep serving"
-    applies here too, not just during a retrain)."""
+    applies here too, not just during a retrain). Goes through `ingestion`
+    (not the bare `run_ingestion_tick`) so `/ct-status` can show this tick
+    actually happening — the same reasoning FR-20 already applies to the CT
+    loop's own status."""
     while True:
         await asyncio.sleep(INGESTION_INTERVAL_SECONDS)
         try:
-            await asyncio.to_thread(run_ingestion_tick, repo)
+            await asyncio.to_thread(ingestion.run, repo)
         except Exception:  # noqa: BLE001 - the scheduler must survive a bad tick
             logging.getLogger(__name__).exception("scheduled ingestion tick failed")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global repo, service, registry, orchestrator, _scheduler_task, _ingestion_task
+    global repo, service, registry, orchestrator, ingestion, _scheduler_task, _ingestion_task
     repo = MarketRepository()
     service = InferenceService(repo=repo)
     registry = ModelRegistry(repo=repo)
     orchestrator = CTOrchestrator(service, repo=repo, registry=registry)
+    ingestion = IngestionState()
     _scheduler_task = asyncio.create_task(_run_scheduler())
     _ingestion_task = asyncio.create_task(_run_ingestion_scheduler())
     yield
@@ -195,6 +200,9 @@ def ct_status() -> CTStatusResponse:
         training_runs=cycle["total_runs"],
         promoted_count=cycle["promoted"],
         rejected_count=cycle["rejected"],
+        ingestion_status=ingestion.status.value,
+        last_ingestion_attempted_at=ingestion.last_attempted_at,
+        last_ingestion_ok=ingestion.last_ok,
     )
 
 
@@ -231,5 +239,5 @@ def trigger_ingestion(
     takes `as_of`: forcing a specific range for backfill or a demo, rather
     than always defaulting to `date.today()`.
     """
-    run_ingestion_tick(repo, window_days=window_days, end=end)
+    ingestion.run(repo, window_days=window_days, end=end)
     return ct_status()
