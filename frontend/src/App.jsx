@@ -97,8 +97,13 @@ export default function App() {
   useEffect(() => {
     return poll(
       async () => {
-        const [s, t, d] = await Promise.all([
-          fetchStatus(), fetchTelemetry(), fetchDecisions(page, pageSize),
+        // status first, deliberately not in the same Promise.all as
+        // telemetry: telemetry's window needs status's last_ingest_date to
+        // anchor to (see fetchTelemetry's docstring in api.js).
+        const s = await fetchStatus();
+        const anchor = s.ok ? s.data.last_ingest_date : undefined;
+        const [t, d] = await Promise.all([
+          fetchTelemetry(180, anchor), fetchDecisions(page, pageSize),
         ]);
         return { s, t, d };
       },
