@@ -193,6 +193,25 @@ def test_ct_status_reflects_active_version(tmp_path, monkeypatch):
         assert body["target_sharpe_threshold"] == RISK.target_sharpe_threshold
 
 
+def test_ct_evaluate_accepts_an_as_of_override(tmp_path, monkeypatch):
+    """The default (no as_of) anchors to date.today(), which a checkout's
+    ingested data may not reach — an operator needs to be able to force
+    evaluation against a date the data actually covers (backfill, catching
+    up post-outage, or bootstrapping a fresh checkout)."""
+    monkeypatch.chdir(tmp_path)
+    db_url, as_of = _seed_db(tmp_path, final_vix=RISK.vix_critical_threshold - 10.0)
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    _promote_model(db_url, tmp_path, as_of)
+
+    with TestClient(app) as client:
+        resp = client.post("/ct/evaluate", params={"as_of": str(as_of)})
+        assert resp.status_code == 200
+        # as_of matches the seeded data's own range, so this must actually
+        # evaluate (not silently no-op) — status settles back to SERVING
+        # either way, but last_evaluated_at only moves if real work happened.
+        assert client.get("/ct-status").json()["last_evaluated_at"] is not None
+
+
 # --------------------------------------------------------------- auth
 def test_protected_endpoint_requires_token_when_configured(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)

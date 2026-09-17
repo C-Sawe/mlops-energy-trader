@@ -69,9 +69,20 @@ async function post(path, body) {
 /** FR-20: serving / evaluating / retraining, the active model, cycle stats. */
 export const fetchStatus = () => get("/ct-status");
 
-/** FR-18: equity curve, rolling Sharpe and max drawdown, over `days` back from today. */
-export function fetchTelemetry(days = 180) {
-  const end = new Date();
+/**
+ * FR-18: equity curve, rolling Sharpe and max drawdown, over `days` back
+ * from `endDate` (defaults to today).
+ *
+ * `endDate` should normally be `/ct-status`'s `last_ingest_date`, not a bare
+ * `new Date()` — anchoring to calendar-today means the window silently goes
+ * blank after any ingestion gap (a weekend the market was still open in some
+ * other sense, a brief outage, DR-04's forward-fill catching up), even
+ * though the data the chart actually cares about hasn't changed. Anchoring
+ * to the latest data that actually exists makes "last N days" mean the same
+ * thing whether ingestion is perfectly current or a few days behind.
+ */
+export function fetchTelemetry(days = 180, endDate) {
+  const end = endDate ? new Date(endDate) : new Date();
   const start = new Date(end);
   start.setDate(start.getDate() - days);
   const iso = (d) => d.toISOString().slice(0, 10);

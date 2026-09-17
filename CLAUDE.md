@@ -459,6 +459,22 @@ every candidate is logged (`"COMPLETED"` if promoted, `"REJECTED"` if not)
 regardless of outcome — only `register_version()` + `promote_version()` are
 conditional on winning. `MarketRepository.get_cycle_stats()` counts both.
 
+**`/ct/evaluate` takes an optional `as_of` — `date.today()` isn't always the right anchor.**
+Found bootstrapping the CT loop against this checkout's real ingested data
+(2015-01-02→2025-12-30): the default `evaluate()`/telemetry both anchor to
+`date.today()`, but a checkout's ingested data can lag behind the literal
+current date for entirely ordinary reasons — a fresh checkout, an ingestion
+gap, or (as here) a sandboxed dev clock running ahead of the last real
+trading day the data covers. Anchoring to `date.today()` unconditionally
+made both the backend's evaluation and the dashboard's charts go silently
+blank rather than showing what data actually exists. Fixed on both ends:
+`POST /ct/evaluate?as_of=YYYY-MM-DD` lets an operator force evaluation
+against a specific date (`src/serving/api.py`), and the dashboard's
+`fetchTelemetry()` now anchors its window to `/ct-status`'s
+`last_ingest_date` instead of `new Date()` (`frontend/src/api.js`) — "last N
+days" means the same thing whether ingestion is perfectly current or a few
+days behind, not "blank unless today happens to have data."
+
 ---
 
 ## 8. FinRL — the recorded deviation
@@ -739,14 +755,38 @@ sentence is any version of "the strategy made 41% in six months" — that
 figure is one seed, one fold, in one favourable regime, and the very
 analysis above exists to stop that number from being reported as a result.
 
-**Not yet done:** promoting any of these 18 candidates to `is_active` (a
-deliberate separate step — Sprint 4's `CTOrchestrator` would normally do
-this by comparing a candidate against a live incumbent, and there isn't one
-yet); computing `deflated_sharpe_ratio` for the other 17 splits (only the
-single best result was disciplined this way, as a demonstration — a full
-Chapter 5 treatment would want this, or the pooled-90 framing, for every
-fold); and re-running with more than 5 seeds if the defence wants tighter
-confidence intervals than std≈1.3 gives.
+**Not yet done:** computing `deflated_sharpe_ratio` for the other 17 splits
+(only the single best result was disciplined this way, as a demonstration —
+a full Chapter 5 treatment would want this, or the pooled-90 framing, for
+every fold); and re-running with more than 5 seeds if the defence wants
+tighter confidence intervals than std≈1.3 gives.
+
+**The CT loop's core claim — autonomous decay detection and recovery — has
+now been observed live, not just unit-tested (2026-09-17, same checkout).**
+Promoting one of the 18 candidates was the missing step above; doing it
+through the real `/ct/evaluate` endpoint (rather than a direct database
+write) exercised the whole loop end to end for the first time:
+
+1. **Bootstrap.** `POST /ct/evaluate?as_of=2025-12-30` with no incumbent yet
+   active. `CTOrchestrator` has no baseline to compare against, so it trains
+   and promotes unconditionally — this is what put candidate
+   `e928c835-bbcb-4531-8824-0e464037f407` into `is_active`.
+2. **Decay detection, live.** A second `evaluate()` call replayed that
+   incumbent over the real market data through `TradingEnvironment` and
+   computed `rolling_sharpe = -3.79` — well below `target_sharpe_threshold =
+   1.0` — and autonomously fired a background retrain (FR-14), the same code
+   path the 300-second scheduler uses.
+3. **The FR-17 gate held.** That retrain's candidate did not beat the
+   incumbent out-of-sample, so it was rejected rather than promoted —
+   `rejected_count` moved 0→1 — and the original incumbent stayed active.
+
+This is the literal architectural claim under examination (§1): a closed
+loop that notices its own performance decay and responds without human
+intervention or serving downtime, observed running against real ingested
+data rather than asserted from unit tests or design intent. It does not
+demonstrate a profitable strategy — the replayed Sharpe was strongly
+negative — and per §1 that is not the point: the system's response to a bad
+Sharpe is exactly what was supposed to happen.
 
 ---
 

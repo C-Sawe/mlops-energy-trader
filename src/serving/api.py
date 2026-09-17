@@ -177,9 +177,17 @@ def ct_status() -> CTStatusResponse:
 
 
 @app.post("/ct/evaluate", response_model=CTStatusResponse, dependencies=[Depends(_verify_token)])
-def trigger_evaluation() -> CTStatusResponse:
+def trigger_evaluation(as_of: date | None = Query(default=None)) -> CTStatusResponse:
     """On-demand counterpart to the background scheduler — returns
     immediately (FR-15): if this evaluation decides to retrain, that
-    happens in its own thread, same as the scheduled path."""
-    orchestrator.evaluate()
+    happens in its own thread, same as the scheduled path.
+
+    `as_of` is an operational escape hatch, not a routine parameter: it
+    lets an operator force an evaluation anchored to a specific date
+    (backfill after an ingestion gap, catching up post-outage, or — as
+    here — bootstrapping against a checkout whose ingested data doesn't
+    reach all the way to the literal current date) instead of always
+    defaulting to `date.today()`.
+    """
+    orchestrator.evaluate(as_of=as_of)
     return ct_status()
