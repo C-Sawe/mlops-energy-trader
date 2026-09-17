@@ -55,8 +55,10 @@ must not be filled with anything not actually measured.
 - The named technology stack in Section 3.6
 
 **Deviations from the approved design are permitted but must be recorded and
-justified in Chapter 5.** The departmental guide requires this explicitly. One
-such deviation already exists (see §8, FinRL).
+justified in Chapter 5.** The departmental guide requires this explicitly. Two
+such deviations already exist: FinRL (§8), and the Alpaca paper-trading
+integration (§7) — neither is in Section 3.6's named stack, and both need a
+Chapter 5 paragraph, not just this file.
 
 ### Outstanding items in the thesis document
 
@@ -90,7 +92,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 115 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 121 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -294,6 +296,11 @@ presentation ──▶ serving ──▶ rlops ──▶ dataops
                      └──── orchestration ─┘
 ```
 
+`src/execution` (§7's Alpaca deviation) sits downstream of `serving` —
+it consumes `InferenceService.predict()`'s output and nothing in the four
+layers above imports it back, so it doesn't change this diagram's shape,
+just extends past its right edge.
+
 ```
 src/dataops/          ingestion · processing (+ walk_forward_splits)   [Sprint 1, 3]
                       · repository (+ decisions/snapshots/versions)    [Sprint 1, 4]
@@ -304,11 +311,13 @@ src/orchestration/    evaluator                                       [Sprint 2]
                       · ct_orchestrator                                [Sprint 4]
                       · ingestion_scheduler                            [Sprint 4, post-hoc]
 src/serving/          schemas · inference · api                       [Sprint 4]
+src/execution/        alpaca_broker (paper trading only, §7 deviation) [post-Sprint 4]
 frontend/              React + hand-rolled SVG charts, no CSS framework [Sprint 4]
 scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
-tests/                115 tests (backend; frontend has no test suite yet)
+                      · broker_paper_trade_test.py                    [post-Sprint 4]
+tests/                121 tests (backend; frontend has no test suite yet)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -519,6 +528,58 @@ What it fixes is DataOps actually being continuous rather than requiring a
 human to remember to re-run a script — the literal reading of FR-01, and
 part of what "the architecture, not the alpha" is supposed to mean when
 someone asks whether this pipeline runs itself.
+
+**Alpaca paper-trading integration — a second recorded deviation
+(2026-09-17), scoped deliberately narrow.** The user asked whether this
+could connect to a real broker. Two very different things hide inside that
+question: paper trading (simulated money, real market structure, real
+order API) is a safe architecture demonstration that stays inside §1's
+"architecture, not alpha" framing; live trading with real capital is not,
+and was explicitly ruled out for this pass rather than assumed either way
+— it would put real money at risk and tempt exactly the "the strategy is
+profitable" framing §1 exists to prevent, and it is the kind of scope
+change §2 says needs the supervisor, not just this file.
+
+What got built, with that boundary enforced in the code, not just
+documentation: `src/execution/alpaca_broker.py` (`AlpacaBroker`,
+`route_decision`) is a thin httpx client over Alpaca's REST API.
+`BrokerConfig.base_url` (`src/config.py`) is a **fixed constant** pointed
+at `paper-api.alpaca.markets`, not an environment variable — there is no
+live-endpoint override anywhere in this codebase, deliberately, so a typo
+in an env var cannot silently switch this to real trading. Credentials
+(`ALPACA_API_KEY`/`ALPACA_SECRET_KEY`) follow the same never-hard-coded,
+never-committed rule NFR-10 already enforces for the database.
+
+`route_decision` maps FR-11's three active discrete actions onto Alpaca's
+API deliberately, not uniformly:
+- `BUY`/`SELL` → a **notional** (dollar-amount) order, not a share-count
+  one — this project's target weights are continuous fractions of
+  portfolio value (FR-06), and notional sizing is the Alpaca primitive
+  that actually matches that, rather than requiring a price lookup to
+  convert dollars to shares first.
+- `LIQUIDATE` → Alpaca's "close position entirely" endpoint, not a sell
+  order. I5/FR-12's fail-safe means "get to cash," and closing the whole
+  position is the correct primitive for that meaning — a sized sell order
+  could leave a partial position behind, which is exactly what the
+  fail-safe must not do.
+- `HOLD` → no request at all, not a zero-notional order (Alpaca rejects
+  those anyway, and "do nothing" isn't better expressed as an API call
+  that does nothing).
+
+Closing a position that doesn't exist (the normal case on a fresh paper
+account, and a real possibility given LIQUIDATE can fire when no position
+was ever opened) returns Alpaca's 404 — treated as a recoverable, expected
+condition and logged, not raised, the same precedent `load_partition`'s
+empty-frame case set earlier in this section. `scripts/broker_paper_trade_test.py`
+runs the actual validation: it calls the real `InferenceService.predict()`
+— the same production code path `/predict` uses — and routes its output to
+a real (paper) Alpaca account, closing the loop from "the model decided
+this" to "a real venue's API received it." Not yet run against a live
+Alpaca account as of this writing (needs the user's own paper-trading API
+keys); 6 new tests (`tests/test_alpaca_broker.py`) cover the client and
+the action-mapping logic against a mocked transport (`httpx.MockTransport`
+— no network, consistent with this project's test conventions), including
+the 404-is-a-no-op case and that `HOLD` genuinely places zero requests.
 
 ---
 
