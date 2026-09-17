@@ -100,6 +100,9 @@ class CTStatusResponse(BaseModel):
 
     status: str  # SERVING | EVALUATING | RETRAINING
     active_version_id: str | None
+    # Presentation label only ("September 2026 #2") — active_version_id
+    # above remains the real identifier for traceability (NFR-07).
+    active_model_label: str | None
     rolling_sharpe: float | None
     target_sharpe_threshold: float
     last_evaluated_at: datetime | None

@@ -191,6 +191,11 @@ def test_ct_status_reflects_active_version(tmp_path, monkeypatch):
         assert body["active_version_id"] == version_id
         assert body["status"] == "SERVING"
         assert body["target_sharpe_threshold"] == RISK.target_sharpe_threshold
+        # Presentation label alongside the real ID — "<Month> <Year> #<n>",
+        # not a replacement for active_version_id (NFR-07 still needs it).
+        import re
+
+        assert re.match(r"^[A-Z][a-z]+ \d{4} #1$", body["active_model_label"])
 
 
 def test_ct_evaluate_accepts_an_as_of_override(tmp_path, monkeypatch):

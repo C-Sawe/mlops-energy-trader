@@ -92,7 +92,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 124 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 126 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -317,7 +317,7 @@ scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
                       · broker_paper_trade_test.py                    [post-Sprint 4]
-tests/                124 tests (backend; frontend has no test suite yet)
+tests/                126 tests (backend; frontend has no test suite yet)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -549,6 +549,25 @@ HH:MM:SS" timestamp visibly advances on its own. 2 new tests
 (`tests/test_ingestion_scheduler.py`) cover both a successful and a failed
 tick, including that a failure still returns the state to `IDLE` rather
 than getting stuck `INGESTING` forever.
+
+**The "Active model" tile shows a human-readable label, not the raw
+UUID.** `active_version_id` (e.g. `bf65de93-...`) is correct but
+unreadable at a glance, and unhelpful for a demo or defense where "which
+model is live" is worth being able to just say out loud. Added
+`MarketRepository.get_promotion_sequence()` — the 1-indexed position of a
+`promoted_at` timestamp among all promotions in its calendar month — and
+`_active_model_label()` (`src/serving/api.py`) formats it as `"September
+2026 #2"`. The `#n` isn't decorative: this session alone promoted two
+different models within September 2026 (the live CT-loop bootstrap, §10,
+then a real autonomous retrain beating it later the same day), so an
+unqualified month name would have been ambiguous, not just less precise.
+`active_version_id` stays in the response and in the frontend (as the
+tile's hover title) — this is a presentation label, not a new identifier,
+and nothing that depends on NFR-07 traceability (the decision log, the
+version→run→partition chain) uses it. 3 new tests: two on
+`get_promotion_sequence` (`tests/test_repository.py` — counts correctly
+within a month, resets across a month boundary) and one on `/ct-status`
+actually returning the formatted label (`tests/test_api.py`).
 
 **Alpaca paper-trading integration — a second recorded deviation
 (2026-09-17), scoped deliberately narrow.** The user asked whether this
