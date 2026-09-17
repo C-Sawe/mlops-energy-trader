@@ -120,6 +120,28 @@ class EnvironmentConfig:
     )
 
 
+DEFAULT_MLFLOW_TRACKING_URI = "sqlite:///mlruns.db"
+
+
+def resolve_mlflow_tracking_uri() -> str:
+    """The MLflow tracking store this project reads and writes by default.
+
+    Shared by `ModelRegistry` (which calls `mlflow.set_tracking_uri` on
+    this) and `InferenceService` (which must do the same, not assume some
+    other object already did): `InferenceService` can legitimately be the
+    first thing in a fresh process to touch MLflow — a real server restart
+    with an already-active model does exactly this — and MLflow's own
+    ambient default tracking URI is not this project's `mlruns.db`. Found
+    via `scripts/broker_paper_trade_test.py`, whose whole point was
+    constructing `InferenceService` as the only MLflow-touching object in
+    a fresh process; every existing test happened to construct a
+    `ModelRegistry` first (to train/promote a model), which primed the
+    correct global URI before `InferenceService` ever needed it — masking
+    this until now.
+    """
+    return os.environ.get("MLFLOW_TRACKING_URI", DEFAULT_MLFLOW_TRACKING_URI)
+
+
 @dataclass(frozen=True)
 class BrokerConfig:
     """Alpaca paper-trading credentials (NFR-10: never hard-coded, never

@@ -172,6 +172,38 @@ def test_reload_picks_up_a_newly_promoted_version(tmp_path, monkeypatch):
     assert service.active_version_id == second_version
 
 
+def test_reload_sets_its_own_tracking_uri_not_assuming_one_is_already_set(tmp_path, monkeypatch):
+    """`InferenceService` can legitimately be the first thing in a fresh
+    process to touch MLflow — a real server restart with an already-active
+    model does exactly this — so `reload()` must not assume some other
+    object (like `ModelRegistry`) already called
+    `mlflow.set_tracking_uri`. Found via `scripts/broker_paper_trade_test.py`,
+    the first place in this project anything constructed `InferenceService`
+    without a `ModelRegistry` having run first: it failed with "Run not
+    found" against MLflow's own ambient default tracking URI, not this
+    project's `mlruns.db`. Every other test masks this by training/promoting
+    through `ModelRegistry` first, which primes the global URI as a side
+    effect before `InferenceService` ever needs it."""
+    repo = _seed_repo_and_promote_model(tmp_path, monkeypatch, final_vix=20.0)
+
+    import mlflow
+
+    # Put MLflow back in the state a genuinely fresh process starts in:
+    # `set_tracking_uri` also writes `MLFLOW_TRACKING_URI` into the
+    # environment as a side effect (so subprocesses inherit it), so merely
+    # calling it with a "wrong" value doesn't simulate an untouched process
+    # — it just makes a different value look like a deliberate override.
+    # `set_tracking_uri(None)` genuinely unsets both, which is what a real
+    # server restart looks like before `InferenceService.reload()` runs.
+    mlflow.set_tracking_uri(None)
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+
+    service = InferenceService(repo=repo)
+
+    assert service.active_version_id is not None
+    assert service.get_agent() is not None
+
+
 # --------------------------------------------------------------- edge cases
 def test_no_active_model_raises_on_predict(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)

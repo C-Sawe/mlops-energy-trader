@@ -92,7 +92,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 121 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 122 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -317,7 +317,7 @@ scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
                       · broker_paper_trade_test.py                    [post-Sprint 4]
-tests/                121 tests (backend; frontend has no test suite yet)
+tests/                122 tests (backend; frontend has no test suite yet)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -570,16 +570,64 @@ Closing a position that doesn't exist (the normal case on a fresh paper
 account, and a real possibility given LIQUIDATE can fire when no position
 was ever opened) returns Alpaca's 404 — treated as a recoverable, expected
 condition and logged, not raised, the same precedent `load_partition`'s
-empty-frame case set earlier in this section. `scripts/broker_paper_trade_test.py`
-runs the actual validation: it calls the real `InferenceService.predict()`
-— the same production code path `/predict` uses — and routes its output to
-a real (paper) Alpaca account, closing the loop from "the model decided
-this" to "a real venue's API received it." Not yet run against a live
-Alpaca account as of this writing (needs the user's own paper-trading API
-keys); 6 new tests (`tests/test_alpaca_broker.py`) cover the client and
-the action-mapping logic against a mocked transport (`httpx.MockTransport`
-— no network, consistent with this project's test conventions), including
-the 404-is-a-no-op case and that `HOLD` genuinely places zero requests.
+empty-frame case set earlier in this section. 6 tests
+(`tests/test_alpaca_broker.py`) cover the client and the action-mapping
+logic against a mocked transport (`httpx.MockTransport` — no network,
+consistent with this project's test conventions), including the
+404-is-a-no-op case and that `HOLD` genuinely places zero requests.
+
+**Run against a real Alpaca paper account — done, 2026-09-17, this
+checkout.** `scripts/broker_paper_trade_test.py` calls the real
+`InferenceService.predict()` — the same production code path `/predict`
+uses — and routes its output to a real paper account (equity $100,000,
+buying power $400,000, standard 4× paper margin defaults). The active
+model's decision (version `e928c835-bbcb-4531-8824-0e464037f407`, VIX
+14.33, no fail-safe) was `HOLD` on all five tickers, which proved
+`route_decision` correctly places zero requests for `HOLD` — but doesn't
+exercise the order-submission code at all, since nothing was routed.
+Exercised that directly and separately, independent of what the model
+happened to decide: a real $10 notional `BUY` on XOM filled at
+$162.876/share for 0.061335003 fractional shares (`filled_qty` confirms
+Alpaca fully supports fractional notional orders, not just whole shares);
+`LIQUIDATE` then correctly closed the position back to flat via the
+close-position endpoint, confirmed via a fresh `get_positions()` call
+returning none. This is real evidence for the two HTTP call shapes that
+matter (`submit_notional_order`, `close_position`) on a real venue, not
+just a mocked assertion — the deviation this section describes is now
+backed the same way §8's FinRL cross-check is.
+
+**A second, unrelated bug surfaced by this validation:
+`InferenceService` could not survive being the first thing to touch
+MLflow in a fresh process.** `scripts/broker_paper_trade_test.py` was the
+first place in this project anything constructed `InferenceService`
+without a `ModelRegistry` having run first in the same process — every
+existing test (and `src/serving/api.py`'s own lifespan, which constructs
+`InferenceService` before `ModelRegistry`) happened to train or promote a
+model through `ModelRegistry` first, which calls
+`mlflow.set_tracking_uri()` as a side effect and silently primed the
+correct global state before `InferenceService.reload()` ever needed it.
+Without that priming, `reload()`'s call to
+`mlflow.artifacts.download_artifacts()` used MLflow's own ambient default
+tracking URI — in this checkout, `sqlite:////Users/.../mlflow.db`, a
+different file from this project's own `mlruns.db` convention, and an
+empty one — and raised `MlflowException: Run with id=... not found` even
+though the run genuinely existed, just in a different store than the one
+MLflow happened to open. This is a real NFR-04 risk, not just a script
+inconvenience: any real server restart where a model is already active
+would have hit the exact same crash on startup, since
+`src/serving/api.py`'s lifespan constructs `InferenceService` before
+`ModelRegistry` in exactly the order that triggers it. Fixed by adding
+`resolve_mlflow_tracking_uri()` (`src/config.py`) as the single shared
+resolution `ModelRegistry` and `InferenceService.reload()` both now call
+before touching MLflow, rather than one implicitly depending on the other
+having gone first. Guarded by
+`test_reload_sets_its_own_tracking_uri_not_assuming_one_is_already_set`
+(`tests/test_inference.py`) — proven to actually catch the regression by
+reverting the fix and confirming the test fails, not just written to pass
+once. Worth re-measuring NFR-04's "~8ms" figure (§9) against a process
+that genuinely never constructed a `ModelRegistry` first, since the
+original measurement may have had the same accidental priming every other
+test does.
 
 ---
 
