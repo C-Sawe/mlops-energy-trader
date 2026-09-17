@@ -112,6 +112,12 @@ class CTStatusResponse(BaseModel):
     training_runs: int
     promoted_count: int
     rejected_count: int
+    # Not FR-20 itself (that's the CT loop) — shows FR-01's "without manual
+    # intervention" ingestion actually ticking, the same way the fields
+    # above show FR-13/14 actually ticking.
+    ingestion_status: str  # IDLE | INGESTING
+    last_ingestion_attempted_at: datetime | None
+    last_ingestion_ok: bool | None
 
 
 class HealthResponse(BaseModel):

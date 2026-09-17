@@ -11,6 +11,7 @@ full backfill already computed and persisted, not silently NaN them out.
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from src.config import DATA
 from src.dataops import processing as P
@@ -87,3 +88,59 @@ def test_ingestion_tick_is_idempotent_on_repeated_runs(tmp_path, monkeypatch):
     after = repo.load_partition("2000-01-01", as_of)
 
     assert len(after) == len(before)
+
+
+# --------------------------------------------------------------- IngestionState
+def test_ingestion_state_records_a_successful_tick(tmp_path, monkeypatch):
+    """The dashboard shows this to prove FR-01's autonomous ingestion is
+    actually running, not just trust it from the code — so the state it
+    reads has to reflect a real completed tick, not just "nothing failed
+    yet"."""
+    repo, equities, vix, as_of = _seed_full_history(tmp_path)
+
+    def fake_fetch(start, end, tickers=None, strict=True):
+        start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+        eq = equities[
+            (equities["date"] >= start_ts)
+            & (equities["date"] <= end_ts)
+            & (equities["ticker"].isin(tickers or DATA.tickers))
+        ].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(tickers or DATA.tickers), failed_tickers=())
+
+    monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
+
+    state = S.IngestionState()
+    assert state.status == S.IngestionStatus.IDLE
+    assert state.last_attempted_at is None
+    assert state.last_ok is None
+
+    rows = state.run(repo, end=as_of)
+
+    assert rows > 0
+    assert state.status == S.IngestionStatus.IDLE  # returns to idle once the tick completes
+    assert state.last_attempted_at is not None
+    assert state.last_ok is True
+
+
+def test_ingestion_state_records_a_failed_tick_and_still_returns_to_idle(tmp_path, monkeypatch):
+    """IR-02: a failed tick must be visible (last_ok False), not silently
+    swallowed — and the state must not get stuck INGESTING forever just
+    because one tick failed, or the dashboard would show a permanently
+    stuck pipeline after a single bad fetch."""
+    repo, _, _, as_of = _seed_full_history(tmp_path)
+
+    def failing_fetch(start, end, tickers=None, strict=True):
+        from src.dataops.ingestion import IngestionError
+
+        raise IngestionError("simulated fetch failure")
+
+    monkeypatch.setattr(S, "fetch_market_data", failing_fetch)
+
+    state = S.IngestionState()
+    with pytest.raises(Exception):
+        state.run(repo, end=as_of)
+
+    assert state.status == S.IngestionStatus.IDLE
+    assert state.last_ok is False
+    assert state.last_attempted_at is not None

@@ -180,6 +180,7 @@ body {
 .strip-k { font-size: 10.5px; font-weight: 600; letter-spacing: 0.055em;
            text-transform: uppercase; color: var(--ink-3); }
 .strip-v { font-size: 15px; font-weight: 600; letter-spacing: -0.015em; }
+.strip-sub { font-size: 11px; color: var(--ink-3); }
 
 /* pills — status is shape + text + colour, never colour alone */
 .pill { display: inline-flex; align-items: center; gap: 7px;

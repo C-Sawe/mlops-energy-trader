@@ -40,6 +40,11 @@ function adaptStatus(raw) {
     vix: raw.current_vix,
     failSafeThreshold: raw.vix_critical_threshold,
     targetSharpe: raw.target_sharpe_threshold,
+    ingestionStatus: raw.ingestion_status,
+    ingestionCheckedAt: raw.last_ingestion_attempted_at
+      ? fmtDateTime(new Date(raw.last_ingestion_attempted_at))
+      : null,
+    ingestionOk: raw.last_ingestion_ok,
   };
 }
 
@@ -190,6 +195,9 @@ export default function App() {
         pipeline={status.pipeline}
         model={status.model}
         lastIngest={status.lastIngest}
+        ingestionStatus={status.ingestionStatus}
+        ingestionCheckedAt={status.ingestionCheckedAt}
+        ingestionOk={status.ingestionOk}
         vix={status.vix}
         failSafeThreshold={status.failSafeThreshold}
       />

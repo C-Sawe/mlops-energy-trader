@@ -92,7 +92,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 122 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 124 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -317,7 +317,7 @@ scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
                       · broker_paper_trade_test.py                    [post-Sprint 4]
-tests/                122 tests (backend; frontend has no test suite yet)
+tests/                124 tests (backend; frontend has no test suite yet)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -528,6 +528,27 @@ What it fixes is DataOps actually being continuous rather than requiring a
 human to remember to re-run a script — the literal reading of FR-01, and
 part of what "the architecture, not the alpha" is supposed to mean when
 someone asks whether this pipeline runs itself.
+
+**The dashboard now shows the ingestion scheduler actually ticking, not
+just its effect.** `last_ingest_date` (the newest date *in* the data)
+already existed, but nothing showed whether the autonomous scheduler was
+still alive versus just having run once a while ago and stopped — the gap
+this session's §13 ingestion-gap incident fell into. No FR/DR ID covers
+this directly (it's a demonstrability aid, not a functional requirement),
+but it exists for the same reason FR-20 exposes the CT loop's own status:
+so the dashboard shows the automation happening, not just asks someone to
+trust it from the code. `IngestionState`
+(`src/orchestration/ingestion_scheduler.py`) tracks `IDLE`/`INGESTING`,
+the last attempt's timestamp, and whether it succeeded, shared by both the
+background scheduler and `/ingest/run` so whichever one is ticking shows
+up regardless of which triggered it. Surfaced in `/ct-status` as
+`ingestion_status` / `last_ingestion_attempted_at` / `last_ingestion_ok`,
+and in the dashboard as a fifth status-strip tile next to "Last ingest" —
+lower `INGESTION_INTERVAL_SECONDS` for a live demo and the "Checked
+HH:MM:SS" timestamp visibly advances on its own. 2 new tests
+(`tests/test_ingestion_scheduler.py`) cover both a successful and a failed
+tick, including that a failure still returns the state to `IDLE` rather
+than getting stuck `INGESTING` forever.
 
 **Alpaca paper-trading integration — a second recorded deviation
 (2026-09-17), scoped deliberately narrow.** The user asked whether this
