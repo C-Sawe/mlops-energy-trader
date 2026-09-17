@@ -151,15 +151,28 @@ def decisions(
     )
 
 
+CYCLE_WINDOW_DAYS = 90  # "this quarter", for the dashboard's cycle-history card
+
+
 @app.get("/ct-status", response_model=CTStatusResponse, dependencies=[Depends(_verify_token)])
 def ct_status() -> CTStatusResponse:
     """FR-20: serving / evaluating / retraining, for the dashboard's status indicator."""
+    ingest = repo.latest_ingest_info()
+    since = date.today() - timedelta(days=CYCLE_WINDOW_DAYS)
+    cycle = repo.get_cycle_stats(since)
     return CTStatusResponse(
         status=orchestrator.status.value,
         active_version_id=service.active_version_id,
         rolling_sharpe=orchestrator.last_rolling_sharpe,
         target_sharpe_threshold=RISK.target_sharpe_threshold,
         last_evaluated_at=orchestrator.last_evaluated_at,
+        last_ingest_date=ingest["date"] if ingest else None,
+        current_vix=ingest["vix"] if ingest else None,
+        vix_critical_threshold=RISK.vix_critical_threshold,
+        cycle_window_days=CYCLE_WINDOW_DAYS,
+        training_runs=cycle["total_runs"],
+        promoted_count=cycle["promoted"],
+        rejected_count=cycle["rejected"],
     )
 
 

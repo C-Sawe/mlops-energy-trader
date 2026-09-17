@@ -58,7 +58,7 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 | **RLOps** | MDP environment, baseline policies, PPO agent, registry | Gymnasium + Stable Baselines3 + MLflow | `src/rlops` | ✅ Sprints 2 & 3 Complete |
 | **Orchestration** | Performance metrics, drift detection, CT cycle | Python (custom) | `src/orchestration` | ✅ Sprints 2 & 4 Complete |
 | **Serving** | Inference API, volatility fail-safe | FastAPI (ASGI) | `src/serving` | ✅ Sprint 4 Complete |
-| **Presentation** | Real-time telemetry dashboard | React + Tailwind + Framer Motion | `frontend/` | ✅ Sprint 4 Complete |
+| **Presentation** | Real-time telemetry dashboard | React, hand-rolled SVG charts, no CSS framework | `frontend/` | ✅ Sprint 4 Complete |
 
 Dependencies flow one way only — orchestration toward data and model concerns — with no cycles (NFR-06).
 
@@ -149,11 +149,14 @@ mlops-energy-trader/
 │       ├── inference.py      # fail-safe, action mapping, hot reload
 │       └── api.py            # FastAPI app: /predict /telemetry /decisions /ct-status
 │
-├── frontend/                  # Sprint 4 — React + TS + Tailwind + Framer Motion dashboard
+├── frontend/                  # Sprint 4 — React, plain CSS tokens, hand-drawn SVG charts
+│   ├── design-reference.html # Standalone no-build version of the same dashboard
 │   └── src/
-│       ├── App.tsx
-│       ├── components/       # GlassCard, StatusPill, PerformanceCharts, DecisionLog, ...
-│       └── lib/               # api.ts, usePolling.ts
+│       ├── App.jsx           # Composition + live-API-to-view-model adapters
+│       ├── api.js            # FastAPI client, IR-07 graceful degradation
+│       ├── mock.js           # Illustrative fallback data (visibly marked as such)
+│       ├── theme.css         # Apple HIG token system, light and dark
+│       └── components/       # Charts.jsx, Primitives.jsx (glass card, pill, spring sheet)
 │
 └── tests/                    # Unit + integration tests (backend only — see Testing note below)
     ├── test_processing.py
@@ -308,9 +311,10 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 | FR-14 | `CTOrchestrator.evaluate` → `_trigger_retrain` | `test_evaluate_triggers_retrain_when_no_incumbent` |
 | FR-15 | `CTOrchestrator._retrain_and_maybe_promote` (own thread) | `test_evaluate_is_non_blocking` |
 | FR-16 | `InferenceService.reload` | `test_reload_picks_up_a_newly_promoted_version` |
-| FR-17 | promote-vs-retain comparison in `_retrain_and_maybe_promote` | `test_retrain_retains_incumbent_when_candidate_does_not_beat_it` |
+| FR-17 | promote-vs-retain comparison in `_retrain_and_maybe_promote`; every candidate logged, win or lose | `test_retrain_retains_incumbent_when_candidate_does_not_beat_it` |
 | FR-18 | `MarketRepository.list_snapshots` → `/telemetry` | `test_telemetry_returns_recorded_snapshots` |
 | FR-19 | `MarketRepository.list_decisions` → `/decisions` | `test_decisions_endpoint_paginates` |
+| NFR-07 (dashboard) | `list_decisions` joins to `model_run` for run_id + both partitions | `test_list_decisions_includes_run_and_partition` |
 | FR-20 | `CTOrchestrator.status` → `/ct-status` | `test_ct_status_reflects_active_version` |
 | I5 | fail-safe lives in `InferenceService`, not the agent | `test_failsafe_does_not_trigger_below_threshold` |
 | NFR-08 | `PredictRequest` field validation | `test_predict_rejects_positions_missing_a_ticker` |
@@ -323,7 +327,7 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 - [x] **Sprint 1 — DataOps Foundation (Complete).** Ingestion, enrichment, persistence, schema, tests.
 - [x] **Sprint 2 — Trading Environment (Complete).** Gymnasium MDP, continuous action space, drawdown-incremented reward, baseline policies, evaluation metrics.
 - [x] **Sprint 3 — Training & Model Registry (Complete).** PPO on CPU (benchmarked ~12–13× faster than MPS), walk-forward cross-validation with a seed sweep, MLflow logging, `model_version` registration.
-- [x] **Sprint 4 — Serving & CT Loop (Complete).** FastAPI inference gateway with the VIX fail-safe checked before any model call, hot-reloadable model loading, a non-blocking CT orchestrator with a real out-of-sample acceptance gate, and a React + Tailwind + Framer Motion dashboard — verified running against a real trained model, screenshotted in light and dark mode.
+- [x] **Sprint 4 — Serving & CT Loop (Complete).** FastAPI inference gateway with the VIX fail-safe checked before any model call, hot-reloadable model loading, a non-blocking CT orchestrator with a real out-of-sample acceptance gate (rejected candidates now logged, not just promoted ones), and a dashboard with a real IR-07 graceful-degradation path — verified running against a real trained model, screenshotted in light and dark mode, with the backend intentionally killed mid-session to confirm the mock fallback.
 
 ---
 

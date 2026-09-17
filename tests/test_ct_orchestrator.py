@@ -221,3 +221,9 @@ def test_retrain_retains_incumbent_when_candidate_does_not_beat_it(tmp_path, mon
     orchestrator._retrain_and_maybe_promote(as_of)
 
     assert service.active_version_id == incumbent_version
+
+    # The rejected candidate must still be logged — "how many candidates
+    # were held back" has to be an answerable question, not silently
+    # discarded just because it lost the acceptance gate.
+    stats = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())
+    assert stats["rejected"] == 1

@@ -57,10 +57,17 @@ class ModelRegistry:
         eval_end: _DateLike,
         metrics: dict[str, float],
         experiment_name: str = "ppo-trading-agent",
+        status: str = "COMPLETED",
     ) -> str:
         """FR-08: log hyperparameters and metrics to MLflow, then persist
         the exact partition boundaries to `model_run` (DR-08) so the run is
         reproducible from the record alone. Returns the new `model_run.run_id`.
+
+        `status` defaults to "COMPLETED" but `CTOrchestrator` passes
+        "REJECTED" for a candidate that lost the FR-17 acceptance gate —
+        every trained candidate is logged either way, so "how many
+        candidates were rejected" is an answerable question, not silently
+        discarded information.
         """
         mlflow.set_experiment(experiment_name)
         with mlflow.start_run() as run:
@@ -82,7 +89,7 @@ class ModelRegistry:
             sharpe_ratio=metrics.get("sharpe_ratio"),
             max_drawdown=metrics.get("max_drawdown"),
             cumulative_return=metrics.get("cumulative_return"),
-            status="COMPLETED",
+            status=status,
         )
         with self.repo.session() as session:
             session.add(record)
