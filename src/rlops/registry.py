@@ -10,7 +10,6 @@ local tables are the source of truth serving (Sprint 4) will query.
 """
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -18,6 +17,7 @@ from typing import Any
 import mlflow
 import pandas as pd
 
+from src.config import resolve_mlflow_tracking_uri
 from src.dataops.models import ModelRun, ModelVersion
 from src.dataops.repository import MarketRepository
 from src.rlops.agent import PPOAgent
@@ -42,9 +42,11 @@ class ModelRegistry:
         # that silences the deprecation. A real deployment (Sprint 4) points
         # MLFLOW_TRACKING_URI at the docker-compose `mlflow` server instead,
         # which already uses Postgres as its backend store.
-        self.tracking_uri = tracking_uri or os.environ.get(
-            "MLFLOW_TRACKING_URI", "sqlite:///mlruns.db"
-        )
+        #
+        # This default must match `InferenceService.reload()`'s exactly —
+        # `resolve_mlflow_tracking_uri()` is the single source of truth for
+        # both, after the two silently disagreeing was a real bug (§7).
+        self.tracking_uri = tracking_uri or resolve_mlflow_tracking_uri()
         mlflow.set_tracking_uri(self.tracking_uri)
         self.repo = repo or MarketRepository()
 

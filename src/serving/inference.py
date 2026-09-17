@@ -15,7 +15,7 @@ import mlflow
 import numpy as np
 import pandas as pd
 
-from src.config import DATA, RISK
+from src.config import DATA, RISK, resolve_mlflow_tracking_uri
 from src.dataops.processing import normalize_rolling
 from src.dataops.repository import MarketRepository
 from src.rlops.agent import PPOAgent
@@ -54,6 +54,14 @@ class InferenceService:
                 self._agent = None
                 self._active_version_id = None
                 return None
+            # Must not assume `ModelRegistry` already set this: this
+            # service can legitimately be the first thing in a fresh
+            # process to touch MLflow (a real restart with an
+            # already-active model does exactly this), and MLflow's own
+            # ambient default tracking URI is not this project's
+            # `mlruns.db` (CLAUDE.md §7 — found via
+            # scripts/broker_paper_trade_test.py).
+            mlflow.set_tracking_uri(resolve_mlflow_tracking_uri())
             local_path = mlflow.artifacts.download_artifacts(
                 f"{active['artifact_uri']}/model.zip"
             )
