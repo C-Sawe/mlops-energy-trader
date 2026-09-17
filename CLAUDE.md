@@ -85,13 +85,19 @@ These are not code tasks, but they are open and they cost marks:
 |---|---|---|
 | 1 | DataOps — ingestion, features, persistence, schema | **Complete** |
 | 2 | Environment — Gymnasium MDP, metrics, baselines | **Complete** |
-| 3 | Training — PPO, walk-forward validation, MLflow | Not started |
+| 3 | Training — PPO, walk-forward validation, MLflow | **Complete** |
 | 4 | Serving — FastAPI, fail-safe, dashboard, CT loop | Not started |
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 56 passing — keep it that way
+python -m pytest tests/ -q     # 72 passing — keep it that way
 ```
+
+Branches (all local, none pushed): `main` is the trunk with everything
+merged in; `sprint-1` and `sprint-2` are retroactive markers at each
+sprint's completion commit, kept for reference; `sprint-3` is where Sprint 3
+was actually built, branched off `main` after Sprint 2's verification work
+landed — merge it back to `main` when ready, it hasn't been yet.
 
 Tests use deterministic synthetic data and in-memory SQLite. **No network and
 no database required.** If a test starts needing either, that is a regression
@@ -253,12 +259,16 @@ presentation ──▶ serving ──▶ rlops ──▶ dataops
 ```
 
 ```
-src/dataops/          ingestion · processing · repository · models    [Sprint 1]
+src/dataops/          ingestion · processing (+ walk_forward_splits)   [Sprint 1, 3]
+                      · repository · models
 src/rlops/            environment · baselines                         [Sprint 2]
+                      · agent · registry                              [Sprint 3]
 src/orchestration/    evaluator                                       [Sprint 2]
 src/serving/          (empty)                                         [Sprint 4]
 scripts/              run_ingestion.py · run_baselines.py
-tests/                56 tests
+                      · benchmark_device.py · finrl_crosscheck.py
+                      · train_agent.py                                [Sprint 3]
+tests/                72 tests
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -635,13 +645,40 @@ built in Sprint 3 — this is now a settled decision, not an open question.
 difference $0.00007 on a ~$100K portfolio, correlation 1.000000000000. The §8
 deviation is now backed by a cross-check, not just a design justification.
 
-**4. Sprint 3 — training and registry.**
-- `src/rlops/agent.py` — PPO wrapper over Stable Baselines3
-- `src/rlops/registry.py` — MLflow run logging (FR-08) and artifact
-  registration (FR-09)
-- Walk-forward cross-validation across regimes, not a single split
-- Seed sweep with aggregated statistics
-- Persist each run to `model_run` with its exact partition boundaries (DR-08)
+**4. ~~Sprint 3 — training and registry~~ — done 2026-09-17, on the
+`sprint-3` branch (not yet merged to `main`).**
+- `src/rlops/agent.py` — `PPOAgent`, a thin wrapper over SB3's PPO
+  (`device="cpu"`, per §9's measured decision). `train`/`predict`/`evaluate`/
+  `save`/`load`; `evaluate()` returns the same `{equity_curve, returns}`
+  shape `baselines.run_policy` does, so an agent's results and a baseline's
+  are directly comparable with no glue code.
+- `src/rlops/registry.py` — `ModelRegistry.log_run()` (FR-08: MLflow
+  params/metrics/artifact, then DR-08: the exact partition boundaries into
+  `model_run`) and `.register_version()` (FR-09). Defaults to a local
+  SQLite-backed MLflow store (`sqlite:///mlruns.db`), not `file:./mlruns` —
+  MLflow 3.x put the plain filesystem backend into maintenance mode and
+  refuses to open one without an explicit opt-out flag; the local default
+  here is the forward-compatible database URI, not a flag that silences the
+  deprecation. A real deployment points `MLFLOW_TRACKING_URI` at the
+  docker-compose `mlflow` service instead.
+- `src/dataops/processing.walk_forward_splits()` — rolling (train, eval)
+  windows across distinct regimes, each satisfying DR-06 by construction
+  (eval_start is always train_end + 1 day, not a separately-checked
+  invariant).
+- `scripts/train_agent.py` — runs the walk-forward × seed-sweep loop end to
+  end: trains, evaluates, logs every run, and registers the best-Sharpe
+  seed per split as a `model_version`. Smoke-tested against a temporary
+  SQLite store spanning ~3.5 years of synthetic data: 17 splits × 2 seeds
+  ran cleanly with no errors. Per-seed Sharpe varied wildly within some
+  splits (e.g. one split: seed 0 → 1.67, seed 1 → −7.23) — exactly the
+  seed-sensitivity §10.2 already warned about, not a bug; it is the
+  concrete demonstration of why the seed sweep is there.
+- 16 new tests (`test_agent.py`, `test_registry.py`, plus 4 for
+  `walk_forward_splits` in `test_processing.py`), all synthetic/offline —
+  the registry tests chdir into `tmp_path` (MLflow's artifact store defaults
+  to a relative `./mlruns` regardless of the tracking DB location, which
+  will otherwise leak a stray directory into the repo root on every test
+  run — it did, once, before this fix; deleted, not committed).
 
 **5. Sprint 4 — serving and the CT loop.**
 - `src/serving/schemas.py` — Pydantic models (IR-05, NFR-08)

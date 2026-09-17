@@ -14,7 +14,7 @@
 | Chapter 1 | Introduction & Problem Statement | ✅ Complete |
 | Chapter 2 | Literature Review | ✅ Complete |
 | Chapter 3 | Methodology & System Design | ✅ Complete |
-| Chapter 4 | System Implementation | 🔄 In Progress (Sprints 1–2 Complete) |
+| Chapter 4 | System Implementation | 🔄 In Progress (Sprints 1–3 Complete) |
 | Chapter 5 | Results, Testing & Evaluation | ⏳ Awaiting Chapter 4 |
 
 > **Proposal Defence:** Completed — June 2026  
@@ -42,8 +42,8 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 │  │ DataOps  │──▶│  RLOps   │──▶│ FastAPI  │──▶│  React.js   │  │
 │  │ Layer    │   │ Training │   │ Serving  │   │  Dashboard  │  │
 │  │          │   │  Layer   │   │  Layer   │   │             │  │
-│  │ yfinance │   │  FinRL   │   │ Inference│   │  Portfolio  │  │
-│  │PostgreSQL│   │   PPO    │   │ Gateway  │   │  Telemetry  │  │
+│  │ yfinance │   │TradingEnv│   │ Inference│   │  Portfolio  │  │
+│  │PostgreSQL│   │PPO(SB3)  │   │ Gateway  │   │  Telemetry  │  │
 │  └──────────┘   └──────────┘   └──────────┘   └─────────────┘  │
 │       ▲                                               │          │
 │       └───────── CT Orchestrator (Sharpe Monitor) ◀──┘          │
@@ -55,8 +55,8 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 | Layer | Responsibility | Technology | Package | Status |
 |---|---|---|---|---|
 | **DataOps** | Ingest, clean, enrich and persist market data | `yfinance` + PostgreSQL + SQLAlchemy | `src/dataops` | ✅ Sprint 1 Complete |
-| **RLOps** | MDP environment, baseline policies, PPO agent | Gymnasium + Stable Baselines3 | `src/rlops` | ✅ Sprint 2 Complete (agent: Sprint 3) |
-| **Orchestration** | Performance metrics, drift detection, CT cycle | Python (custom) | `src/orchestration` | 🔄 Sprint 2 (metrics); ⏳ Sprint 4 (CT loop) |
+| **RLOps** | MDP environment, baseline policies, PPO agent, registry | Gymnasium + Stable Baselines3 + MLflow | `src/rlops` | ✅ Sprints 2 & 3 Complete |
+| **Orchestration** | Performance metrics, drift detection, CT cycle | Python (custom) | `src/orchestration` | ✅ Sprint 2 (metrics); ⏳ Sprint 4 (CT loop) |
 | **Serving** | Inference API, volatility fail-safe | FastAPI (ASGI) | `src/serving` | ⏳ Sprint 4 |
 | **Presentation** | Real-time telemetry dashboard | React.js SPA | `frontend/` | ⏳ Sprint 4 |
 
@@ -66,11 +66,15 @@ Dependencies flow one way only — orchestration toward data and model concerns 
 
 ## 🤖 The RL Agent & Universe
 
-- **Algorithm:** Proximal Policy Optimization (PPO) via Stable Baselines3 — Sprint 3
+- **Algorithm:** Proximal Policy Optimization (PPO) via Stable Baselines3, wrapped by
+  `PPOAgent` (`src/rlops/agent.py`), on `device="cpu"` — benchmarked ~12–13× faster than
+  `"mps"` on the actual training hardware (`CLAUDE.md` §9), not a default left open for tuning
 - **Environment:** `TradingEnvironment` (`src/rlops/environment.py`), a Gymnasium-compatible
   MDP implemented directly to spec. FinRL's `StockTradingEnv` was evaluated and does import
   successfully, but its reward has no override hook and its actions are hmax-scaled share
-  counts rather than continuous weights — see the recorded deviation in `CLAUDE.md` §8.
+  counts rather than continuous weights — see the recorded deviation in `CLAUDE.md` §8, and the
+  cross-check against it in `scripts/finrl_crosscheck.py` (max abs diff $0.00007 on a ~$100K
+  portfolio, correlation 1.0)
 - **Action Space:** Continuous target weight per ticker, in [-1, 1]
 - **State Space:** 8 backward-looking z-scored features per ticker (OHLCV + SMA_20 + RSI_14
   + VIX) plus the agent's own current position weights and cash weight — 46 dimensions for
@@ -79,7 +83,11 @@ Dependencies flow one way only — orchestration toward data and model concerns 
 - **Baselines:** buy-and-hold, equal-weight-rebalanced, all-cash, random (`src/rlops/baselines.py`)
 - **Metrics:** Sharpe ratio, rolling Sharpe, max drawdown, cumulative return, deflated Sharpe
   ratio (`src/orchestration/evaluator.py`)
-- **Validation:** Walk-forward time-series cross-validation (no look-ahead bias)
+- **Registry:** `ModelRegistry` (`src/rlops/registry.py`) — MLflow run logging (FR-08) and
+  `model_version` registration (FR-09)
+- **Validation:** Walk-forward cross-validation across rolling regimes
+  (`processing.walk_forward_splits`), each with a 5-seed sweep, not a single train/eval split
+  or a single seed
 
 ### Target Equities
 
@@ -116,18 +124,23 @@ mlops-energy-trader/
 │
 ├── scripts/
 │   ├── run_ingestion.py      # CLI runner for data ingestion pipeline
-│   └── run_baselines.py      # CLI runner for the baseline policies (Sprint 2)
+│   ├── run_baselines.py      # CLI runner for the baseline policies (Sprint 2)
+│   ├── benchmark_device.py   # CPU vs MPS PPO throughput benchmark (Sprint 3)
+│   ├── finrl_crosscheck.py   # §8 validation experiment against FinRL (Sprint 3)
+│   └── train_agent.py        # Walk-forward PPO training + seed sweep (Sprint 3)
 │
 ├── src/
 │   ├── config.py             # Database, risk and environment settings
 │   ├── dataops/              # Sprint 1 — ETL pipeline (yfinance → PostgreSQL)
 │   │   ├── ingestion.py
-│   │   ├── processing.py
+│   │   ├── processing.py     # + walk_forward_splits (Sprint 3)
 │   │   ├── models.py
 │   │   └── repository.py
-│   ├── rlops/                # Sprint 2 — MDP environment + baselines; Sprint 3 — PPO agent
+│   ├── rlops/                # Sprint 2 — MDP environment + baselines
 │   │   ├── environment.py
-│   │   └── baselines.py
+│   │   ├── baselines.py
+│   │   ├── agent.py          # PPOAgent wrapper over SB3 (Sprint 3)
+│   │   └── registry.py       # MLflow logging + model_version registration (Sprint 3)
 │   ├── orchestration/        # Sprint 2 — metrics; Sprint 4 — CT loop & drift detection
 │   │   └── evaluator.py
 │   └── serving/              # Sprint 4 — FastAPI inference + CT orchestrator
@@ -137,7 +150,9 @@ mlops-energy-trader/
     ├── test_repository.py
     ├── test_environment.py
     ├── test_baselines.py
-    └── test_evaluator.py
+    ├── test_evaluator.py
+    ├── test_agent.py
+    └── test_registry.py
 ```
 
 ---
@@ -177,6 +192,10 @@ python scripts/run_ingestion.py --tickers XOM --start 2024-01-01 --end 2024-06-0
 # Run the baseline policies over the evaluation partition (Sprint 2)
 python scripts/run_baselines.py
 python scripts/run_baselines.py --partition train --tickers XOM CVX
+
+# Walk-forward PPO training with a seed sweep, logged to MLflow (Sprint 3)
+python scripts/train_agent.py
+python scripts/train_agent.py --timesteps 50000 --seeds 5
 ```
 
 ### Running Tests
@@ -231,6 +250,10 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 | FR-13 | `orchestration.evaluator.rolling_sharpe` | `test_rolling_sharpe_warmup_rows_are_nan_not_zero` |
 | I1 | `TradingEnvironment._prepare` (backward-looking alignment) | `test_observation_contains_no_future_information` |
 | I2 | `TradingEnvironment.step` (t → t+1 realisation) | `test_return_is_realised_from_t_to_t_plus_one` |
+| FR-07 | `PPOAgent.train` (reward from `TradingEnvironment`) | `test_agent_trains_without_error` |
+| FR-08 | `ModelRegistry.log_run` | `test_log_run_records_hyperparameters_in_mlflow` |
+| FR-09 | `ModelRegistry.register_version` | `test_register_version_links_to_its_run` |
+| DR-08 | `ModelRegistry.log_run` → `model_run` partition columns | `test_log_run_persists_exact_partition_boundaries` |
 
 ---
 
@@ -238,7 +261,7 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 
 - [x] **Sprint 1 — DataOps Foundation (Complete).** Ingestion, enrichment, persistence, schema, tests.
 - [x] **Sprint 2 — Trading Environment (Complete).** Gymnasium MDP, continuous action space, drawdown-incremented reward, baseline policies, evaluation metrics.
-- [ ] **Sprint 3 — Training & Model Registry.** PPO on CPU (benchmarked faster than MPS), walk-forward validation, MLflow.
+- [x] **Sprint 3 — Training & Model Registry (Complete).** PPO on CPU (benchmarked ~12–13× faster than MPS), walk-forward cross-validation with a seed sweep, MLflow logging, `model_version` registration.
 - [ ] **Sprint 4 — Serving & CT Loop.** FastAPI, VIX fail-safe, React dashboard, orchestrator.
 
 ---

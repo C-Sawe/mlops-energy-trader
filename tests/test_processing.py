@@ -159,6 +159,42 @@ def test_partition_produces_disjoint_ordered_sets():
     assert set(train["date"]).isdisjoint(set(evaluation["date"]))
 
 
+# --------------------------------------------------------------- walk-forward
+def test_walk_forward_splits_are_chronological_and_disjoint():
+    splits = P.walk_forward_splits(
+        "2015-01-01", "2020-01-01", train_days=365, eval_days=90
+    )
+    assert len(splits) > 1  # more than one regime, not a single split
+
+    for split in splits:
+        assert split["eval_start"] > split["train_end"]  # DR-06, by construction
+        assert split["train_end"] > split["train_start"]
+        assert split["eval_end"] > split["eval_start"]
+
+    for a, b in zip(splits, splits[1:]):
+        assert b["train_start"] > a["train_start"]  # each window rolls forward
+
+
+def test_walk_forward_default_step_gives_non_overlapping_eval_windows():
+    splits = P.walk_forward_splits(
+        "2015-01-01", "2018-01-01", train_days=365, eval_days=180
+    )
+    for a, b in zip(splits, splits[1:]):
+        assert b["eval_start"] > a["eval_end"]  # no evaluation day scored twice
+
+
+def test_walk_forward_splits_never_exceed_the_end_date():
+    end = pd.Timestamp("2016-06-30")
+    splits = P.walk_forward_splits("2015-01-01", "2016-06-30", train_days=365, eval_days=90)
+    for split in splits:
+        assert split["eval_end"] <= end
+
+
+def test_walk_forward_splits_empty_when_range_too_short():
+    splits = P.walk_forward_splits("2015-01-01", "2015-06-01", train_days=365, eval_days=90)
+    assert splits == []
+
+
 # --------------------------------------------------------------- DR-03
 def test_corporate_action_adjustment_preserves_ratios():
     """A 2:1 split halves price and doubles volume, leaving value intact."""
