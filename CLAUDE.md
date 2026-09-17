@@ -686,6 +686,68 @@ most common way an RL trading thesis fails at defence.
 Also report: walk-forward validation across distinct market regimes (Section
 3.3.4), not a single split.
 
+### First real training run — 2026-09-17, this checkout
+
+Real market data (13,825 rows, 2015-01-02→2025-12-30, all 5 tickers + VIX,
+ingested for real via `scripts/run_ingestion.py` with no `--start`/`--end`
+override, into the real `mlops_postgres` container) through
+`scripts/train_agent.py` at real settings (no synthetic data, no toy
+hyperparameters): **18 walk-forward splits × 5 seeds = 90 models**, ~20
+minutes on the M5 CPU. All 90 runs logged to `model_run`; the best seed per
+split registered as a `model_version` (18 total) — **none promoted**, which
+is correct, not a gap: this script produces validation folds for reporting,
+not a production deployment decision (`ModelRegistry.register_version()`
+deliberately never sets `is_active`; see §7).
+
+**The headline numbers, reported the way §10 asks them to be, not the
+flattering way:**
+
+| Statistic | Value | What it's measuring |
+|---|---|---|
+| Best-seed-per-split Sharpe, n=18 | mean 0.570, std 1.279 | what gets *registered* each split — already a maximum over 5 seeds |
+| All individual seeds pooled, n=90 | mean −0.606, std 1.507 | what an *untuned* seed actually gets you |
+| Positive splits | 10/18 | regime-dependent, not uniformly positive |
+
+That gap between 0.570 and −0.606 is the selection-bias effect §10.3 exists
+to catch, demonstrated with this project's own real numbers rather than a
+hypothetical. **The best single result across all 90 runs** was split 11
+(eval 2021-12-05→2022-06-02), seed 0, Sharpe **3.273**, `run_id`
+`7f60784a-805f-4047-ad74-fad67261920c` — re-run standalone to confirm exact
+reproducibility given a fixed seed (it reproduced to three decimal places)
+and to recover the per-period returns MLflow didn't log a copy of:
+
+- **Undeflated (treated as the only thing tried): PSR = 0.986** — 98.6%
+  probability this Sharpe is genuinely positive, taken alone.
+- **`deflated_sharpe_ratio(returns, n_trials=90)` = 0.388** — under 40%,
+  correcting for having actually tried 90 configurations and reported the
+  best. This is the number that belongs in Chapter 5, not the 0.986, and
+  not the 3.273 either.
+- **Baselines on that exact window** (§10.1, same eval partition, so the
+  comparison is fair): buy-and-hold Sharpe **2.419**, equal-weight
+  **2.388**, random (mean of 5 seeds) **−3.192**, all-cash **0.000**. The
+  agent's 3.273 beats buy-and-hold, but buy-and-hold *itself* scored 2.4 on
+  this window — Dec 2021–Jun 2022 was simply a strong period for energy
+  equities. The margin over a passive baseline is real but modest once
+  that's accounted for, not the standalone number suggests.
+
+**Read this the way §1 requires, not the way it's tempting to read it.** The
+correct sentence is: the walk-forward + seed-sweep + deflation + baseline
+pipeline ran end to end on real data and produced a disciplined, honest
+number (DSR 0.388 on the best fold) instead of an inflated one (0.986 or
+3.273) — that is the architecture responding as designed. The incorrect
+sentence is any version of "the strategy made 41% in six months" — that
+figure is one seed, one fold, in one favourable regime, and the very
+analysis above exists to stop that number from being reported as a result.
+
+**Not yet done:** promoting any of these 18 candidates to `is_active` (a
+deliberate separate step — Sprint 4's `CTOrchestrator` would normally do
+this by comparing a candidate against a live incumbent, and there isn't one
+yet); computing `deflated_sharpe_ratio` for the other 17 splits (only the
+single best result was disciplined this way, as a demonstration — a full
+Chapter 5 treatment would want this, or the pooled-90 framing, for every
+fold); and re-running with more than 5 seeds if the defence wants tighter
+confidence intervals than std≈1.3 gives.
+
 ---
 
 ## 11. Code conventions
