@@ -181,15 +181,30 @@ def decisions(
 CYCLE_WINDOW_DAYS = 90  # "this quarter", for the dashboard's cycle-history card
 
 
+def _active_model_label(active: dict | None) -> str | None:
+    """A human-readable label like "September 2026 #2" for the dashboard's
+    "Active model" tile — a presentation convenience only. It is never a
+    substitute for `active_version_id`, which stays the real identifier
+    NFR-07's traceability chain (decision -> version -> run -> partition)
+    actually depends on; the frontend keeps the raw ID available too (as a
+    hover title), it just isn't the headline text anymore."""
+    if active is None or active["promoted_at"] is None:
+        return None
+    sequence = repo.get_promotion_sequence(active["promoted_at"])
+    return f"{active['promoted_at'].strftime('%B %Y')} #{sequence}"
+
+
 @app.get("/ct-status", response_model=CTStatusResponse, dependencies=[Depends(_verify_token)])
 def ct_status() -> CTStatusResponse:
     """FR-20: serving / evaluating / retraining, for the dashboard's status indicator."""
     ingest = repo.latest_ingest_info()
     since = date.today() - timedelta(days=CYCLE_WINDOW_DAYS)
     cycle = repo.get_cycle_stats(since)
+    active = repo.get_active_version()
     return CTStatusResponse(
         status=orchestrator.status.value,
         active_version_id=service.active_version_id,
+        active_model_label=_active_model_label(active),
         rolling_sharpe=orchestrator.last_rolling_sharpe,
         target_sharpe_threshold=RISK.target_sharpe_threshold,
         last_evaluated_at=orchestrator.last_evaluated_at,

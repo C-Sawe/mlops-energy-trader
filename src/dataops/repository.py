@@ -352,6 +352,31 @@ class MarketRepository:
                 "promoted_at": row.promoted_at,
             }
 
+    def get_promotion_sequence(self, promoted_at) -> int:
+        """1-indexed position of `promoted_at` among all promotions in its
+        calendar month — lets the dashboard label a model "September 2026
+        #2" rather than just its version_id. `version_id` stays the real
+        identifier everywhere NFR-07 traceability actually depends on
+        (the decision log, the version->run->partition chain); this is a
+        presentation label only, not a replacement identifier — two models
+        promoted in the same month (which happened twice in one session,
+        2026-09) would otherwise both read as an unqualified "September
+        2026"."""
+        ts = pd.Timestamp(promoted_at)
+        month_start = ts.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_end = month_start + pd.DateOffset(months=1)
+        with self.session() as session:
+            return session.execute(
+                select(func.count())
+                .select_from(ModelVersion)
+                .where(
+                    ModelVersion.promoted_at.is_not(None),
+                    ModelVersion.promoted_at >= month_start,
+                    ModelVersion.promoted_at < month_end,
+                    ModelVersion.promoted_at <= ts,
+                )
+            ).scalar_one()
+
     def promote_version(self, version_id: str) -> None:
         """FR-17: activate `version_id`, retiring whatever was active.
 

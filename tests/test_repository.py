@@ -358,6 +358,48 @@ def test_promote_version_rejects_unknown_id(repo):
         repo.promote_version("not-a-real-id")
 
 
+def test_get_promotion_sequence_counts_within_the_same_calendar_month(repo):
+    """Backs the dashboard's "September 2026 #2" style label — two models
+    promoted in the same month must be distinguishable, not both read as
+    an unqualified "September 2026"."""
+    v1 = _make_version(repo, artifact_uri="uri-1")
+    v2 = _make_version(repo, artifact_uri="uri-2")
+    v3 = _make_version(repo, artifact_uri="uri-3")
+
+    repo.promote_version(v1)
+    p1 = repo.get_active_version()["promoted_at"]
+    repo.promote_version(v2)
+    p2 = repo.get_active_version()["promoted_at"]
+    repo.promote_version(v3)
+    p3 = repo.get_active_version()["promoted_at"]
+
+    assert repo.get_promotion_sequence(p1) == 1
+    assert repo.get_promotion_sequence(p2) == 2
+    assert repo.get_promotion_sequence(p3) == 3
+
+
+def test_get_promotion_sequence_resets_across_calendar_months(repo):
+    v1 = _make_version(repo, artifact_uri="uri-1")
+    v2 = _make_version(repo, artifact_uri="uri-2")
+    repo.promote_version(v1)
+    repo.promote_version(v2)
+
+    with repo.session() as session:
+        moved = session.get(ModelVersion, v2)
+        moved.promoted_at = moved.promoted_at + pd.DateOffset(months=1)
+        session.commit()
+        moved_promoted_at = moved.promoted_at
+
+    with repo.session() as session:
+        v1_promoted_at = session.get(ModelVersion, v1).promoted_at
+
+    # v1 is still the only promotion in its own month; v2, moved a month
+    # forward, is the only promotion in its new month too — neither should
+    # see the other as a same-month sibling anymore.
+    assert repo.get_promotion_sequence(v1_promoted_at) == 1
+    assert repo.get_promotion_sequence(moved_promoted_at) == 1
+
+
 # --------------------------------------------------------------- FR-17 (cycle stats)
 def test_get_cycle_stats_counts_promoted_and_rejected(repo):
     promoted_version = _make_version(repo, artifact_uri="uri-promoted")

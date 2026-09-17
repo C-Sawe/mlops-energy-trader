@@ -81,7 +81,8 @@ export const Button = forwardRef(function Button(
 
 /* ------------------------------------------------------------ status strip */
 export function StatusStrip({
-  pipeline, model, lastIngest, ingestionStatus, ingestionCheckedAt, ingestionOk, vix, failSafeThreshold,
+  pipeline, model, modelLabel, modelId, lastIngest,
+  ingestionStatus, ingestionCheckedAt, ingestionOk, vix, failSafeThreshold,
 }) {
   const tripped = vix != null && failSafeThreshold != null && vix > failSafeThreshold;
   const tone = { SERVING: "good", EVALUATING: "idle", RETRAINING: "warn" }[pipeline] || "idle";
@@ -104,7 +105,7 @@ export function StatusStrip({
       </div>
       <div className="strip-cell">
         <span className="strip-k">Active model</span>
-        <span className="strip-v num">{model ?? "—"}</span>
+        <span className="strip-v" title={modelId ?? undefined}>{modelLabel ?? model ?? "—"}</span>
       </div>
       <div className="strip-cell">
         <span className="strip-k">Last ingest</span>

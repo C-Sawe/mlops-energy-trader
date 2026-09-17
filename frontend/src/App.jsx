@@ -36,6 +36,8 @@ function adaptStatus(raw) {
   return {
     pipeline: raw.status,
     model: shortId(raw.active_version_id),
+    modelLabel: raw.active_model_label ?? shortId(raw.active_version_id),
+    modelId: raw.active_version_id,
     lastIngest: raw.last_ingest_date ? fmtShortDate(new Date(raw.last_ingest_date)) : "—",
     vix: raw.current_vix,
     failSafeThreshold: raw.vix_critical_threshold,
@@ -194,6 +196,8 @@ export default function App() {
       <StatusStrip
         pipeline={status.pipeline}
         model={status.model}
+        modelLabel={status.modelLabel}
+        modelId={status.modelId}
         lastIngest={status.lastIngest}
         ingestionStatus={status.ingestionStatus}
         ingestionCheckedAt={status.ingestionCheckedAt}

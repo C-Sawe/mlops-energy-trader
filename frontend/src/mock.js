@@ -51,6 +51,8 @@ export const sharpe = Array.from({ length: N }, (_, i) => {
 export const status = {
   pipeline: "SERVING",
   model: "v1.4.2",
+  modelLabel: "June 2026 #3",
+  modelId: "v1.4.2",
   lastIngest: "11 Jun · 16:30",
   ingestionStatus: "IDLE",
   ingestionCheckedAt: "11/06/2026 16:30:00",
