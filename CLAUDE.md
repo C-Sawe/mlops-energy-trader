@@ -1122,6 +1122,46 @@ default) guards the endpoints that matter, which is what got built.
   mitigation is procedural, not technical: verify a claim about *this*
   checkout's state (file existence, test counts, "measured" numbers) by
   reading the checkout, before building on it or repeating it in Chapter 5.
+- **`mlruns.db` lost its pre-existing run history to a schema migration —
+  root cause not fully diagnosed (2026-09-17).** Restarting the backend
+  after the `resolve_mlflow_tracking_uri()` fix (§7) — the first time that
+  fix's `mlflow.set_tracking_uri()` call ran against the real, long-lived
+  `mlruns.db` rather than a test fixture — triggered a schema
+  upgrade/migration. Afterward the file had a much larger table set (many
+  tables — `webhooks`, `guardrails`, `review_queues`, `mcp_servers` — that
+  weren't there before) and the `runs` table was empty: all 92 real
+  training runs' MLflow-side metadata (params/metrics logged during
+  training) was gone. **What was not lost:** Postgres's `model_run` /
+  `model_version` tables (DR-08/NFR-07's actual source of truth — partition
+  boundaries, hyperparameters, promotion history — all 92/19 rows intact)
+  and the real trained artifact files on disk under `mlruns/1/<run_id>/`
+  (confirmed present, unchanged). The then-active version's `model_version`
+  row was pointed directly at its `model.zip`'s real filesystem path
+  instead of the `runs:/<id>/model` indirection, which let
+  `InferenceService` load it without needing MLflow's run registry to
+  resolve anything — a pragmatic patch for that one row, not a fix to
+  whatever caused the migration. Runs logged *after* this event (e.g.
+  version `bf65de93`, promoted the same session) register and resolve
+  normally through the standard `runs:/` mechanism, so this looks like a
+  one-time transition cost, not an ongoing fragility — but that's an
+  observation, not a diagnosis, and no root cause was confirmed. If this
+  ever recurs, check `mlruns.db`'s row count and `alembic_version` before
+  assuming a restart is safe, and don't assume the direct-path workaround
+  generalizes to new runs — it doesn't need to, since new runs weren't
+  affected.
+- **A ~4.5-month real data gap existed (2025-12-30 → 2026-05-20) because
+  scheduled ingestion had never actually run before this session's
+  ingestion-scheduler fix landed.** The original backfill stopped at
+  `DATA.eval_end` (2025-12-31, §6), and nothing pulled anything newer until
+  the new scheduler's first tick — which only covers its own trailing
+  window (120 days by default), not arbitrary historical gaps. Closed with
+  an explicit `scripts/run_ingestion.py --start 2025-09-01 --end
+  2026-09-16` (wide enough before the gap for SMA_20/RSI_14 warm-up, per
+  the same reasoning as `DEFAULT_TRAILING_WINDOW_DAYS`). Worth remembering:
+  the scheduler is correct for steady-state (a process that's been running
+  continuously), but a gap larger than its trailing window needs an
+  explicit backfill, not just letting the scheduler catch up on its own —
+  it won't.
 
 ---
 
