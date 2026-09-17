@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config import RISK, SERVING
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator
+from src.orchestration.ingestion_scheduler import DEFAULT_TRAILING_WINDOW_DAYS, run_ingestion_tick
 from src.rlops.registry import ModelRegistry
 from src.serving.inference import InferenceService, NoActiveModelError
 from src.serving.schemas import (
@@ -36,6 +37,11 @@ from src.serving.schemas import (
 )
 
 CT_EVALUATION_INTERVAL_SECONDS = int(os.environ.get("CT_EVALUATION_INTERVAL_SECONDS", "300"))
+# Daily by default: yfinance's OHLCV bars only change once per trading day
+# (§9), so anything more frequent just re-fetches the same values. Set
+# lower for a live demo of FR-01 actually landing new rows without a human
+# re-running scripts/run_ingestion.py.
+INGESTION_INTERVAL_SECONDS = int(os.environ.get("INGESTION_INTERVAL_SECONDS", "86400"))
 
 # Constructed in `lifespan`, not here: `InferenceService.__init__` queries
 # the database immediately (it loads whatever model_version is active), so
@@ -49,6 +55,7 @@ service: InferenceService
 registry: ModelRegistry
 orchestrator: CTOrchestrator
 _scheduler_task: asyncio.Task | None = None
+_ingestion_task: asyncio.Task | None = None
 
 
 async def _run_scheduler() -> None:
@@ -60,16 +67,31 @@ async def _run_scheduler() -> None:
             logging.getLogger(__name__).exception("scheduled CT evaluation failed")
 
 
+async def _run_ingestion_scheduler() -> None:
+    """FR-01: ingest without manual intervention. Runs `fetch_market_data`'s
+    blocking network I/O off the event loop via `asyncio.to_thread` so a
+    slow or retrying fetch never stalls `/predict` (FR-15's "keep serving"
+    applies here too, not just during a retrain)."""
+    while True:
+        await asyncio.sleep(INGESTION_INTERVAL_SECONDS)
+        try:
+            await asyncio.to_thread(run_ingestion_tick, repo)
+        except Exception:  # noqa: BLE001 - the scheduler must survive a bad tick
+            logging.getLogger(__name__).exception("scheduled ingestion tick failed")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global repo, service, registry, orchestrator, _scheduler_task
+    global repo, service, registry, orchestrator, _scheduler_task, _ingestion_task
     repo = MarketRepository()
     service = InferenceService(repo=repo)
     registry = ModelRegistry(repo=repo)
     orchestrator = CTOrchestrator(service, repo=repo, registry=registry)
     _scheduler_task = asyncio.create_task(_run_scheduler())
+    _ingestion_task = asyncio.create_task(_run_ingestion_scheduler())
     yield
     _scheduler_task.cancel()
+    _ingestion_task.cancel()
 
 
 app = FastAPI(title="MLOps Trading Inference API", lifespan=lifespan)
@@ -190,4 +212,24 @@ def trigger_evaluation(as_of: date | None = Query(default=None)) -> CTStatusResp
     defaulting to `date.today()`.
     """
     orchestrator.evaluate(as_of=as_of)
+    return ct_status()
+
+
+@app.post("/ingest/run", response_model=CTStatusResponse, dependencies=[Depends(_verify_token)])
+def trigger_ingestion(
+    end: date | None = Query(default=None),
+    window_days: int = Query(default=DEFAULT_TRAILING_WINDOW_DAYS, ge=1),
+) -> CTStatusResponse:
+    """FR-01, on-demand counterpart to the background ingestion scheduler:
+    pulls fresh data immediately instead of waiting for
+    INGESTION_INTERVAL_SECONDS. Runs synchronously — a sync route function
+    already executes in Starlette's threadpool, so the blocking network
+    call inside `run_ingestion_tick` does not stall the event loop or any
+    concurrent `/predict` call.
+
+    `end`/`window_days` exist for the same operational reason `/ct/evaluate`
+    takes `as_of`: forcing a specific range for backfill or a demo, rather
+    than always defaulting to `date.today()`.
+    """
+    run_ingestion_tick(repo, window_days=window_days, end=end)
     return ct_status()

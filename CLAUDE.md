@@ -90,7 +90,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 112 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 115 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -302,12 +302,13 @@ src/rlops/            environment · baselines                         [Sprint 2
                       · agent · registry                              [Sprint 3]
 src/orchestration/    evaluator                                       [Sprint 2]
                       · ct_orchestrator                                [Sprint 4]
+                      · ingestion_scheduler                            [Sprint 4, post-hoc]
 src/serving/          schemas · inference · api                       [Sprint 4]
 frontend/              React + hand-rolled SVG charts, no CSS framework [Sprint 4]
 scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
-tests/                107 tests (backend; frontend has no test suite yet)
+tests/                115 tests (backend; frontend has no test suite yet)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -474,6 +475,50 @@ against a specific date (`src/serving/api.py`), and the dashboard's
 `last_ingest_date` instead of `new Date()` (`frontend/src/api.js`) — "last N
 days" means the same thing whether ingestion is perfectly current or a few
 days behind, not "blank unless today happens to have data."
+
+**FR-01's "without manual intervention" was a claim the comments made, not
+one the code kept — until this fix (2026-09-17).** `fetch_market_data`'s
+own docstring (`src/dataops/ingestion.py`) and `persist()`'s
+(`src/dataops/repository.py`) both referred to "the scheduled job" that
+refetches a trailing window, as if it already existed. It didn't: the only
+autonomous background task anywhere in this checkout was
+`CTOrchestrator`'s evaluation scheduler (FR-13/14), which only ever
+re-evaluates whatever is *already* in the database — nothing ever
+refetched new data on its own. Every ingestion, including the real
+2015–2025 backfill in §9, was a human running `scripts/run_ingestion.py`
+by hand. Fixed by adding `src/orchestration/ingestion_scheduler.py`
+(`run_ingestion_tick()`) and wiring a second background task into
+`src/serving/api.py`'s lifespan, mirroring the existing CT-evaluation
+scheduler exactly — same pattern, same failure handling (log and skip a
+bad tick rather than crash the process). `POST /ingest/run` is the
+on-demand counterpart, same relationship `/ct/evaluate` has to its own
+scheduler. Configurable via `INGESTION_INTERVAL_SECONDS` (default 86400 —
+daily, since yfinance's OHLCV only changes once per trading day; lower it
+for a live demo).
+
+The window this refetches on each tick can't be small. Wilder's RSI_14
+(§9) is an EMA with unbounded memory — it never fully forgets data before
+wherever a fetch happens to start — so recomputing it from only the last
+few days reproduces a measurably *colder* value than the one a full
+backfill already computed, and because `persist()` upserts, a scheduled
+tick would silently overwrite a correct, converged indicator with a wrong
+one for every date the two windows overlap. `DEFAULT_TRAILING_WINDOW_DAYS
+= 120` in `ingestion_scheduler.py` exists specifically so the EMA has
+decayed past any practical difference — `(1 - 1/14)**120 ≈ 1.9e-4` — before
+the days the tick actually cares about. `sma_20` has no such issue (a
+plain rolling mean has no memory past its own window), but 120 days covers
+it trivially too. Guarded by
+`test_ingestion_tick_reproduces_warm_indicators_not_nulls`
+(`tests/test_ingestion_scheduler.py`), which would fail immediately on a
+window narrow enough to reintroduce the NaN-clobber this is designed to
+avoid.
+
+This does not make the system a live trading system — there is still no
+broker connection, and CLAUDE.md §1's Sim2Real boundary is unchanged.
+What it fixes is DataOps actually being continuous rather than requiring a
+human to remember to re-run a script — the literal reading of FR-01, and
+part of what "the architecture, not the alpha" is supposed to mean when
+someone asks whether this pipeline runs itself.
 
 ---
 
