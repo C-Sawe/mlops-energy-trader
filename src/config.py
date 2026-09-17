@@ -121,6 +121,32 @@ class EnvironmentConfig:
 
 
 @dataclass(frozen=True)
+class BrokerConfig:
+    """Alpaca paper-trading credentials (NFR-10: never hard-coded, never
+    committed). Deliberately paper-trading only — `base_url` is a fixed
+    constant, not environment-configurable, so nothing in this codebase can
+    be pointed at Alpaca's live-trading endpoint by an env var typo. See
+    CLAUDE.md §7's Alpaca entry for why this exists and what it does and
+    does not demonstrate.
+
+    Properties, not `field(default_factory=...)`, for the same reason as
+    `ServingConfig.bearer_token`: a frozen dataclass field's default factory
+    runs once at module import, before a test (or a real run) has had a
+    chance to set the environment variable.
+    """
+
+    base_url: str = "https://paper-api.alpaca.markets"
+
+    @property
+    def api_key(self) -> str | None:
+        return os.environ.get("ALPACA_API_KEY")
+
+    @property
+    def secret_key(self) -> str | None:
+        return os.environ.get("ALPACA_SECRET_KEY")
+
+
+@dataclass(frozen=True)
 class ServingConfig:
     """Sprint 4 note (CLAUDE.md §12): single-user local operation, no user
     table. A single bearer token is proportionate for the exposed surface
@@ -147,5 +173,6 @@ DATABASE = DatabaseConfig()
 INGESTION = IngestionConfig()
 RISK = RiskConfig()
 ENVIRONMENT = EnvironmentConfig()
+BROKER = BrokerConfig()
 SERVING = ServingConfig()
 ENVIRONMENT = EnvironmentConfig()
