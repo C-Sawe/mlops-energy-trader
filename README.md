@@ -158,7 +158,7 @@ cp .env.example .env                   # edit credentials if needed
 docker compose up -d postgres          # spin up PostgreSQL container
 ```
 
-On Apple Silicon, install the MPS-enabled PyTorch build when running Sprint 3; set `device="mps"` on the PPO model.
+Benchmarked on an M5 (`scripts/benchmark_device.py`, CLAUDE.md §9): CPU beats MPS by ~12–13× for this policy network (14.7K parameters — small enough that CPU↔GPU transfer overhead dominates any arithmetic MPS would accelerate). Use `device="cpu"` on the PPO model in Sprint 3, not `device="mps"`.
 
 ---
 
@@ -238,7 +238,7 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 
 - [x] **Sprint 1 — DataOps Foundation (Complete).** Ingestion, enrichment, persistence, schema, tests.
 - [x] **Sprint 2 — Trading Environment (Complete).** Gymnasium MDP, continuous action space, drawdown-incremented reward, baseline policies, evaluation metrics.
-- [ ] **Sprint 3 — Training & Model Registry.** PPO on MPS, walk-forward validation, MLflow.
+- [ ] **Sprint 3 — Training & Model Registry.** PPO on CPU (benchmarked faster than MPS), walk-forward validation, MLflow.
 - [ ] **Sprint 4 — Serving & CT Loop.** FastAPI, VIX fail-safe, React dashboard, orchestrator.
 
 ---
