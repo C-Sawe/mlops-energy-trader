@@ -1,23 +1,19 @@
 # RLOps Module
 
-**Sprint 2 & 3 — Status: ⏳ Awaiting Sprint 1**
+**Sprint 2 — Status: ✅ Complete.** **Sprint 3 (PPO agent) — Status: ⏳ Not started.**
 
-This module contains the Reinforcement Learning training environment and PPO agent:
+- `environment.py` — `TradingEnvironment`, a Gymnasium-compatible MDP implemented directly
+  to spec (FR-06, FR-07, FR-11), rather than via FinRL. See the recorded deviation in
+  `CLAUDE.md` §8: FinRL's `StockTradingEnv` imports successfully but its reward has no
+  override hook and its actions are hmax-scaled share counts, not continuous [-1, 1] target
+  weights.
+- `baselines.py` — buy-and-hold, equal-weight-rebalanced, all-cash, and random policies, run
+  through the same environment accounting as any learned agent (CLAUDE.md §10.1).
 
-- FinRL simulated MDP environment over global energy equities
-- PPO agent via Stable Baselines3 (PyTorch backend)
-- Risk-averse reward function — penalises Maximum Drawdown (MDD)
-- Walk-forward time-series cross-validation to prevent look-ahead bias
-
-## Planned Files
+## Planned — Sprint 3
 
 ```
 rlops/
-├── environment.py       # FinRLEnvironment class — MDP wrapper, state/action space
-├── agent.py             # PPOAgent class — training, inference, artifact serialisation
-├── reward.py            # Custom reward function — Sharpe-weighted, MDD-penalised
-├── train.py             # Training entry point — hyperparameter config
-└── validate.py          # Walk-forward backtesting evaluation
+├── agent.py       # PPOAgent — Stable Baselines3 wrapper, train/predict/save/load
+└── registry.py     # MLflow run logging (FR-08) and artifact registration (FR-09)
 ```
-
-## Implementation begins: Sprint 2 (September 2026)

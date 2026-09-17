@@ -14,7 +14,7 @@
 | Chapter 1 | Introduction & Problem Statement | ✅ Complete |
 | Chapter 2 | Literature Review | ✅ Complete |
 | Chapter 3 | Methodology & System Design | ✅ Complete |
-| Chapter 4 | System Implementation | 🔄 In Progress (Sprint 1 Complete) |
+| Chapter 4 | System Implementation | 🔄 In Progress (Sprints 1–2 Complete) |
 | Chapter 5 | Results, Testing & Evaluation | ⏳ Awaiting Chapter 4 |
 
 > **Proposal Defence:** Completed — June 2026  
@@ -55,8 +55,8 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 | Layer | Responsibility | Technology | Package | Status |
 |---|---|---|---|---|
 | **DataOps** | Ingest, clean, enrich and persist market data | `yfinance` + PostgreSQL + SQLAlchemy | `src/dataops` | ✅ Sprint 1 Complete |
-| **RLOps** | MDP environment, PPO agent, model registry | FinRL + Stable Baselines3 + MLflow | `src/rlops` | 🔄 Sprint 2 & 3 |
-| **Orchestration** | Drift detection, continuous training cycle | Python (custom) | `src/orchestration` | ⏳ Sprint 4 |
+| **RLOps** | MDP environment, baseline policies, PPO agent | Gymnasium + Stable Baselines3 | `src/rlops` | ✅ Sprint 2 Complete (agent: Sprint 3) |
+| **Orchestration** | Performance metrics, drift detection, CT cycle | Python (custom) | `src/orchestration` | 🔄 Sprint 2 (metrics); ⏳ Sprint 4 (CT loop) |
 | **Serving** | Inference API, volatility fail-safe | FastAPI (ASGI) | `src/serving` | ⏳ Sprint 4 |
 | **Presentation** | Real-time telemetry dashboard | React.js SPA | `frontend/` | ⏳ Sprint 4 |
 
@@ -66,11 +66,19 @@ Dependencies flow one way only — orchestration toward data and model concerns 
 
 ## 🤖 The RL Agent & Universe
 
-- **Algorithm:** Proximal Policy Optimization (PPO) via Stable Baselines3
-- **Environment:** FinRL (OpenAI Gym–compatible MDP over energy equities)
-- **Action Space:** Continuous — Buy / Hold / Sell portfolio weights
-- **State Space:** OHLCV + SMA_20 + RSI_14 + VIX (enriched observation)
-- **Reward Function:** Risk-averse; penalizes Maximum Drawdown (MDD) heavily
+- **Algorithm:** Proximal Policy Optimization (PPO) via Stable Baselines3 — Sprint 3
+- **Environment:** `TradingEnvironment` (`src/rlops/environment.py`), a Gymnasium-compatible
+  MDP implemented directly to spec. FinRL's `StockTradingEnv` was evaluated and does import
+  successfully, but its reward has no override hook and its actions are hmax-scaled share
+  counts rather than continuous weights — see the recorded deviation in `CLAUDE.md` §8.
+- **Action Space:** Continuous target weight per ticker, in [-1, 1]
+- **State Space:** 8 backward-looking z-scored features per ticker (OHLCV + SMA_20 + RSI_14
+  + VIX) plus the agent's own current position weights and cash weight — 46 dimensions for
+  the 5-ticker universe
+- **Reward Function:** Step return minus the *increment* in maximum drawdown, never its level
+- **Baselines:** buy-and-hold, equal-weight-rebalanced, all-cash, random (`src/rlops/baselines.py`)
+- **Metrics:** Sharpe ratio, rolling Sharpe, max drawdown, cumulative return, deflated Sharpe
+  ratio (`src/orchestration/evaluator.py`)
 - **Validation:** Walk-forward time-series cross-validation (no look-ahead bias)
 
 ### Target Equities
@@ -107,22 +115,29 @@ mlops-energy-trader/
 │       └── system_architecture_diagram.md
 │
 ├── scripts/
-│   └── run_ingestion.py      # CLI runner for data ingestion pipeline
+│   ├── run_ingestion.py      # CLI runner for data ingestion pipeline
+│   └── run_baselines.py      # CLI runner for the baseline policies (Sprint 2)
 │
 ├── src/
-│   ├── config.py             # Database and project settings
+│   ├── config.py             # Database, risk and environment settings
 │   ├── dataops/              # Sprint 1 — ETL pipeline (yfinance → PostgreSQL)
 │   │   ├── ingestion.py
 │   │   ├── processing.py
 │   │   ├── models.py
 │   │   └── repository.py
-│   ├── rlops/                # Sprint 2 & 3 — FinRL env + PPO agent training
-│   ├── orchestration/        # Continuous Training loop & drift detection
+│   ├── rlops/                # Sprint 2 — MDP environment + baselines; Sprint 3 — PPO agent
+│   │   ├── environment.py
+│   │   └── baselines.py
+│   ├── orchestration/        # Sprint 2 — metrics; Sprint 4 — CT loop & drift detection
+│   │   └── evaluator.py
 │   └── serving/              # Sprint 4 — FastAPI inference + CT orchestrator
 │
 └── tests/                    # Unit + integration tests
     ├── test_processing.py
-    └── test_repository.py
+    ├── test_repository.py
+    ├── test_environment.py
+    ├── test_baselines.py
+    └── test_evaluator.py
 ```
 
 ---
@@ -158,6 +173,10 @@ python scripts/run_ingestion.py --start 2024-01-01 --end 2024-03-01 --dry-run
 
 # A single ticker
 python scripts/run_ingestion.py --tickers XOM --start 2024-01-01 --end 2024-06-01
+
+# Run the baseline policies over the evaluation partition (Sprint 2)
+python scripts/run_baselines.py
+python scripts/run_baselines.py --partition train --tickers XOM CVX
 ```
 
 ### Running Tests
@@ -207,13 +226,18 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 | IR-03 | `config.DatabaseConfig` | — |
 | NFR-07 | `trading_decision → model_version → model_run` | `test_decision_traces_back_to_run_and_partition` |
 | NFR-10 | `DatabaseConfig.__repr__` masks password | — |
+| FR-06 | `rlops.environment.TradingEnvironment` | `test_conforms_to_gymnasium_api`, `test_observation_and_action_space_shapes` |
+| FR-07 | `TradingEnvironment._reward` (drawdown increment, I4) | `test_drawdown_penalty_applies_to_increment_not_level` |
+| FR-13 | `orchestration.evaluator.rolling_sharpe` | `test_rolling_sharpe_warmup_rows_are_nan_not_zero` |
+| I1 | `TradingEnvironment._prepare` (backward-looking alignment) | `test_observation_contains_no_future_information` |
+| I2 | `TradingEnvironment.step` (t → t+1 realisation) | `test_return_is_realised_from_t_to_t_plus_one` |
 
 ---
 
 ## 🗓️ Development Sprints & Roadmap
 
 - [x] **Sprint 1 — DataOps Foundation (Complete).** Ingestion, enrichment, persistence, schema, tests.
-- [ ] **Sprint 2 — FinRL Environment.** State space, continuous action space, drawdown-penalized reward.
+- [x] **Sprint 2 — Trading Environment (Complete).** Gymnasium MDP, continuous action space, drawdown-incremented reward, baseline policies, evaluation metrics.
 - [ ] **Sprint 3 — Training & Model Registry.** PPO on MPS, walk-forward validation, MLflow.
 - [ ] **Sprint 4 — Serving & CT Loop.** FastAPI, VIX fail-safe, React dashboard, orchestrator.
 

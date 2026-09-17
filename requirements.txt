@@ -6,8 +6,12 @@ psycopg2-binary>=2.9
 yfinance>=0.2.40
 python-dotenv>=1.0
 
-# Sprint 2-3 - RLOps (install when you reach these sprints)
-# stable-baselines3>=2.3
+# Sprint 2 - RLOps environment, metrics, baselines
+gymnasium>=0.29
+stable-baselines3>=2.3
+scipy>=1.11
+
+# Sprint 3 - RLOps training (install when you reach this sprint)
 # finrl
 # torch
 # mlflow>=2.17

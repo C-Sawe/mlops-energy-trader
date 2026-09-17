@@ -100,7 +100,28 @@ class RiskConfig:
     sell_threshold: float = -0.5
 
 
+@dataclass(frozen=True)
+class EnvironmentConfig:
+    """FR-06, FR-07: the trading MDP's economic parameters.
+
+    Configurable rather than constant so Chapter 5 can report a
+    sensitivity analysis (see RiskConfig) instead of defending magic
+    numbers.
+    """
+
+    initial_cash: float = field(
+        default_factory=lambda: _env_float("INITIAL_CASH", 100_000.0)
+    )
+    transaction_cost_pct: float = field(
+        default_factory=lambda: _env_float("TRANSACTION_COST_PCT", 0.001)
+    )
+    drawdown_penalty_coef: float = field(
+        default_factory=lambda: _env_float("DRAWDOWN_PENALTY_COEF", 1.0)
+    )
+
+
 DATA = DataConfig()
 DATABASE = DatabaseConfig()
 INGESTION = IngestionConfig()
 RISK = RiskConfig()
+ENVIRONMENT = EnvironmentConfig()
