@@ -10,3 +10,7 @@ mlruns/
 .DS_Store
 data/raw/
 data/processed/
+mlruns.db
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo

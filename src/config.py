@@ -120,8 +120,32 @@ class EnvironmentConfig:
     )
 
 
+@dataclass(frozen=True)
+class ServingConfig:
+    """Sprint 4 note (CLAUDE.md §12): single-user local operation, no user
+    table. A single bearer token is proportionate for the exposed surface
+    (read telemetry + /predict); it is optional so local dev and the test
+    suite need not set one — `None` disables the check entirely, which is
+    the deliberate default, not an oversight.
+
+    `bearer_token` is a property, not a `field(default_factory=...)`: a
+    plain dataclass field's default factory runs once, at `ServingConfig()`
+    construction — since `SERVING` is a module-level singleton and
+    `src.config` is imported (and cached) well before any test gets to set
+    `API_BEARER_TOKEN`, a frozen field would never see it. A property reads
+    the environment fresh on every access, the same pattern
+    `DatabaseConfig.url` already uses for `DATABASE_URL`.
+    """
+
+    @property
+    def bearer_token(self) -> str | None:
+        return os.environ.get("API_BEARER_TOKEN")
+
+
 DATA = DataConfig()
 DATABASE = DatabaseConfig()
 INGESTION = IngestionConfig()
 RISK = RiskConfig()
+ENVIRONMENT = EnvironmentConfig()
+SERVING = ServingConfig()
 ENVIRONMENT = EnvironmentConfig()
