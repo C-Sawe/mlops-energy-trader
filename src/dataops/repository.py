@@ -17,12 +17,13 @@ from datetime import date, datetime, timezone
 import pandas as pd
 from sqlalchemy import create_engine, select, func
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from src.config import DATABASE
 from src.dataops.models import (
     Base,
     MarketObservation,
+    ModelRun,
     ModelVersion,
     PortfolioSnapshot,
     TradingDecision,
@@ -237,7 +238,13 @@ class MarketRepository:
                 return decision.decision_id
 
     def list_decisions(self, page: int = 1, page_size: int = 20) -> tuple[list[dict], int]:
-        """FR-19: a paginated decision log, most recent first."""
+        """FR-19: a paginated decision log, most recent first.
+
+        Joins through to `model_run` for `run_id` and the partition
+        boundaries — NFR-07's traceability chain (decision -> version ->
+        run -> data partition) is only actually *visible* if a caller can
+        get all of it back in one call, not just the version_id FK.
+        """
         with self.session() as session:
             total = session.execute(
                 select(func.count()).select_from(TradingDecision)
@@ -245,6 +252,7 @@ class MarketRepository:
 
             stmt = (
                 select(TradingDecision)
+                .options(joinedload(TradingDecision.version).joinedload(ModelVersion.run))
                 .order_by(TradingDecision.decided_at.desc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
@@ -254,6 +262,11 @@ class MarketRepository:
                 {
                     "decision_id": r.decision_id,
                     "version_id": r.version_id,
+                    "run_id": r.version.run_id,
+                    "train_start": r.version.run.train_start,
+                    "train_end": r.version.run.train_end,
+                    "eval_start": r.version.run.eval_start,
+                    "eval_end": r.version.run.eval_end,
                     "decided_at": r.decided_at,
                     "ticker": r.ticker,
                     "raw_weight": float(r.raw_weight) if r.raw_weight is not None else None,
@@ -359,3 +372,50 @@ class MarketRepository:
                     raise ValueError(f"no such model_version: {version_id}")
                 candidate.is_active = True
                 candidate.promoted_at = now
+
+    def get_cycle_stats(self, since: date | str) -> dict:
+        """Training runs logged in the window, and how many were promoted
+        vs rejected by the FR-17 acceptance gate.
+
+        Counts every logged run regardless of trigger — there is no field
+        distinguishing a `CTOrchestrator` retrain from a manual
+        `scripts/train_agent.py` sweep, so this is honestly "training
+        activity in the window", not specifically "autonomous retrains".
+        The dashboard labels it accordingly rather than overclaiming.
+        """
+        since_ts = pd.Timestamp(since)
+        with self.session() as session:
+            total = session.execute(
+                select(func.count()).select_from(ModelRun).where(ModelRun.created_at >= since_ts)
+            ).scalar_one()
+            promoted = session.execute(
+                select(func.count())
+                .select_from(ModelVersion)
+                .join(ModelRun, ModelVersion.run_id == ModelRun.run_id)
+                .where(ModelRun.created_at >= since_ts, ModelVersion.promoted_at.is_not(None))
+            ).scalar_one()
+            rejected = session.execute(
+                select(func.count())
+                .select_from(ModelRun)
+                .where(ModelRun.created_at >= since_ts, ModelRun.status == "REJECTED")
+            ).scalar_one()
+        return {"total_runs": total, "promoted": promoted, "rejected": rejected}
+
+    # ---------------------------------------------------------- ingest info
+    def latest_ingest_info(self) -> dict | None:
+        """Most recent observation across the whole universe — the
+        dashboard's "Last ingest" and "Current VIX" status fields."""
+        stmt = (
+            select(MarketObservation)
+            .order_by(MarketObservation.observation_date.desc(), MarketObservation.ingested_at.desc())
+            .limit(1)
+        )
+        with self.session() as session:
+            row = session.execute(stmt).scalars().first()
+            if row is None:
+                return None
+            return {
+                "date": row.observation_date,
+                "vix": float(row.vix) if row.vix is not None else None,
+                "ingested_at": row.ingested_at,
+            }

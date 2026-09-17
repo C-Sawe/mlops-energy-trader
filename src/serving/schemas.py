@@ -73,6 +73,11 @@ class TelemetryResponse(BaseModel):
 class DecisionLogEntry(BaseModel):
     decision_id: str
     version_id: str
+    run_id: str
+    train_start: date
+    train_end: date
+    eval_start: date
+    eval_end: date
     decided_at: datetime
     ticker: str
     raw_weight: float | None
@@ -98,6 +103,15 @@ class CTStatusResponse(BaseModel):
     rolling_sharpe: float | None
     target_sharpe_threshold: float
     last_evaluated_at: datetime | None
+    last_ingest_date: date | None
+    current_vix: float | None
+    vix_critical_threshold: float
+    # Training activity in the reporting window — every logged run, not
+    # specifically autonomous retrains (see MarketRepository.get_cycle_stats).
+    cycle_window_days: int
+    training_runs: int
+    promoted_count: int
+    rejected_count: int
 
 
 class HealthResponse(BaseModel):

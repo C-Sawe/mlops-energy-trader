@@ -228,15 +228,22 @@ class CTOrchestrator:
                 "candidate sharpe=%.3f vs incumbent sharpe=%.3f", candidate_sharpe, incumbent_sharpe
             )
 
-            if candidate_sharpe > incumbent_sharpe:
-                run_id = self.registry.log_run(
-                    candidate,
-                    train_start,
-                    train_end,
-                    eval_start,
-                    eval_end,
-                    {"sharpe_ratio": candidate_sharpe},
-                )
+            accepted = candidate_sharpe > incumbent_sharpe
+            # Every trained candidate is logged, win or lose — FR-17's
+            # "abort promotion" must still leave a record that a candidate
+            # was tried and rejected, or "how many candidates were held
+            # back" is an unanswerable question rather than a queryable one.
+            run_id = self.registry.log_run(
+                candidate,
+                train_start,
+                train_end,
+                eval_start,
+                eval_end,
+                {"sharpe_ratio": candidate_sharpe},
+                status="COMPLETED" if accepted else "REJECTED",
+            )
+
+            if accepted:
                 from src.dataops.models import ModelRun
 
                 with self.repo.session() as session:

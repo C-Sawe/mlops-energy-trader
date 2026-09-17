@@ -291,6 +291,21 @@ def test_decision_records_failsafe_flag(repo):
     assert item["raw_weight"] is None
 
 
+def test_list_decisions_includes_run_and_partition(repo):
+    """NFR-07's traceability chain (decision -> version -> run -> data
+    partition) is only actually visible if a caller gets all of it back in
+    one call, not just the version_id foreign key."""
+    version_id = _make_version(repo)
+    repo.record_decision(version_id, "XOM", 0.5, "BUY", 15.0)
+
+    [item], _ = repo.list_decisions()
+    assert item["run_id"] is not None
+    assert item["train_start"] == pd.Timestamp("2020-01-01").date()
+    assert item["train_end"] == pd.Timestamp("2022-12-31").date()
+    assert item["eval_start"] == pd.Timestamp("2023-01-01").date()
+    assert item["eval_end"] == pd.Timestamp("2023-12-31").date()
+
+
 # --------------------------------------------------------------- FR-13, FR-18
 def test_record_snapshot_and_list_snapshots_round_trip(repo):
     repo.record_snapshot("2024-01-02", 101_500.0, rolling_sharpe_30d=1.2, max_drawdown=0.05, cumulative_return=0.015)
@@ -341,3 +356,46 @@ def test_promote_version_activates_and_retires(repo):
 def test_promote_version_rejects_unknown_id(repo):
     with pytest.raises(ValueError, match="no such model_version"):
         repo.promote_version("not-a-real-id")
+
+
+# --------------------------------------------------------------- FR-17 (cycle stats)
+def test_get_cycle_stats_counts_promoted_and_rejected(repo):
+    promoted_version = _make_version(repo, artifact_uri="uri-promoted")
+    repo.promote_version(promoted_version)
+
+    with repo.session() as session:
+        rejected_run = ModelRun(
+            train_start=pd.Timestamp("2020-01-01").date(),
+            train_end=pd.Timestamp("2022-12-31").date(),
+            eval_start=pd.Timestamp("2023-01-01").date(),
+            eval_end=pd.Timestamp("2023-12-31").date(),
+            status="REJECTED",
+        )
+        session.add(rejected_run)
+        session.commit()
+
+    stats = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())
+    assert stats["total_runs"] == 2
+    assert stats["promoted"] == 1
+    assert stats["rejected"] == 1
+
+
+def test_get_cycle_stats_excludes_runs_before_the_window(repo):
+    _make_version(repo)  # created "now", inside any reasonable window
+    stats = repo.get_cycle_stats(pd.Timestamp("2099-01-01").date())  # window starts in the future
+    assert stats["total_runs"] == 0
+
+
+# --------------------------------------------------------------- ingest info
+def test_latest_ingest_info_returns_most_recent_observation(repo):
+    df = feature_frame(60)
+    repo.persist(df)
+
+    info = repo.latest_ingest_info()
+    assert info is not None
+    assert info["date"] == pd.Timestamp(df["date"].max()).date()
+    assert info["vix"] is not None
+
+
+def test_latest_ingest_info_none_when_store_is_empty(repo):
+    assert repo.latest_ingest_info() is None

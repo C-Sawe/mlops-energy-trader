@@ -90,7 +90,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 107 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 112 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -303,7 +303,7 @@ src/rlops/            environment · baselines                         [Sprint 2
 src/orchestration/    evaluator                                       [Sprint 2]
                       · ct_orchestrator                                [Sprint 4]
 src/serving/          schemas · inference · api                       [Sprint 4]
-frontend/              React + Tailwind + Framer Motion dashboard      [Sprint 4]
+frontend/              React + hand-rolled SVG charts, no CSS framework [Sprint 4]
 scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
@@ -446,6 +446,18 @@ real deployments use Postgres or a file, both genuinely shared across
 connections — but it would bite anyone who reached for `:memory:` for "quick
 local testing" of anything that touches threading, which the CT loop
 inherently does.
+
+**A rejected candidate is logged too, not just a promoted one.**
+Found while building the dashboard's "Cycle history" card, which wants a
+real "held back" count. `CTOrchestrator._retrain_and_maybe_promote`
+originally called `registry.log_run()` only inside the branch where the
+candidate beat the incumbent — a candidate that lost the FR-17 acceptance
+gate left no record anywhere that it had ever been trained. FR-17 says
+"retain the incumbent and abort promotion"; it does not say "and forget the
+attempt happened." Fixed: `log_run()` now takes a `status` argument, and
+every candidate is logged (`"COMPLETED"` if promoted, `"REJECTED"` if not)
+regardless of outcome — only `register_version()` + `promote_version()` are
+conditional on winning. `MarketRepository.get_cycle_stats()` counts both.
 
 ---
 
@@ -781,20 +793,49 @@ merged back — see §3).**
   Measured, not assumed: triggering a real retrain and hammering `/predict`
   throughout showed 2.1% p95 degradation (§9) — FR-15 holds up under load,
   not just by design intent.
-- `frontend/` — React + TypeScript + Tailwind + Framer Motion, built to the
-  Apple HIG glass aesthetic the user specified: translucent `backdrop-blur`
-  cards, the SF system font stack, spring-physics interactions (a
-  `whileTap` press on every button, a fluid bottom sheet for decision
-  detail). Polls `/telemetry`, `/decisions`, `/ct-status` on a timer — no
-  websocket layer, this is single-user local operation. Verified by
-  actually running it: backend seeded with a trained+promoted model,
-  frontend driven with Playwright (`chromium-cli` wasn't available in this
-  environment), screenshotted in both light and dark mode, decision-detail
-  sheet opened and closed, "Force Check" clicked — `console --errors`
-  clean throughout. That run is what caught the `load_partition` bug above;
-  it would not have been caught by the backend test suite alone, since no
-  existing test exercised `/ct/evaluate` with `as_of` outside the seeded
-  data's range the way a real "today" default does.
+- `frontend/` — React, plain CSS custom properties (no Tailwind), hand-drawn
+  SVG charts (no Recharts), a hand-rolled critically-damped spring
+  integrator (no Framer Motion). **Rebuilt from scratch on 2026-09-17** to a
+  design reference the user supplied directly (superseding an earlier
+  Tailwind/Framer/Recharts version built the same day) — see `frontend/README.md`
+  for the design rationale in full; the highlights:
+  - IR-07's graceful degradation is real, not aspirational: `src/api.js`
+    falls back to `src/mock.js` (visibly marked "Example data — not live
+    results") until the backend answers, and again if it later stops
+    answering. Verified both states render correctly by stopping the
+    backend mid-session and reloading.
+  - The equity chart's buy-and-hold **benchmark series is honestly absent
+    from the live path** — the backend doesn't persist one (the CT
+    orchestrator only replays the incumbent, never a baseline policy,
+    during evaluation) — rather than faked client-side. Only the clearly-
+    labelled mock data shows the full two-series comparison.
+  - The "Cycle history" card is labelled "Training runs, last N days", not
+    "Retrains this quarter" — `model_run` has no field distinguishing an
+    autonomous `CTOrchestrator` retrain from a manual
+    `scripts/train_agent.py` sweep, so the honest label is the one that
+    matches what `MarketRepository.get_cycle_stats` actually counts.
+  - This surfaced a real gap the backend needed anyway: **a rejected
+    candidate was never being logged at all.** `CTOrchestrator._retrain_and_maybe_promote`
+    only called `registry.log_run()` inside the "candidate won" branch — a
+    candidate that lost the FR-17 acceptance gate left zero record of
+    having been trained. Fixed: every candidate is now logged
+    (`status="REJECTED"` when not promoted), which is what makes "how many
+    candidates were held back" an answerable, queryable question instead
+    of always reading zero. `MarketRepository.list_decisions()` was also
+    extended to join through to `model_run` for `run_id` and both
+    partition boundaries, so NFR-07's traceability chain (decision →
+    version → run → training partition → eval partition) is something the
+    decision-detail sheet can actually *show*, not just something the
+    schema makes possible.
+  - Verified by actually running it: backend seeded with a trained+promoted
+    model, frontend driven with Playwright (`chromium-cli` wasn't available
+    in this environment), screenshotted in both light and dark mode,
+    decision-detail sheet opened and closed (including the fail-safe
+    example row), "Force Check" clicked, and the mock fallback exercised by
+    killing the backend mid-session — `console --errors` clean throughout
+    every pass. The earlier version's Playwright run is what caught the
+    `load_partition` empty-frame bug documented in §7; that fix carried
+    over unchanged into this rebuild.
 - NFR-01/02/04 established by measurement (§9); NFR-09 explicitly left
   unmeasured (would require the dashboard actually running for hours).
 
