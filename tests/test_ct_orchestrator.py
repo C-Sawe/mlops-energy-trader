@@ -271,3 +271,35 @@ def test_retrain_retains_incumbent_when_candidate_does_not_beat_it(tmp_path, mon
     # discarded just because it lost the acceptance gate.
     stats = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())
     assert stats["rejected"] == 1
+
+
+def test_retrain_survives_a_genuine_crash_and_leaves_incumbent_active(tmp_path, monkeypatch):
+    """NFR-05: a *failed* retraining cycle (training itself throws, not
+    "the candidate lost the comparison") must leave the incumbent serving
+    and state consistent — and, distinctly from FR-17's already-tested
+    rejection path, the failure itself must be visible, not just a bare
+    stderr traceback from the background thread's default exception hook."""
+    repo, as_of = _seed_repo(tmp_path)
+    incumbent_version = _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+
+    runs_before = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())["total_runs"]
+
+    def exploding_train(self, total_timesteps):
+        raise RuntimeError("simulated training crash")
+
+    monkeypatch.setattr(PPOAgent, "train", exploding_train)
+
+    orchestrator._retrain_and_maybe_promote(as_of)
+
+    assert service.active_version_id == incumbent_version  # untouched
+    assert orchestrator.status == CTStatus.SERVING  # not stuck RETRAINING
+    assert orchestrator.last_retrain_failed_at is not None
+    assert "simulated training crash" in orchestrator.last_retrain_error
+
+    # A crash before a candidate exists has nothing log_run() could record
+    # against — correctly no new row, not a silent swallow of a run that
+    # never happened.
+    runs_after = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())["total_runs"]
+    assert runs_after == runs_before
