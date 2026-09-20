@@ -92,7 +92,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 129 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 131 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -265,6 +265,49 @@ service):
   Leaving it bracketed is the correct call here, not an oversight: inventing
   a number to fill the row would be exactly what the departmental guide
   warns against.
+- **NFR-03 and NFR-05, measured 2026-09-20 — both were listed in this table
+  and never mentioned again anywhere in this file before now**, unlike
+  NFR-01/02/04's detailed write-up above. `scripts/nfr_reliability_check.py`
+  hammers a real `/predict` (real SQLite-backed repo, a real trained
+  PPOAgent, `TestClient`'s in-process ASGI transport) continuously through a
+  real retrain triggered via `orchestrator._trigger_retrain()` — the same
+  method FR-14 itself calls — and explicitly counts failures rather than
+  inferring "probably zero" from a latency chart having no obvious gaps:
+  **1,331 requests, 0 failures** (NFR-03, genuinely counted). Latency
+  under this specific load (continuous hammering for the *entire* retrain,
+  not a before/after comparison like NFR-02's own measurement) came back
+  higher — p50 22.4ms, p95 25.9ms, max 92.8ms — plausibly real GIL
+  contention between the hammering thread and the CPU-bound training
+  thread in this single-process deployment, not a regression from the
+  16.9ms NFR-01 figure, which was measured under different conditions
+  (steady-state, no concurrent retrain). NFR-05 ("a failed retraining
+  cycle leaves the incumbent serving and state consistent") is really a
+  correctness property rather than a load measurement — verified by
+  `test_retrain_survives_a_genuine_crash_and_leaves_incumbent_active`
+  (`tests/test_ct_orchestrator.py`, §7) using a genuine training crash, not
+  just FR-17's already-tested "candidate lost the comparison" — but this
+  script also confirms the incumbent kept answering correctly under real
+  concurrent load throughout a real retrain, which the crash test alone
+  doesn't exercise.
+- **NFR-06, verified 2026-09-20, not just asserted by the architecture
+  diagram in §6.** Installed `import-linter` and wrote `.importlinter` at
+  the repo root, encoding the actual dependency graph rather than the
+  diagram's simplification: `src.serving.api` (the FastAPI composition
+  root, which wires `CTOrchestrator`/`IngestionState` into `lifespan`) sits
+  above `src.orchestration`, which sits above `src.serving.inference` (the
+  module `orchestration` actually imports for FR-17's comparison) — naming
+  "src.serving" as a single layer would have wrongly flagged this, since
+  it isn't a real circular *import* (api.py and inference.py never import
+  each other), just two different modules in the same package occupying
+  different points in the dependency order. A separate `forbidden`
+  contract checks `src.execution` never imports `src.serving` or
+  `src.orchestration` directly, matching §7's Alpaca-deviation claim that
+  it consumes `predict()`'s *output* via a script, not by importing
+  `InferenceService`. Both contracts pass. Guarded by
+  `tests/test_architecture.py`, which runs the same check `lint-imports`
+  does — confirmed to actually catch a violation, not just pass trivially,
+  by pointing it at a deliberately impossible contract first and watching
+  it correctly report "BROKEN".
 
 ### Data
 
@@ -317,7 +360,10 @@ scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
                       · broker_paper_trade_test.py                    [post-Sprint 4]
-tests/                129 tests (backend; frontend has no test suite yet)
+                      · deflated_sharpe_analysis.py                   [post-Sprint 4]
+                      · nfr_reliability_check.py                      [post-Sprint 4]
+.importlinter          NFR-06's layer contracts, checked by tests/test_architecture.py
+tests/                131 tests (backend; frontend has no test suite yet)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -789,6 +835,33 @@ deferral is specific to volatility, not a general brake on FR-14).
 Confirmed the first test actually exercises the new code path, not
 just a tautology: reverting the fix and re-running it fails with
 `RETRAINING` where `SERVING` was expected.
+
+**A genuinely crashing retrain was invisible — found during a "what gaps
+are left" review, not a live failure.** `_retrain_and_maybe_promote()` had
+a `try/finally` but no `except`. The `finally` already reset `_status`
+back to `SERVING` correctly on any exception, so NFR-05's actual guarantee
+("incumbent keeps serving") already held — but the exception itself just
+printed to stderr via Python's default thread-exception hook: nothing
+through this module's own `logger`, and no `model_run` row, since
+`log_run()` needs a trained candidate agent that may never have existed
+(e.g. if `PPOAgent.train()` itself threw). This is a different, stronger
+failure mode than FR-17's "candidate lost the comparison," which was
+already logged and tested — a genuine crash had zero tests and zero
+structured visibility.
+
+Fixed with an `except Exception` that logs via `logger.exception(...)` and
+records `last_retrain_failed_at` / `last_retrain_error` (surfaced on
+`/ct-status` as `last_retrain_failed_at`; the raw exception text stays
+server-side, not in the public response — NFR-10's spirit, not just its
+letter). Guarded by
+`test_retrain_survives_a_genuine_crash_and_leaves_incumbent_active`
+(`tests/test_ct_orchestrator.py`), which monkeypatches `PPOAgent.train` to
+raise directly (not "the candidate happened to score worse" — an actual
+crash) and confirms the incumbent is untouched, status returns to
+`SERVING`, the failure is recorded, and — since a crash before a candidate
+exists has nothing for `log_run()` to record — no new `model_run` row
+appears either. Confirmed as a real regression test: reverting the fix,
+the same `RuntimeError` propagates straight out uncaught.
 
 ---
 

@@ -27,3 +27,4 @@ httpx>=0.27  # TestClient for the FastAPI test suite, and the Alpaca paper-tradi
 
 # Development
 pytest>=8.0
+import-linter>=2.15  # NFR-06: verifies the layered architecture (see .importlinter, tests/test_architecture.py)

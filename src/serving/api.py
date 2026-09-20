@@ -209,6 +209,7 @@ def ct_status() -> CTStatusResponse:
         target_sharpe_threshold=RISK.target_sharpe_threshold,
         last_evaluated_at=orchestrator.last_evaluated_at,
         last_retrain_deferred_at=orchestrator.last_retrain_deferred_at,
+        last_retrain_failed_at=orchestrator.last_retrain_failed_at,
         last_ingest_date=ingest["date"] if ingest else None,
         current_vix=ingest["vix"] if ingest else None,
         vix_critical_threshold=RISK.vix_critical_threshold,

@@ -69,6 +69,8 @@ class CTOrchestrator:
         self._last_rolling_sharpe: float | None = None
         self._last_evaluated_at: datetime | None = None
         self._last_retrain_deferred_at: datetime | None = None
+        self._last_retrain_failed_at: datetime | None = None
+        self._last_retrain_error: str | None = None
         self._retrain_thread: threading.Thread | None = None
 
     @property
@@ -93,6 +95,23 @@ class CTOrchestrator:
         the deferral fired, not just an assumption it would."""
         with self._lock:
             return self._last_retrain_deferred_at
+
+    @property
+    def last_retrain_failed_at(self) -> datetime | None:
+        """NFR-05: set when the retrain thread itself raised — training or
+        evaluation genuinely crashed, not "candidate lost the comparison".
+        Without this, a crash was only ever visible as a bare stderr
+        traceback from Python's default thread-exception hook: nothing
+        logged through this module's own logger, and no `model_run` row,
+        since `log_run()` needs a trained candidate agent that may never
+        have existed."""
+        with self._lock:
+            return self._last_retrain_failed_at
+
+    @property
+    def last_retrain_error(self) -> str | None:
+        with self._lock:
+            return self._last_retrain_error
 
     def _load_normalised_frame(self, start, end) -> pd.DataFrame:
         raw = self.repo.load_partition(start, end, tickers=self.tickers)
@@ -289,6 +308,23 @@ class CTOrchestrator:
             else:
                 # FR-17: the incumbent is retained; promotion is aborted.
                 logger.info("candidate did not beat incumbent; incumbent retained")
+        except Exception as exc:  # noqa: BLE001 - NFR-05: a crashed retrain must not crash the process
+            # A genuine crash (bad data, an OOM, a training exception) is
+            # different from FR-17's "candidate lost the comparison" — that
+            # is a normal, logged outcome; this is not. Without this catch,
+            # the only trace was a bare stderr traceback from Python's
+            # default thread-exception hook: invisible to this module's own
+            # logger, and no model_run row, since log_run() needs a trained
+            # candidate that may never have existed (e.g. if training
+            # itself threw). The incumbent is untouched either way — this
+            # method never promotes anything until every step above
+            # succeeds — so NFR-05's actual guarantee ("state consistent")
+            # already held before this fix; what was missing was knowing it
+            # happened at all.
+            logger.exception("retrain failed; incumbent remains active")
+            with self._lock:
+                self._last_retrain_failed_at = datetime.now(timezone.utc)
+                self._last_retrain_error = str(exc)
         finally:
             with self._lock:
                 self._status = CTStatus.SERVING
