@@ -972,11 +972,60 @@ sentence is any version of "the strategy made 41% in six months" — that
 figure is one seed, one fold, in one favourable regime, and the very
 analysis above exists to stop that number from being reported as a result.
 
-**Not yet done:** computing `deflated_sharpe_ratio` for the other 17 splits
-(only the single best result was disciplined this way, as a demonstration —
-a full Chapter 5 treatment would want this, or the pooled-90 framing, for
-every fold); and re-running with more than 5 seeds if the defence wants
-tighter confidence intervals than std≈1.3 gives.
+**Full statistical-rigor pass — done, 2026-09-20, this checkout
+(`scripts/deflated_sharpe_analysis.py`).** The above disciplined a single
+demonstrated fold; this re-runs all 18 splits with **10 seeds each**
+(double the original sweep, for a tighter confidence interval) and
+computes `deflated_sharpe_ratio` for *every* split's best-seed run, not
+just one. A standalone analysis script, the same kind as
+`scripts/finrl_crosscheck.py` — it does not touch `ModelRegistry` or the
+production `model_run` table, since `deflated_sharpe_ratio` needs the
+actual per-period return series (to estimate skew/kurtosis, Bailey &
+López de Prado 2014), and `scripts/train_agent.py`'s sweep never
+persisted those anywhere, only the summary Sharpe scalar. 180 real
+training runs against the real 2015–2025 data, **671 seconds (~11.2
+minutes)** on the M5 CPU.
+
+| Statistic | 5 seeds (previous) | 10 seeds (this pass) |
+|---|---|---|
+| Best-seed-per-split Sharpe, n=18 | mean 0.570, std 1.279 | mean 1.173, std 0.914 |
+| All individual seeds pooled | mean −0.606, std 1.507 (n=90) | mean −0.723, std 1.583 (n=180) |
+| Positive splits | 10/18 | 17/18 |
+| Deflated Sharpe per split | one fold only: 0.388 | mean 0.055, std 0.073, **max 0.301** (all 18) |
+| Splits with DSR > 0.5 | — | **0 / 18** |
+
+**Read the middle two rows the way §10.2/§10.3 exist to make you read
+them, not the way they first look.** Doubling the seed count pushed the
+best-per-split mean *up* (0.570 → 1.173) and its std *down* — that is not
+the strategy improving; "best of 10" is a maximum-order-statistic that
+mechanically rises and tightens as you draw more samples, regardless of
+whether any single seed is actually good. The pooled-seeds row (what an
+untuned single run actually gets you) barely moved between 90 and 180
+observations — slightly worse, if anything — which is the honest
+population estimate, and it does not show "best of 10" doing anything
+more than getting luckier more often. The DSR column is what actually
+disciplines this: **every one of the 18 splits' best result has a
+deflated Sharpe under 0.31, and none clears 0.5** — not even split 11,
+the single best result across all 180 runs, whose own DSR *fell* from
+0.388 to 0.301 once the trial count was honestly counted at 180 instead
+of 90. That is the correct, complete version of §10.3's point: no fold in
+this sweep survives correction for how many configurations were actually
+tried, which is exactly what "the architecture, not the alpha" (§1) means
+in practice — nothing here should be reported to a defence committee as
+"this fold made money," only as "the disciplined evaluation protocol ran
+to completion and correctly declined to certify any fold as a real edge."
+
+Confirms determinism as a side effect, not just an evaluation result:
+split 11 seed 0 reproduced **3.2727 exactly** (five decimal places) across
+two independent runs of this script three days apart, using the same
+partition boundaries and hyperparameters — the same reproducibility
+property CLAUDE.md already relied on when it first re-ran that fold
+standalone.
+
+Not yet done: annealing the *hyperparameters themselves* (n_steps,
+learning rate, network size) rather than only the seed — everything above
+still holds the original architecture fixed and asks only "how variable
+is this specific configuration," not "is there a better configuration."
 
 **The CT loop's core claim — autonomous decay detection and recovery — has
 now been observed live, not just unit-tested (2026-09-17, same checkout).**
