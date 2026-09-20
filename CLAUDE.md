@@ -92,7 +92,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 127 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 129 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -317,7 +317,7 @@ scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
                       · broker_paper_trade_test.py                    [post-Sprint 4]
-tests/                127 tests (backend; frontend has no test suite yet)
+tests/                129 tests (backend; frontend has no test suite yet)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -741,6 +741,54 @@ original bug by reverting the fix and confirming 107 of 110 rows in the
 clobber zone came back `NaN`. The real 2026-06-01..18 corruption was
 repaired with `scripts/run_ingestion.py --start 2026-04-01 --end
 2026-09-18` (wide enough before the gap for the same warm-up reason).
+
+**FR-14's retrain trigger had no volatility awareness at all — the user
+asked directly what stops a retrain from firing during a volatile week,
+and the honest answer, before this, was nothing.** I5/FR-12's VIX
+fail-safe only gates `/predict`; it has no connection to
+`CTOrchestrator`, confirmed by grepping `ct_orchestrator.py` for any VIX
+reference and finding none. The actual trigger was one line: `if rolling
+< RISK.target_sharpe_threshold`. That's a real gap, not a benign one: a
+volatile week is exactly when the 30-day rolling Sharpe is most likely to
+cross that trigger, so the system as designed would tend to retrain
+*more*, not less, during volatility — training a fresh candidate on a
+distorted, noisy window, the opposite of what a Chapter-5-defensible CT
+loop should do.
+
+Fixed in `CTOrchestrator.evaluate()` (`src/orchestration/ct_orchestrator.py`):
+when the Sharpe check would trigger a retrain, a second check reads the
+latest VIX (`repo.latest_ingest_info()`, the same source `/ct-status`
+already surfaces) and defers — logs why, records
+`last_retrain_deferred_at`, returns to `SERVING` — rather than training
+through it, if VIX is at or above `vix_critical_threshold`. Deliberately
+reuses that threshold rather than adding a second magic number: "volatile
+enough to force capital preservation" (I5/FR-12) is a defensible bar for
+"volatile enough not to trust a retrain," and it means Chapter 5 defends
+one number, not two. Deferred, not cancelled — the next scheduled tick
+(FR-13) re-checks both Sharpe and VIX from scratch, so a retrain still
+happens once the market calms down, it just doesn't happen *during* the
+spike. No FR/DR ID covers this directly; it is to FR-14 what I5/FR-12
+already is to FR-10 — a volatility fail-safe on a different code path,
+not a new requirement.
+
+Deliberately scoped to the FR-14 decay-detection path only, not the
+"no incumbent" bootstrap path (`evaluate()`'s other call to
+`_trigger_retrain`) — deferring the very first deployment indefinitely
+because ingestion happened to start during a rough week would leave the
+system with nothing serving at all, which is a worse outcome than
+training once on a noisy bootstrap window that FR-17's acceptance gate
+would likely reject anyway.
+
+Guarded by two tests in `tests/test_ct_orchestrator.py`:
+`test_evaluate_defers_retrain_when_vix_is_critical` (seeds an elevated
+VIX and a losing incumbent replay, confirms no retrain thread spawns and
+`last_retrain_deferred_at` is set) and
+`test_evaluate_still_retrains_below_threshold_when_vix_is_normal` (the
+same losing replay under ordinary VIX still retrains as before — the
+deferral is specific to volatility, not a general brake on FR-14).
+Confirmed the first test actually exercises the new code path, not
+just a tautology: reverting the fix and re-running it fails with
+`RETRAINING` where `SERVING` was expected.
 
 ---
 

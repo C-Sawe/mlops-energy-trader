@@ -18,7 +18,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from src.config import DATA
+from src.config import DATA, RISK
 from src.dataops import processing as P
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator, CTStatus
@@ -156,6 +156,50 @@ def test_evaluate_persists_snapshots_and_computes_rolling_sharpe(tmp_path, monke
 
     snapshots = repo.list_snapshots(pd.Timestamp(as_of) - pd.Timedelta(days=60), as_of)
     assert not snapshots.empty
+
+
+def test_evaluate_defers_retrain_when_vix_is_critical(tmp_path, monkeypatch):
+    """A volatile week is exactly when the rolling Sharpe is most likely to
+    cross the retrain trigger — training a fresh candidate on a distorted,
+    high-volatility window is the opposite of what FR-14 is for. When VIX
+    is at or above the same critical threshold I5/FR-12 already uses to
+    force capital preservation on inference, a below-threshold Sharpe must
+    defer the retrain rather than fire it."""
+    repo, as_of = _seed_repo(tmp_path, final_vix=RISK.vix_critical_threshold + 5.0)
+    _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+
+    losing = {"equity_curve": np.array([100_000.0, 95_000.0, 90_000.0]), "returns": np.array([-0.05, -0.0526])}
+    monkeypatch.setattr(PPOAgent, "evaluate", lambda self, env, n_episodes=1, seed=None, deterministic=True: [losing])
+
+    status = orchestrator.evaluate(as_of=as_of)
+
+    assert status == CTStatus.SERVING
+    assert orchestrator._retrain_thread is None  # never spawned
+    assert orchestrator.last_retrain_deferred_at is not None
+    assert orchestrator.last_rolling_sharpe is not None
+    assert orchestrator.last_rolling_sharpe < RISK.target_sharpe_threshold  # the trigger condition was real
+
+
+def test_evaluate_still_retrains_below_threshold_when_vix_is_normal(tmp_path, monkeypatch):
+    """The deferral must be specific to volatility, not a general brake on
+    FR-14 — a poor Sharpe under ordinary VIX still triggers a retrain,
+    exactly as before this fail-safe existed."""
+    repo, as_of = _seed_repo(tmp_path, final_vix=20.0)
+    _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+
+    losing = {"equity_curve": np.array([100_000.0, 95_000.0, 90_000.0]), "returns": np.array([-0.05, -0.0526])}
+    monkeypatch.setattr(PPOAgent, "evaluate", lambda self, env, n_episodes=1, seed=None, deterministic=True: [losing])
+
+    orchestrator.evaluate(as_of=as_of)
+    if orchestrator._retrain_thread is not None:
+        orchestrator._retrain_thread.join(timeout=60)
+
+    assert orchestrator.last_retrain_deferred_at is None
+    assert orchestrator._retrain_thread is not None
 
 
 def test_evaluate_handles_no_data_in_window_gracefully(tmp_path, monkeypatch):

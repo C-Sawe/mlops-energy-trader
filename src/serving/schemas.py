@@ -106,6 +106,10 @@ class CTStatusResponse(BaseModel):
     rolling_sharpe: float | None
     target_sharpe_threshold: float
     last_evaluated_at: datetime | None
+    # Set when a below-threshold Sharpe would have triggered FR-14 but a
+    # volatile VIX deferred it instead — the CT loop's own fail-safe on
+    # itself, distinct from I5/FR-12's inference-side one.
+    last_retrain_deferred_at: datetime | None
     last_ingest_date: date | None
     current_vix: float | None
     vix_critical_threshold: float
