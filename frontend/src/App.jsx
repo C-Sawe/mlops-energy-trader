@@ -21,18 +21,18 @@ import {
 import { fetchStatus, fetchTelemetry, fetchDecisions, triggerEvaluation, poll } from "./api.js";
 import * as mock from "./mock.js";
 
-const actionClass = (a) =>
+export const actionClass = (a) =>
   ({ BUY: "buy", SELL: "sell", HOLD: "hold", LIQUIDATE: "liq" }[a] ?? "hold");
 
-const shortId = (id) => (id ? id.slice(0, 8) : "—");
-const fmtShortDate = (d) => d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
-const fmtDateTime = (d) =>
+export const shortId = (id) => (id ? id.slice(0, 8) : "—");
+export const fmtShortDate = (d) => d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+export const fmtDateTime = (d) =>
   d.toLocaleString("en-GB", {
     year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
   }).replace(",", "");
 
-function adaptStatus(raw) {
+export function adaptStatus(raw) {
   return {
     pipeline: raw.status,
     model: shortId(raw.active_version_id),
@@ -50,7 +50,7 @@ function adaptStatus(raw) {
   };
 }
 
-function adaptTelemetry(raw) {
+export function adaptTelemetry(raw) {
   const points = raw.points ?? [];
   const last = points[points.length - 1];
   return {
@@ -62,7 +62,7 @@ function adaptTelemetry(raw) {
   };
 }
 
-function adaptDecisions(raw) {
+export function adaptDecisions(raw) {
   return {
     items: raw.items.map((d) => ({
       ts: fmtDateTime(new Date(d.decided_at)),
@@ -80,7 +80,7 @@ function adaptDecisions(raw) {
   };
 }
 
-function adaptMetrics(statusRaw, telemetryAdapted) {
+export function adaptMetrics(statusRaw, telemetryAdapted) {
   return {
     rollingSharpe: statusRaw.rolling_sharpe,
     maxDrawdown: telemetryAdapted.lastMaxDrawdown != null ? -(telemetryAdapted.lastMaxDrawdown * 100) : null,

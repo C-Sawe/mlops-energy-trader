@@ -239,6 +239,40 @@ export function EquityChart({ dates, agent, bench }) {
 }
 
 /* ------------------------------------------------------------ sharpe chart */
+// A rolling Sharpe computed over a near-flat stretch of returns (the model
+// holding steady for weeks) can mathematically explode to an enormous but
+// finite number — CLAUDE.md §7's `_VARIANCE_FLOOR` note: the floor prevents
+// an infinite value, not merely a huge one. Real, but useless on a linear
+// chart: one such point would compress every meaningful value into a flat
+// line near zero. Exported as a standalone function (not inlined in the
+// component) specifically so this logic — the exact thing that caused a
+// real bug once — is unit-testable without rendering SVG.
+export const SHARPE_OUTLIER_BOUND = 20;
+
+/** The chart's y-axis domain, computed from values actually within
+ * `SHARPE_OUTLIER_BOUND` of zero; anything beyond that is plotted clipped
+ * to the axis edge (see `clampForDisplay`) and marked with a chevron, not
+ * silently rescaled or dropped — the tooltip and aria-label always carry
+ * the true value. */
+export function computeSharpeDomain(values, threshold) {
+  if (values.length === 0) return [0, 2];
+  const inRange = values.filter((v) => Math.abs(v) <= SHARPE_OUTLIER_BOUND);
+  const basis = inRange.length ? inRange : values;
+  const min = Math.min(...basis, threshold);
+  const max = Math.max(...basis, threshold);
+  const span = Math.max(max - min, 0.5);
+  return [min - span * 0.15, max + span * 0.15];
+}
+
+/** Clips each value into `[lo, hi]` for plotting, and flags which ones were
+ * actually out of range — the flag is what draws the chevron marker. */
+export function clampForDisplay(values, lo, hi) {
+  return {
+    clampedValues: values.map((v) => Math.max(lo, Math.min(hi, v))),
+    offScale: values.map((v) => v < lo || v > hi),
+  };
+}
+
 export function SharpeChart({ dates, values, threshold = 1.0 }) {
   const ref = useRef(null);
   // Warm-up rows (fewer than the rolling window's worth of history) are
@@ -255,34 +289,17 @@ export function SharpeChart({ dates, values, threshold = 1.0 }) {
   const box = { w: 760, h: 200 };
   const pad = { l: 44, r: 18, t: 24, b: 26 };
 
-  // A rolling Sharpe computed over a near-flat stretch of returns (the
-  // model holding steady for weeks) can mathematically explode to an
-  // enormous but finite number — CLAUDE.md §7's `_VARIANCE_FLOOR` note:
-  // the floor prevents an infinite value, not merely a huge one. Real,
-  // but useless on a linear chart: one such point would compress every
-  // meaningful value into a flat line near zero. The domain below is
-  // computed from values actually within OUTLIER_BOUND of zero; anything
-  // beyond that is plotted clipped to the axis edge and marked with a
-  // chevron, not silently rescaled or dropped — the tooltip and
-  // aria-label always carry the true value.
-  const OUTLIER_BOUND = 20;
-  const [lo, hi] = useMemo(() => {
-    if (n === 0) return [0, 2];
-    const inRange = cleanValues.filter((v) => Math.abs(v) <= OUTLIER_BOUND);
-    const basis = inRange.length ? inRange : cleanValues;
-    const min = Math.min(...basis, threshold);
-    const max = Math.max(...basis, threshold);
-    const span = Math.max(max - min, 0.5);
-    return [min - span * 0.15, max + span * 0.15];
-  }, [cleanValues, threshold, n]);
+  const [lo, hi] = useMemo(
+    () => computeSharpeDomain(cleanValues, threshold),
+    [cleanValues, threshold]
+  );
 
   const s = useScales(box, pad, Math.max(n, 2), lo, hi);
   const idx = useCrosshair(ref, box, pad, n);
 
   if (n < 2) return <EmptyChart label="Sharpe history" />;
 
-  const clampedValues = cleanValues.map((v) => Math.max(lo, Math.min(hi, v)));
-  const offScale = cleanValues.map((v) => v < lo || v > hi);
+  const { clampedValues, offScale } = clampForDisplay(cleanValues, lo, hi);
 
   const xTicks = [0, Math.floor(n * 0.33), Math.floor(n * 0.66), n - 1];
 

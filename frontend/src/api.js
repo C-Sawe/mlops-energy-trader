@@ -84,7 +84,15 @@ export const fetchStatus = () => get("/ct-status");
 export function fetchTelemetry(days = 180, endDate) {
   const end = endDate ? new Date(endDate) : new Date();
   const start = new Date(end);
-  start.setDate(start.getDate() - days);
+  // setUTCDate, not setDate: local-time calendar arithmetic on a date
+  // parsed as UTC midnight is off by one day whenever the `days`-wide
+  // window straddles a DST transition in the viewer's timezone (found
+  // writing this file's tests — e.g. a 30-day window ending 2026-11-15
+  // computed a start of 2026-10-15 in America/New_York, not the correct
+  // 2026-10-16, because the UTC-to-local offset used going in differs
+  // from the one implicitly undone by toISOString() coming out). Pure UTC
+  // arithmetic throughout sidesteps the local offset entirely.
+  start.setUTCDate(start.getUTCDate() - days);
   const iso = (d) => d.toISOString().slice(0, 10);
   return get(`/telemetry?start=${iso(start)}&end=${iso(end)}`);
 }
