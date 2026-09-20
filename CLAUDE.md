@@ -92,7 +92,8 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 131 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 131 passing — keep it that way (backend)
+cd frontend && npm test        # 47 passing — Vitest + React Testing Library, added 2026-09-20
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -364,7 +365,8 @@ scripts/              run_ingestion.py · run_baselines.py
                       · nfr_reliability_check.py                      [post-Sprint 4]
                       · sensitivity_analysis.py                       [post-Sprint 4]
 .importlinter          NFR-06's layer contracts, checked by tests/test_architecture.py
-tests/                131 tests (backend; frontend has no test suite yet)
+tests/                131 tests (backend)
+frontend/src/*.test.jsx  47 tests (Vitest + React Testing Library, added 2026-09-20)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -931,9 +933,46 @@ exists has nothing for `log_run()` to record — no new `model_run` row
 appears either. Confirmed as a real regression test: reverting the fix,
 the same `RuntimeError` propagates straight out uncaught.
 
----
+**The frontend went from zero tests to 47 — and writing them for
+testability surfaced a real, previously-unknown DST bug (2026-09-20).**
+Vitest + React Testing Library (`frontend/package.json`'s `test` script);
+`vitest@^2` specifically, not the latest major, since `vitest@5` requires
+Vite 6/7/8 and this project deliberately pins Vite 5 (`frontend/vite.config.js`'s
+`test` block, `frontend/src/test/setup.js`). Three pieces of previously
+inline, unexported logic were pulled out into standalone functions
+specifically so they're unit-testable without rendering — not a
+refactor for its own sake, but because these are exactly the pieces most
+likely to silently regress: `computeSharpeDomain`/`clampForDisplay`
+(`Charts.jsx`, the outlier-handling logic from this same section, above)
+and `pipelineToneAndLabel`/`ingestionToneAndLabel` (`Primitives.jsx`,
+`StatusStrip`'s tone mapping). `App.jsx`'s adapter functions
+(`adaptStatus`/`adaptTelemetry`/`adaptDecisions`/`adaptMetrics`) gained
+plain `export` keywords for the same reason.
 
-## 8. FinRL — the recorded deviation
+**A genuine DST bug, not a hypothetical one.** Writing a test for
+`fetchTelemetry`'s date-window math (`api.js`) found that
+`start.setDate(start.getDate() - days)` on a date parsed as UTC midnight
+is timezone-dependent in a way that breaks specifically when the
+`days`-wide window straddles a DST transition in the *viewer's* browser
+timezone: a 30-day window ending 2026-11-15 computed a start of
+2026-10-15 in `America/New_York` instead of the correct 2026-10-16 (the
+UTC-to-local offset used parsing the end date differs from the one
+implicitly undone converting back via `toISOString()` once a transition
+falls in between). This machine's own timezone (EAT, no DST) would never
+have hit this, which is exactly why it went unnoticed until a test
+deliberately forced `America/New_York`. Fixed with `setUTCDate`/`getUTCDate`
+throughout, sidestepping local-offset dependence entirely. Guarded by a
+test that explicitly sets `process.env.TZ` rather than trusting the
+runner's own timezone, and confirmed to actually catch the bug by
+reverting the fix and watching it fail on the exact scenario described.
+
+**Scope, honestly stated:** 47 tests covers the highest-risk pure logic
+(outlier handling, status-tone mapping, all four API-response adapters,
+`api.js`'s error-handling paths and date math) — it is not full component
+or visual coverage. `App.jsx`'s main component (data fetching, polling,
+the mock-fallback switch, the decision-detail sheet) has no rendering
+tests yet; the adapter functions it calls are now covered, but the
+component wiring them together is not.
 
 The proposal names FinRL. **It does work.** An earlier claim in this project
 that it was broken was wrong and has been corrected.

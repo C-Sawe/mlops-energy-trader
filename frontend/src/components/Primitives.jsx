@@ -80,22 +80,33 @@ export const Button = forwardRef(function Button(
 });
 
 /* ------------------------------------------------------------ status strip */
+/** Pure so the tone/label mapping — the part most likely to silently drift
+ * as new statuses get added — is unit-testable without rendering. */
+export function pipelineToneAndLabel(pipeline) {
+  const tone = { SERVING: "good", EVALUATING: "idle", RETRAINING: "warn" }[pipeline] || "idle";
+  const label = { SERVING: "Serving", EVALUATING: "Evaluating", RETRAINING: "Retraining" }[pipeline]
+    || pipeline;
+  return { tone, label };
+}
+
+/** Mirrors the CT pipeline pill: "actively doing something" reads warn, a
+ * clean last result reads good/crit, and "never run yet" (no
+ * ingestionStatus at all, e.g. the mock fallback) reads idle rather than
+ * claiming a status this build doesn't actually have. */
+export function ingestionToneAndLabel(ingestionStatus, ingestionOk) {
+  const ingesting = ingestionStatus === "INGESTING";
+  const tone = ingesting ? "warn" : ingestionOk === false ? "crit" : ingestionOk === true ? "good" : "idle";
+  const label = ingesting ? "Ingesting" : ingestionOk === false ? "Failed" : ingestionOk === true ? "Idle" : "—";
+  return { tone, label };
+}
+
 export function StatusStrip({
   pipeline, model, modelLabel, modelId, lastIngest,
   ingestionStatus, ingestionCheckedAt, ingestionOk, vix, failSafeThreshold,
 }) {
   const tripped = vix != null && failSafeThreshold != null && vix > failSafeThreshold;
-  const tone = { SERVING: "good", EVALUATING: "idle", RETRAINING: "warn" }[pipeline] || "idle";
-  const label = { SERVING: "Serving", EVALUATING: "Evaluating", RETRAINING: "Retraining" }[pipeline]
-    || pipeline;
-
-  // Mirrors the CT pipeline pill above it: "actively doing something" reads
-  // warn, a clean last result reads good/crit, and "never run yet" (no
-  // ingestionStatus at all, e.g. the mock fallback) reads idle rather than
-  // claiming a status this build doesn't actually have.
-  const ingesting = ingestionStatus === "INGESTING";
-  const ingestTone = ingesting ? "warn" : ingestionOk === false ? "crit" : ingestionOk === true ? "good" : "idle";
-  const ingestLabel = ingesting ? "Ingesting" : ingestionOk === false ? "Failed" : ingestionOk === true ? "Idle" : "—";
+  const { tone, label } = pipelineToneAndLabel(pipeline);
+  const { tone: ingestTone, label: ingestLabel } = ingestionToneAndLabel(ingestionStatus, ingestionOk);
 
   return (
     <section className="glass strip" aria-label="System status">
