@@ -362,6 +362,7 @@ scripts/              run_ingestion.py · run_baselines.py
                       · broker_paper_trade_test.py                    [post-Sprint 4]
                       · deflated_sharpe_analysis.py                   [post-Sprint 4]
                       · nfr_reliability_check.py                      [post-Sprint 4]
+                      · sensitivity_analysis.py                       [post-Sprint 4]
 .importlinter          NFR-06's layer contracts, checked by tests/test_architecture.py
 tests/                131 tests (backend; frontend has no test suite yet)
 ```
@@ -389,8 +390,75 @@ All values environment-driven (IR-03); nothing hard-coded. `src/config.py`.
 | `drawdown_penalty_coef` | 1.0 | `EnvironmentConfig`, FR-07/I4 |
 
 Thresholds are configurable rather than constant so Chapter 5 can report a
-**sensitivity analysis** over them instead of defending magic numbers. Doing
-that analysis is a genuine strengthening of the evaluation — plan for it.
+**sensitivity analysis** over them instead of defending magic numbers.
+
+**Done, 2026-09-20 (`scripts/sensitivity_analysis.py`), against real data
+throughout — not synthetic illustrations of the expected shape.** Three
+independent passes:
+
+**VIX critical threshold (FR-12, and the retrain-deferral gate, §7).**
+Swept against every real VIX reading ingested into this checkout
+(2,766 trading days, 2015-01-02→2025-12-31):
+
+| threshold | days ≥ threshold | % of history |
+|---|---|---|
+| 20.0 | 826 | 29.86% |
+| 25.0 | 377 | 13.63% |
+| 30.0 | 156 | 5.64% |
+| **35.0 (default)** | **63** | **2.28%** |
+| 40.0 | 40 | 1.45% |
+| 50.0 | 19 | 0.69% |
+
+The default fires on 2.28% of real trading days — rare enough to be a
+genuine circuit breaker (real market-stress episodes within this range:
+2015–16's correction, 2018 Q4, 2020's COVID crash), not a threshold the
+system spends its life near. A materially lower threshold (25–30) would
+put the fail-safe in play 6–14% of the time, a real design trade-off
+between missed trading opportunities and caution, not just a bigger
+number being "safer" for free.
+
+**target_sharpe_threshold (FR-14).** Using the real 18-split × 10-seed
+walk-forward sweep (§10, 180 real training runs):
+
+| threshold | % of all 180 seeds below | % of best-per-split (n=18) below |
+|---|---|---|
+| 0.0 | 67.2% | 5.6% |
+| 0.5 | 75.0% | 22.2% |
+| **1.0 (default)** | **85.6%** | **44.4%** |
+| 1.5 | 92.8% | 61.1% |
+| 2.0 | 96.1% | 83.3% |
+
+This explains something already observed live rather than just predicting
+it: at the current default, **85.6% of individual untuned seeds fail to
+clear the retrain bar** — which is exactly why the 3-day unattended run
+(§7, §13) produced 540 evaluations with only 2 promotions and 448
+rejections. That is not the threshold being miscalibrated; it is the
+threshold correctly reflecting this project's own measured seed
+sensitivity (§10.2) — PPO's seed variance is high enough that "most single
+seeds don't clear 1.0" is the honest population statistic, not a sign the
+bar is set wrong. The "best-per-split" column is included only to show how
+much more forgiving the trigger looks judged against a cherry-picked seed
+instead of a real one — the same selection effect §10.3's deflated Sharpe
+ratio exists to correct for, made visible here as a side effect rather
+than computed directly.
+
+**transaction_cost_pct (FR-07).** Re-running equal-weight-rebalanced (the
+one baseline that trades every step, so the one actually exposed to cost
+drag — buy-and-hold barely rebalances) on the real 2024–2025 eval window:
+
+| cost | Sharpe | cumulative return |
+|---|---|---|
+| 0 bps | 0.629 | 15.56% |
+| **10 bps (default)** | **0.616** | **15.16%** |
+| 20 bps | 0.603 | 14.75% |
+| 100 bps | 0.501 | 11.62% |
+
+A modest, monotonic, real degradation — the current default costs about
+2% of the frictionless Sharpe, and even a 10× harsher cost assumption
+(100bps) doesn't collapse the baseline's edge, which is itself informative:
+this project's §10.4 "keep transaction costs on" instruction is protecting
+against something real, not defending against a fragile result that only
+survives at exactly 10bps.
 
 ---
 
