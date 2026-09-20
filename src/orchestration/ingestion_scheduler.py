@@ -26,13 +26,30 @@ logger = logging.getLogger(__name__)
 # Wilder's RSI_14 is an EMA with unbounded memory (CLAUDE.md §7, §9): the
 # smoothing never fully "forgets" data before the fetch window starts, so a
 # too-narrow trailing re-fetch computes a measurably *colder* RSI than the
-# one already sitting in the store from the original backfill. Because
-# `persist()` is idempotent (§7), a scheduled tick would then silently
-# overwrite a correct, converged indicator with a wrong, cold one for every
-# date the two windows overlap. At 120 days the EMA's weight on anything
-# before the fetch starts has decayed to (1 - 1/14)**120 ≈ 1.9e-4 — close
-# enough to full convergence that recomputing from this window reproduces
-# the full-history value, not a different one.
+# one already sitting in the store from the original backfill. At 120 days
+# the EMA's weight on anything before the fetch starts has decayed to
+# (1 - 1/14)**120 ≈ 1.9e-4 — close enough to full convergence that
+# recomputing from this window reproduces the full-history value.
+#
+# That handles RSI's "colder, not wrong" problem, but not SMA_20's
+# different one: `compute_indicators()` uses `min_periods=window`, so the
+# first `sma_window - 1` (here, 19) rows of *any* single computation call
+# are exactly `NaN`, by construction, no matter how wide the window is —
+# widening the fetch doesn't give those specific rows more lookback, since
+# they're only ever a fixed distance from the fetch's own leading edge, not
+# from the true history. A 120-day fetch still starts *somewhere*, and
+# whatever ~20 trading days land right after that start are NaN this tick.
+# Since `persist()` is idempotent (§7), the next tick's fetch starts one day
+# later, its own leading ~20-day NaN zone shifts one day later too, and it
+# clobbers a *different* previously-good stretch — every tick permanently
+# corrupts a moving 20-day window of indicator history. Found 2026-09-20,
+# replaying an evaluation against `as_of=2026-08-19`: `TradingEnvironment`
+# raised "no usable rows for ticker 'XOM'" because `sma_20`/`rsi_14` had
+# gone NaN for 2026-06-01..18 — a stretch a scheduled tick's own 120-day
+# fetch had started right before, days after that range was already
+# correctly populated by an earlier, wider backfill.
+_INDICATOR_WARMUP = max(DATA.sma_window, DATA.rsi_window)
+
 DEFAULT_TRAILING_WINDOW_DAYS = 120
 
 
@@ -50,9 +67,16 @@ def run_ingestion_tick(
     so re-writing overlapping rows updates them rather than duplicating or
     rejecting them (DR-05 still holds: exactly one row survives per key).
 
-    Returns the number of rows in this tick's fetched frame (not the number
-    that actually changed — an unchanged trailing window still round-trips
-    through fetch + persist).
+    Drops each ticker's first `_INDICATOR_WARMUP` rows before persisting —
+    those rows are `NaN` by construction within *this* fetch (see the
+    module-level comment above) regardless of window width, and persisting
+    them would silently overwrite an already-correct value an earlier,
+    better-positioned computation left there. `window_days` must stay
+    comfortably larger than `_INDICATOR_WARMUP` or every ticker's trimmed
+    frame comes back empty; the default (120) has wide margin.
+
+    Returns the number of rows actually persisted (post-trim), not the
+    number fetched.
 
     Uses `fetch_market_data`'s default `strict=True`: a failed ticker
     raises `IngestionError` rather than silently persisting a partial
@@ -65,6 +89,18 @@ def run_ingestion_tick(
     start = end - timedelta(days=window_days)
     result = fetch_market_data(str(start), str(end), tickers=tickers or DATA.tickers)
     frame = build_feature_frame(result.equities, result.vix)
+    # Not groupby(...).apply(lambda g: g.iloc[n:]) — pandas 3.x's groupby
+    # excludes the grouping column from what apply's callback receives,
+    # which silently dropped "ticker" here and broke every insert.
+    frame = frame.sort_values(["ticker", "date"]).reset_index(drop=True)
+    frame = frame[frame.groupby("ticker").cumcount() >= _INDICATOR_WARMUP].reset_index(drop=True)
+    if frame.empty:
+        logger.warning(
+            "ingestion tick: window_days=%d left nothing after trimming the %d-row "
+            "indicator warm-up — window_days must be well above _INDICATOR_WARMUP",
+            window_days, _INDICATOR_WARMUP,
+        )
+        return 0
     repo.persist(frame)
     logger.info("ingestion tick: persisted %d rows (%s to %s)", len(frame), start, end)
     return len(frame)
