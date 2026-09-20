@@ -92,7 +92,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 126 passing — keep it that way (backend only; see §14 for the frontend)
+python -m pytest tests/ -q     # 127 passing — keep it that way (backend only; see §14 for the frontend)
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -317,7 +317,7 @@ scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
                       · broker_paper_trade_test.py                    [post-Sprint 4]
-tests/                126 tests (backend; frontend has no test suite yet)
+tests/                127 tests (backend; frontend has no test suite yet)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -696,6 +696,56 @@ were already reading the unclamped value and still do. This is
 display-only: `/telemetry` still returns the real `30101.4`; anyone
 querying the API directly sees exactly what was computed.
 
+**The ingestion scheduler had been silently corrupting a moving ~20-day
+window of indicator history on every single tick — found 2026-09-20,
+fixed the same day.** Surfaced by a real failure: forcing
+`/ct/evaluate?as_of=2026-08-19` (to demonstrate a live retrain for Chapter
+5) raised `ValueError: no usable rows for ticker 'XOM'` inside
+`TradingEnvironment`. The `DEFAULT_TRAILING_WINDOW_DAYS = 120` note
+earlier in this section solved Wilder's RSI problem (an EMA that's merely
+*colder*, not wrong, with too little lookback) but missed a completely
+different one: `compute_indicators()`'s `sma_20` uses `min_periods=20`, so
+the first 19 rows of **any single computation call** are `NaN` by
+construction — widening the fetch doesn't give those specific rows more
+lookback, because they're a fixed distance from *that fetch's own
+starting row*, not from true history. Every scheduled tick recomputes
+indicators fresh over its own 120-day slice and its own leading ~20-day
+NaN zone lands on a *different* stretch of dates each time (since the
+fetch's start slides forward with `date.today()`) — and because
+`persist()` is idempotent, each tick permanently overwrites whatever
+correct value an earlier, better-positioned computation had left for
+whatever dates its own warm-up zone happens to land on. This is why
+2026-06-01..18 came back all-`NaN` for `sma_20`/`rsi_14` across all 5
+tickers despite having been correctly populated by an earlier, wider
+backfill: some scheduled tick's 120-day fetch had started right before
+that stretch.
+
+Fixed in `run_ingestion_tick()` (`src/orchestration/ingestion_scheduler.py`):
+drop each ticker's first `_INDICATOR_WARMUP` (= `max(sma_window,
+rsi_window)` = 20) rows before persisting, using
+`frame.groupby("ticker").cumcount() >= _INDICATOR_WARMUP` — not
+`groupby(...).apply(lambda g: g.iloc[n:])`, which was the first attempt
+and immediately failed differently: **pandas 3.x's `groupby().apply()`
+excludes the grouping column from what the callback receives by default**,
+so `g` inside the lambda no longer had a `ticker` column at all, and every
+row persisted with `ticker=NULL`, tripping the `NOT NULL` constraint —
+caught immediately by the existing test suite (4 of 5 tests in
+`test_ingestion_scheduler.py` failed) before this ever reached the real
+database. Guarded going forward by
+`test_ingestion_tick_does_not_clobber_already_warm_history_behind_it`,
+which seeds a full history, ticks with an `end` well before the seeded
+data's own end (so the fetch window starts partway through
+already-populated dates, not at the very beginning), and asserts the
+pre-existing `sma_20` values are untouched — proven to actually catch the
+original bug by reverting the fix and confirming 107 of 110 rows in the
+clobber zone came back `NaN`. The real 2026-06-01..18 corruption was
+repaired with `scripts/run_ingestion.py --start 2026-04-01 --end
+2026-09-18` (wide enough before the gap for the same warm-up reason).
+
+---
+
+## 8. FinRL — the recorded deviation
+
 The proposal names FinRL. **It does work.** An earlier claim in this project
 that it was broken was wrong and has been corrected.
 
@@ -1053,6 +1103,32 @@ data rather than asserted from unit tests or design intent. It does not
 demonstrate a profitable strategy — the replayed Sharpe was strongly
 negative — and per §1 that is not the point: the system's response to a bad
 Sharpe is exactly what was supposed to happen.
+
+**A second, independent occurrence of the same loop — 2026-09-20, a
+different incumbent, a different window, requested specifically for
+Chapter 5 documentation.** After the September bootstrap above, the
+incumbent (`bf65de93`, §7's model-label entry) ran unattended for three
+days: 540 evaluations, only 2 promotions, 448 rejections — already
+recorded in §13 as evidence the FR-17 gate is genuinely hard to beat, not
+just present. To capture a second full cycle on demand rather than wait
+for one, `POST /ct/evaluate?as_of=2026-08-19` replayed the incumbent
+against a real historical window already known to be weak for it
+(`rolling_sharpe = -2.43`, found by scanning recorded telemetry for
+`rolling_sharpe_30d < 1.0` rather than guessing a date). Below target,
+this autonomously triggered a real retrain (`training_runs` 540→541); the
+candidate did not beat the incumbent out-of-sample, so it was rejected
+(`rejected_count` 448→449) and `bf65de93` stayed active — the same
+decay → retrain → gate-holds sequence as the first bootstrap, this time
+starting from an already-serving incumbent rather than no incumbent at
+all, which is the more representative steady-state case for a defence to
+cite. (Getting to this `as_of` took two attempts and surfaced §7's
+ingestion-scheduler bug along the way: `as_of=2026-09-17` first, which
+replayed straight into the `_VARIANCE_FLOOR` outlier §7's chart fix
+already documents — no retrain, since 30101.4 is nowhere near the
+threshold; then `as_of=2026-08-19`, which hit the corrupted
+2026-06-01..18 stretch and raised the `ValueError` that led to finding
+and fixing the bug; only then, with the repair applied, did this same
+`as_of` produce the real -2.43 result above.)
 
 ---
 

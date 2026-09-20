@@ -65,6 +65,54 @@ def test_ingestion_tick_reproduces_warm_indicators_not_nulls(tmp_path, monkeypat
     assert tail["rsi_14"].notna().all()
 
 
+def test_ingestion_tick_does_not_clobber_already_warm_history_behind_it(tmp_path, monkeypatch):
+    """A tick's own fetch always starts *somewhere*, and the first
+    `_INDICATOR_WARMUP` trading days after that start are `NaN` within this
+    computation — regardless of window width — because `compute_indicators`
+    needs real prior rows *in this call*, not just a wide calendar range.
+    If that NaN zone lands on dates that already had a correct value from
+    an earlier, better-positioned computation, persisting it clobbers
+    perfectly good history. Found 2026-09-20 via a real evaluation that
+    failed with "no usable rows for ticker 'XOM'" after a scheduled tick's
+    120-day window started partway through already-ingested data."""
+    repo, equities, vix, as_of = _seed_full_history(tmp_path)
+
+    def fake_fetch(start, end, tickers=None, strict=True):
+        start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+        eq = equities[
+            (equities["date"] >= start_ts)
+            & (equities["date"] <= end_ts)
+            & (equities["ticker"].isin(tickers or DATA.tickers))
+        ].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(tickers or DATA.tickers), failed_tickers=())
+
+    monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
+
+    # A tick whose end is well before the seeded history's own last day, so
+    # its 120-day fetch starts partway through already-populated dates —
+    # exactly the scenario a daily scheduler produces once it's been
+    # running a while, not just on its very first-ever tick.
+    tick_end = pd.Timestamp(as_of) - pd.Timedelta(days=50)
+    fetch_start = tick_end - pd.Timedelta(days=S.DEFAULT_TRAILING_WINDOW_DAYS)
+    clobber_zone_end = fetch_start + pd.Timedelta(days=30)  # comfortably covers the warm-up rows
+
+    before = repo.load_partition(fetch_start, clobber_zone_end)
+    assert not before.empty
+    assert before["sma_20"].notna().all()  # already correct, from the original full backfill
+
+    S.run_ingestion_tick(repo, end=tick_end.date())
+
+    after = repo.load_partition(fetch_start, clobber_zone_end)
+    assert len(after) == len(before)
+    assert after["sma_20"].notna().all()
+    assert after["rsi_14"].notna().all()
+    pd.testing.assert_series_equal(
+        before.sort_values(["ticker", "date"])["sma_20"].reset_index(drop=True),
+        after.sort_values(["ticker", "date"])["sma_20"].reset_index(drop=True),
+    )
+
+
 def test_ingestion_tick_is_idempotent_on_repeated_runs(tmp_path, monkeypatch):
     """DR-05: re-running the same tick must not duplicate rows — persist()
     upserts by (date, ticker), so the store's row count is unaffected."""
