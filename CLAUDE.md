@@ -669,9 +669,32 @@ that genuinely never constructed a `ModelRegistry` first, since the
 original measurement may have had the same accidental priming every other
 test does.
 
----
+**A 3-day unattended run surfaced a real chart bug: the Rolling Sharpe
+tile could show a mathematically genuine but useless number in the tens
+of thousands.** Left running from 2026-09-17 to 2026-09-20 with no
+attention, the CT scheduler ticked autonomously roughly every 5 minutes
+the whole time — 540 training runs, 448 held back by the FR-17 gate, only
+2 promoted, a strong real demonstration that the acceptance gate is hard
+to beat. But one snapshot's `rolling_sharpe_30d` came back as `30101.4`:
+the model held a near-flat `HOLD`-heavy position for a stretch, daily
+returns were nearly constant, and `_VARIANCE_FLOOR` (§7 above) does
+exactly what it's documented to do — prevent a literal division by zero,
+not cap a merely tiny-but-nonzero variance. The ratio is real, not a bug
+in `rolling_sharpe`, but a linear chart with one point at 30,101 and the
+rest between -14 and +5 renders as a flat line — every value that
+actually matters gets compressed to nothing.
 
-## 8. FinRL — the recorded deviation
+Fixed on the frontend, not the metric: `SharpeChart`
+(`frontend/src/components/Charts.jsx`) now computes its axis domain from
+only the values within `OUTLIER_BOUND = 20` of zero (a value chosen
+because every genuine reading seen from this project, synthetic or real,
+has stayed in single digits — 20 is headroom, not a guess at what's
+"normal"). A point beyond that range is drawn clipped to the axis edge
+with a chevron and its true value labelled next to it, not silently
+dropped or used to rescale the whole chart — the tooltip and aria-label
+were already reading the unclamped value and still do. This is
+display-only: `/telemetry` still returns the real `30101.4`; anyone
+querying the API directly sees exactly what was computed.
 
 The proposal names FinRL. **It does work.** An earlier claim in this project
 that it was broken was wrong and has been corrected.
@@ -1202,6 +1225,20 @@ default) guards the endpoints that matter, which is what got built.
   continuously), but a gap larger than its trailing window needs an
   explicit backfill, not just letting the scheduler catch up on its own —
   it won't.
+- **Ports 8000/8001 are not this project's alone on this machine.** The
+  user has a separate, unrelated project (`~/Documents/whats app
+  automation`, a WhatsApp automation tool with its own FastAPI apps) whose
+  dev servers also default to 8000 and 8001. When both are running, the OS
+  can route new connections to whichever bound most specifically/recently
+  rather than to this project's `uvicorn`, so `curl localhost:8000` can
+  silently return the *other* project's app instead of an error — no crash,
+  no obvious sign anything is wrong, just the wrong response body. Found
+  2026-09-20 when the dashboard loaded an entirely unrelated site. This
+  project's backend now defaults to port **8010** in this checkout's
+  running instance to avoid the collision; if starting it fresh, check
+  `lsof -iTCP:8000 -sTCP:LISTEN` first rather than assuming the port is
+  free, and pass `VITE_API_BASE` to the frontend to match whatever port the
+  backend actually used.
 
 ---
 

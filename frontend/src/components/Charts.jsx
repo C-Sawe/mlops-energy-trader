@@ -254,10 +254,24 @@ export function SharpeChart({ dates, values, threshold = 1.0 }) {
 
   const box = { w: 760, h: 200 };
   const pad = { l: 44, r: 18, t: 24, b: 26 };
+
+  // A rolling Sharpe computed over a near-flat stretch of returns (the
+  // model holding steady for weeks) can mathematically explode to an
+  // enormous but finite number — CLAUDE.md §7's `_VARIANCE_FLOOR` note:
+  // the floor prevents an infinite value, not merely a huge one. Real,
+  // but useless on a linear chart: one such point would compress every
+  // meaningful value into a flat line near zero. The domain below is
+  // computed from values actually within OUTLIER_BOUND of zero; anything
+  // beyond that is plotted clipped to the axis edge and marked with a
+  // chevron, not silently rescaled or dropped — the tooltip and
+  // aria-label always carry the true value.
+  const OUTLIER_BOUND = 20;
   const [lo, hi] = useMemo(() => {
     if (n === 0) return [0, 2];
-    const min = Math.min(...cleanValues, threshold);
-    const max = Math.max(...cleanValues, threshold);
+    const inRange = cleanValues.filter((v) => Math.abs(v) <= OUTLIER_BOUND);
+    const basis = inRange.length ? inRange : cleanValues;
+    const min = Math.min(...basis, threshold);
+    const max = Math.max(...basis, threshold);
     const span = Math.max(max - min, 0.5);
     return [min - span * 0.15, max + span * 0.15];
   }, [cleanValues, threshold, n]);
@@ -266,6 +280,9 @@ export function SharpeChart({ dates, values, threshold = 1.0 }) {
   const idx = useCrosshair(ref, box, pad, n);
 
   if (n < 2) return <EmptyChart label="Sharpe history" />;
+
+  const clampedValues = cleanValues.map((v) => Math.max(lo, Math.min(hi, v)));
+  const offScale = cleanValues.map((v) => v < lo || v > hi);
 
   const xTicks = [0, Math.floor(n * 0.33), Math.floor(n * 0.66), n - 1];
 
@@ -302,7 +319,7 @@ export function SharpeChart({ dates, values, threshold = 1.0 }) {
         ))}
 
         <path
-          d={`${path(cleanValues, s)} L ${s.x(n - 1)} ${s.y(lo)} L ${s.x(0)} ${s.y(lo)} Z`}
+          d={`${path(clampedValues, s)} L ${s.x(n - 1)} ${s.y(lo)} L ${s.x(0)} ${s.y(lo)} Z`}
           fill="url(#shfill)" stroke="none"
         />
 
@@ -316,10 +333,33 @@ export function SharpeChart({ dates, values, threshold = 1.0 }) {
           Retraining threshold · {threshold.toFixed(2)}
         </text>
 
-        <path d={path(cleanValues, s)} fill="none" stroke="var(--series-agent)"
+        <path d={path(clampedValues, s)} fill="none" stroke="var(--series-agent)"
               strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-        <circle cx={s.x(n - 1)} cy={s.y(cleanValues[n - 1])} r="4.5"
+        <circle cx={s.x(n - 1)} cy={s.y(clampedValues[n - 1])} r="4.5"
                 fill="var(--series-agent)" stroke="var(--glass-strong)" strokeWidth="2" />
+
+        {/* Off-scale points: a near-flat return stretch can send the ratio
+            far beyond any sane axis range (see OUTLIER_BOUND above). Marked
+            with a chevron and its true value rather than silently clipped —
+            the point is genuinely there, just not at that height. */}
+        {cleanValues.map((v, i) => {
+          if (!offScale[i]) return null;
+          const atTop = v > hi;
+          const y = atTop ? pad.t : box.h - pad.b;
+          return (
+            <g key={i} transform={`translate(${s.x(i)}, ${y})`}>
+              <path
+                d={atTop ? "M -5 6 L 0 -2 L 5 6" : "M -5 -6 L 0 2 L 5 -6"}
+                fill="none" stroke="var(--warn)" strokeWidth="2"
+                strokeLinecap="round" strokeLinejoin="round"
+              />
+              <text x={0} y={atTop ? 18 : -10} textAnchor="middle" fontSize="10"
+                    fontWeight="600" fill="var(--warn)">
+                {v.toFixed(0)}
+              </text>
+            </g>
+          );
+        })}
 
         {idx !== null && (
           <line x1={s.x(idx)} x2={s.x(idx)} y1={pad.t} y2={box.h - pad.b}
