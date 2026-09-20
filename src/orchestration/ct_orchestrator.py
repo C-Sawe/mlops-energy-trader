@@ -68,6 +68,7 @@ class CTOrchestrator:
         self._status = CTStatus.SERVING
         self._last_rolling_sharpe: float | None = None
         self._last_evaluated_at: datetime | None = None
+        self._last_retrain_deferred_at: datetime | None = None
         self._retrain_thread: threading.Thread | None = None
 
     @property
@@ -85,9 +86,21 @@ class CTOrchestrator:
         with self._lock:
             return self._last_evaluated_at
 
+    @property
+    def last_retrain_deferred_at(self) -> datetime | None:
+        """Set whenever a below-threshold Sharpe would have triggered a
+        retrain but a volatile VIX deferred it instead — visible evidence
+        the deferral fired, not just an assumption it would."""
+        with self._lock:
+            return self._last_retrain_deferred_at
+
     def _load_normalised_frame(self, start, end) -> pd.DataFrame:
         raw = self.repo.load_partition(start, end, tickers=self.tickers)
         return normalize_rolling(raw)
+
+    def _current_vix(self) -> float | None:
+        ingest = self.repo.latest_ingest_info()
+        return ingest["vix"] if ingest else None
 
     def evaluate(self, as_of: date | None = None) -> CTStatus:
         """FR-13: replay the incumbent over the most recent evaluation
@@ -150,6 +163,27 @@ class CTOrchestrator:
                 self._last_evaluated_at = datetime.now(timezone.utc)
 
             if rolling < RISK.target_sharpe_threshold:
+                current_vix = self._current_vix()
+                if current_vix is not None and current_vix >= RISK.vix_critical_threshold:
+                    # A volatile week is exactly when the rolling Sharpe is
+                    # most likely to cross the retrain trigger — training a
+                    # fresh candidate on a distorted, high-volatility window
+                    # is the opposite of what FR-14 is for. Reuses
+                    # vix_critical_threshold rather than a second magic
+                    # number: "volatile enough to force capital
+                    # preservation" (I5/FR-12) is the same bar as "volatile
+                    # enough not to trust a retrain." Deferred, not
+                    # cancelled — the next scheduled tick re-checks both
+                    # Sharpe and VIX from scratch.
+                    logger.info(
+                        "rolling Sharpe %.3f below target %.3f, but VIX %.1f >= critical "
+                        "%.1f; deferring retrain until volatility subsides",
+                        rolling, RISK.target_sharpe_threshold, current_vix, RISK.vix_critical_threshold,
+                    )
+                    with self._lock:
+                        self._last_retrain_deferred_at = datetime.now(timezone.utc)
+                        self._status = CTStatus.SERVING
+                    return self.status
                 logger.info("rolling Sharpe %.3f below target %.3f; retraining", rolling, RISK.target_sharpe_threshold)
                 self._trigger_retrain(as_of)
             else:
