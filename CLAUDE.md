@@ -254,13 +254,30 @@ service):
   `InferenceService`'s lock at the moment of promotion, so FR-15's
   "continue serving throughout retraining" holds up under actual
   measurement, not just by design intent.
-- **NFR-04: ~8ms mean, ~11ms max (N=5) to reconstruct `InferenceService`
-  and reload the active model from scratch** — what a fresh process does on
-  startup. Set at 1 minute, which is almost entirely headroom: this number
-  is the *application's* readiness time once the process is actually
-  running again, not the OS/process-manager's crash-to-restart time (e.g.
-  systemd/supervisor restart delay), which is an infrastructure concern
-  outside this service's own code and wasn't part of this measurement.
+- **NFR-04: corrected 2026-09-21 — the original "~8ms mean, ~11ms max" figure
+  was itself an artifact of the exact issue §7 already flagged and this
+  entry originally only speculated about.** `scripts/measure_nfr04_cold.py`
+  re-measured from N=5 genuinely separate `python3` processes, each
+  constructing `MarketRepository` + `InferenceService` as the *only* things
+  that ever touch MLflow — no `ModelRegistry`, no prior test setup, nothing
+  else in the process history. Result: **mean 497.9ms, max 523.2ms, min
+  489.9ms** — roughly **60× slower** than originally reported. Root cause
+  confirmed directly: the *first* thing in any process to touch MLflow pays
+  a one-time ~500ms cost initializing the tracking store's SQLAlchemy
+  connection and running its schema/migration check; every subsequent touch
+  in the *same* process is fast (~10ms, confirmed by timing a second
+  `InferenceService` reconstruction back-to-back with the first). The
+  original measurement's test setup had already trained/promoted a model
+  through `ModelRegistry` before timing `InferenceService`'s reconstruction
+  — so it measured the *second* touch, not the first, and a real unplanned
+  termination is always a first touch (a fresh process has nothing cached).
+  **Still comfortably meets the 1-minute threshold** (497.9ms is ~0.83% of
+  the budget, not the ~0.013% the old figure implied) — the requirement is
+  not at risk, but the number reported for it was wrong, and is fixed now
+  rather than left standing. Same scope note as before: this is the
+  *application's* readiness time once the process is running again, not
+  the OS/process-manager's crash-to-restart time, which remains outside
+  this service's own code.
 - **NFR-09 remains unmeasured** — it requires the dashboard to actually run
   for hours in a browser, which a backend measurement pass can't produce.
   Leaving it bracketed is the correct call here, not an oversight: inventing
@@ -364,6 +381,7 @@ scripts/              run_ingestion.py · run_baselines.py
                       · deflated_sharpe_analysis.py                   [post-Sprint 4]
                       · nfr_reliability_check.py                      [post-Sprint 4]
                       · sensitivity_analysis.py                       [post-Sprint 4]
+                      · measure_nfr04_cold.py                         [post-Sprint 4]
 .importlinter          NFR-06's layer contracts, checked by tests/test_architecture.py
 tests/                131 tests (backend)
 frontend/src/*.test.jsx  47 tests (Vitest + React Testing Library, added 2026-09-20)
