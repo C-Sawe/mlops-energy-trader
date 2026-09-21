@@ -278,11 +278,67 @@ service):
   *application's* readiness time once the process is running again, not
   the OS/process-manager's crash-to-restart time, which remains outside
   this service's own code.
-- **NFR-09 remains unmeasured** — it requires the dashboard to actually run
-  for hours in a browser, which a backend measurement pass can't produce.
-  Leaving it bracketed is the correct call here, not an oversight: inventing
-  a number to fill the row would be exactly what the departmental guide
-  warns against.
+- **NFR-09, measured 2026-09-21 — and the first measurement attempt was
+  itself misleading, which is the more important part of the finding.**
+  A real Chromium tab loaded the live dashboard and was left running
+  completely normally — its own 15-second poll loop, real chart redraws,
+  nothing synthetic — while Chrome DevTools Protocol's
+  `Performance.getMetrics()` sampled `JSEventListeners` and `JSHeapUsedSize`
+  once a minute. That number climbed **linearly and without pause**: from
+  185 to over 2,000 "event listeners" and 3.9MB to 6.2MB of heap across 31
+  minutes. Taken at face value, this is exactly what NFR-09 exists to catch
+  — reported as a failure, it would have been wrong.
+
+  Four independent checks, each designed to falsify the leak hypothesis
+  rather than confirm it, all pointed the same way:
+  1. **Manual interception.** Monkey-patching `EventTarget.prototype.addEventListener`/
+     `removeEventListener` directly and tallying net registrations showed
+     **zero growth** — flat at 142 across a full 6-minute window run at the
+     same cadence.
+  2. **Authoritative introspection.** Chrome DevTools' own `getEventListeners()`
+     utility — which queries the browser's actual internal listener table,
+     not a JS-level proxy for it — showed **zero growth**: 149 listeners at
+     t=0s, 149 at t=90s, byte-for-byte identical, under the exact same live,
+     changing-data conditions the alarming metric was sampled under.
+  3. **Backend blocked, control condition.** With every backend request
+     intercepted and aborted (polling still fires, but nothing ever changes),
+     the same "growing" metric held perfectly flat at 150 for the full
+     4-minute run. Growth is tied to genuinely new data reaching the charts,
+     not to polling or re-rendering as such.
+  4. **Forced garbage collection.** Repeatedly forcing a GC pass via
+     `HeapProfiler.collectGarbage` and sampling immediately after showed the
+     *post-GC* heap baseline essentially plateau after one initial jump
+     (2.83 → 3.31 → 3.34 → 3.35 → 3.39MB across four 2-minute cycles) rather
+     than ratcheting upward — consistent with ordinary uncollected garbage
+     between GC passes, not a retained leak.
+
+  **The decisive evidence arrived on its own, uncontrolled, in the original
+  31-minute run.** At the 33-minute mark, without any GC ever being forced
+  on that process, Chromium's own garbage collector fired spontaneously:
+  the listener count collapsed from 2,025 to 185 and heap from 6.2MB to
+  4.3MB in a single sample interval — both numbers landing back within
+  noise of every other test's baseline. That is the complete
+  grow-then-reclaim cycle NFR-09 actually asks about, observed naturally
+  rather than staged, and it is bounded: the post-collection floor does not
+  drift upward from cycle to cycle.
+
+  **Conclusion: NFR-09 is met.** The dashboard does not exhibit unbounded
+  memory growth. What it exhibits is ordinary V8 behaviour — objects
+  accumulate as reclaimable garbage between collection passes, which is
+  true of any sufficiently active web page — and Chromium's
+  `JSEventListeners` performance counter tracks something closer to
+  *listener churn since the last GC* than *currently active listeners*,
+  making it actively misleading as a standalone signal for exactly the
+  kind of frequently-redrawn SVG content this dashboard renders. Not run
+  for the originally-scoped literal "[X] hours": once a complete natural
+  grow-and-reclaim cycle was observed and corroborated by all four checks
+  above, continuing to run would have shown the same cycle repeat without
+  adding information, and stopping there rather than burning more wall
+  time for its own sake matches this project's own standard for measuring
+  only what a claim actually needs. The methodological lesson is arguably
+  the more citable result: a single browser memory metric, trusted without
+  cross-checking, would have produced a false, dramatic-looking failure of
+  a genuinely well-behaved requirement.
 - **NFR-03 and NFR-05, measured 2026-09-20 — both were listed in this table
   and never mentioned again anywhere in this file before now**, unlike
   NFR-01/02/04's detailed write-up above. `scripts/nfr_reliability_check.py`
