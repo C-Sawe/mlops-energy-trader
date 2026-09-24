@@ -1,4 +1,4 @@
-"""PPO agent wrapper over Stable Baselines3 (FR-07, FR-08, FR-09).
+"""RL agent wrappers over Stable Baselines3 (FR-07, FR-08, FR-09).
 
 ``device="cpu"`` is the default because it *is* the measured answer, not a
 placeholder left open for tuning: CLAUDE.md §9 benchmarked CPU vs MPS on the
@@ -6,50 +6,61 @@ actual training hardware and CPU won by ~12-13x for this policy network
 (14.7K parameters — small enough that CPU<->GPU transfer overhead dominates
 whatever MPS would otherwise accelerate). Passing ``device="mps"`` here is a
 regression, not an optimisation.
+
+`PPOAgent` is what the production CT loop trains and serves. `RLAgent`
+generalises it to the other continuous-action algorithms SB3 ships, for the
+algorithm-comparison study (`scripts/algorithm_comparison.py`); each runs at
+its library defaults, the same "untuned" footing PPO has always had here.
 """
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
-from stable_baselines3 import PPO
+from stable_baselines3 import A2C, PPO, SAC, TD3
+from stable_baselines3.common.noise import NormalActionNoise
 
 from src.rlops.environment import TradingEnvironment
 
+ALGORITHMS = {"ppo": PPO, "a2c": A2C, "sac": SAC, "td3": TD3}
 
-class PPOAgent:
-    """Wraps SB3's PPO with this project's environment and conventions."""
+# SB3's TD3 defaults to no exploration noise, which leaves a deterministic
+# policy with nothing driving exploration; 0.1 is the value SB3's own TD3
+# examples use.
+_TD3_NOISE_SIGMA = 0.1
+
+
+class RLAgent:
+    """Wraps one SB3 algorithm with this project's environment and conventions."""
 
     def __init__(
         self,
         env: TradingEnvironment,
-        learning_rate: float = 3e-4,
-        gamma: float = 0.99,
-        n_steps: int = 2048,
+        algorithm: str = "ppo",
         seed: int | None = None,
         device: str = "cpu",
+        **algo_kwargs,
     ) -> None:
+        if algorithm not in ALGORITHMS:
+            raise ValueError(f"unknown algorithm {algorithm!r}; expected one of {sorted(ALGORITHMS)}")
+        self.algorithm = algorithm
         self.hyperparameters = {
+            "algorithm": algorithm,
             "policy": "MlpPolicy",
-            "learning_rate": learning_rate,
-            "gamma": gamma,
-            "n_steps": n_steps,
+            **algo_kwargs,
             "seed": seed,
             "device": device,
         }
-        self.model = PPO(
-            "MlpPolicy",
-            env,
-            learning_rate=learning_rate,
-            gamma=gamma,
-            n_steps=n_steps,
-            seed=seed,
-            device=device,
-            verbose=0,
+        if algorithm == "td3" and "action_noise" not in algo_kwargs:
+            n = env.action_space.shape[0]
+            algo_kwargs["action_noise"] = NormalActionNoise(np.zeros(n), _TD3_NOISE_SIGMA * np.ones(n))
+            self.hyperparameters["action_noise_sigma"] = _TD3_NOISE_SIGMA
+        self.model = ALGORITHMS[algorithm](
+            "MlpPolicy", env, seed=seed, device=device, verbose=0, **algo_kwargs
         )
 
-    def train(self, total_timesteps: int) -> "PPOAgent":
-        """FR-07: train PPO against the reward `TradingEnvironment` computes."""
+    def train(self, total_timesteps: int) -> "RLAgent":
+        """FR-07: train against the reward `TradingEnvironment` computes."""
         self.model.learn(total_timesteps=total_timesteps)
         return self
 
@@ -93,14 +104,48 @@ class PPOAgent:
 
     @classmethod
     def load(
-        cls, path: str | Path, env: TradingEnvironment | None = None, device: str = "cpu"
-    ) -> "PPOAgent":
+        cls,
+        path: str | Path,
+        env: TradingEnvironment | None = None,
+        device: str = "cpu",
+        algorithm: str = "ppo",
+    ) -> "RLAgent":
         """FR-09/DR-09: reload a previously registered artifact.
 
         `env` is optional — a loaded model can `predict()` without one — but
         must be supplied to call `train()` again on the restored agent.
         """
         agent = cls.__new__(cls)
+        agent.algorithm = algorithm
         agent.hyperparameters = {}
-        agent.model = PPO.load(str(path), env=env, device=device)
+        agent.model = ALGORITHMS[algorithm].load(str(path), env=env, device=device)
         return agent
+
+
+class PPOAgent(RLAgent):
+    """The production agent: PPO, as named in the proposal's Section 3.6."""
+
+    def __init__(
+        self,
+        env: TradingEnvironment,
+        learning_rate: float = 3e-4,
+        gamma: float = 0.99,
+        n_steps: int = 2048,
+        seed: int | None = None,
+        device: str = "cpu",
+    ) -> None:
+        super().__init__(
+            env,
+            algorithm="ppo",
+            seed=seed,
+            device=device,
+            learning_rate=learning_rate,
+            gamma=gamma,
+            n_steps=n_steps,
+        )
+
+    @classmethod
+    def load(
+        cls, path: str | Path, env: TradingEnvironment | None = None, device: str = "cpu"
+    ) -> "PPOAgent":
+        return super().load(path, env=env, device=device, algorithm="ppo")

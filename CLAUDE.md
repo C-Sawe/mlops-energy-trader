@@ -92,7 +92,7 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 131 passing — keep it that way (backend)
+python -m pytest tests/ -q     # 138 passing — keep it that way (backend)
 cd frontend && npm test        # 47 passing — Vitest + React Testing Library, added 2026-09-20
 ```
 
@@ -438,8 +438,11 @@ scripts/              run_ingestion.py · run_baselines.py
                       · nfr_reliability_check.py                      [post-Sprint 4]
                       · sensitivity_analysis.py                       [post-Sprint 4]
                       · measure_nfr04_cold.py                         [post-Sprint 4]
+                      · nfr09_memory_check.mjs                        [post-Sprint 4]
+                      · algorithm_comparison.py (PPO/A2C/SAC/TD3, §10) [post-Sprint 4]
+results/algorithm_comparison/  runs.jsonl (every run's returns) + summary.json
 .importlinter          NFR-06's layer contracts, checked by tests/test_architecture.py
-tests/                131 tests (backend)
+tests/                138 tests (backend)
 frontend/src/*.test.jsx  47 tests (Vitest + React Testing Library, added 2026-09-20)
 ```
 
@@ -1378,6 +1381,78 @@ Not yet done: annealing the *hyperparameters themselves* (n_steps,
 learning rate, network size) rather than only the seed — everything above
 still holds the original architecture fixed and asks only "how variable
 is this specific configuration," not "is there a better configuration."
+
+**Algorithm comparison — PPO vs A2C vs SAC vs TD3, plus a selection
+ensemble — done 2026-09-24 (`scripts/algorithm_comparison.py`,
+results in `results/algorithm_comparison/`).** The user asked whether
+other model types might be more suitable before committing to one. Scoped
+deliberately to RL algorithms only (all from SB3, all acting on the same
+`TradingEnvironment`, so RL stays the project's core): random forests /
+XGBoost / LSTMs forecast returns rather than choose actions, so comparing
+them to PPO would need an invented trading rule on top, and if one "won"
+the project would stop being an RL project. **This is a scope question
+§2 says needs the supervisor — raised with the user, not yet confirmed as
+approved. Chapter 5 has not been updated with any of it.**
+
+Protocol, identical for every algorithm: the same 18 walk-forward splits,
+10 seeds each, 20,000 timesteps each, SB3 defaults for every algorithm
+(PPO has always been untuned here too), costs and drawdown penalty on.
+`RLAgent` (`src/rlops/agent.py`) generalises the wrapper; `PPOAgent` now
+subclasses it with identical behaviour, so production is untouched. TD3
+alone gets `NormalActionNoise(σ=0.1)` — SB3's TD3 has *no* exploration
+noise by default, so "untuned" would otherwise mean "never explores."
+
+The ensemble is Yang et al. (2020)'s: per split and seed, pick the
+algorithm with the best Sharpe on a **validation slice carved off the end
+of the training window** (last 90 days), then trade the eval window with
+it. Choosing on eval-window Sharpe would be look-ahead (I1). Consequence:
+every algorithm here trains on the train window *minus* those 90 days, so
+PPO's numbers below are not comparable with the 180-run study above,
+which trained on the full window.
+
+720 real training runs, ~3.1 hours wall time on 8 worker processes
+(SAC ~175s and TD3 ~186s per run single-threaded vs ~4s for PPO/A2C; the
+first estimate was wrong partly because the Mac idle-slept mid-run —
+`caffeinate -i -w <pid>` prevents that on any future long run).
+DSR `n_trials = 5 strategies × 18 × 10 = 900`.
+
+| strategy | pooled Sharpe (n=180) | best-seed/split mean | seed-mean beats buy-and-hold | DSR max | splits DSR>0.5 | vs PPO: splits better (Wilcoxon p) |
+|---|---|---|---|---|---|---|
+| PPO | −0.630 ± 1.658 | 1.206 | 4/18 | 0.170 | 0/18 | — |
+| A2C | −0.630 ± 1.568 | 1.359 | 4/18 | 0.250 | 0/18 | 7/18 (0.495) |
+| SAC | −0.623 ± 1.555 | 1.092 | 4/18 | 0.058 | 0/18 | 7/18 (0.766) |
+| TD3 | −0.430 ± 1.846 | 1.200 | 7/18 | 0.283 | 0/18 | 10/18 (0.609) |
+| Ensemble | −0.767 ± 1.757 | 1.208 | 5/18 | 0.261 | 0/18 | 8/18 (0.347) |
+
+Baselines, mean Sharpe across the same 18 eval windows: buy-and-hold
+0.855, equal-weight 0.865, all-cash 0.000, random −3.295.
+
+**What this does and does not show.**
+- **No algorithm is distinguishable from PPO.** None beats it on more
+  than 10 of 18 splits, and no paired difference is significant
+  (p 0.35–0.77). TD3's slightly higher pooled mean comes with the widest
+  spread and is well inside noise. The honest reading is that the choice
+  of PPO is now *defended by evidence* rather than just inherited from
+  the proposal — not that PPO is best.
+- **The ensemble made things slightly worse, not better.** Its picks were
+  spread almost evenly (A2C 52, PPO 37, SAC 38, TD3 53 of 180), which is
+  what selection looks like when a 90-day validation Sharpe carries
+  almost no information about the next 180 days. This is a real,
+  reportable negative result against the Yang et al. approach under this
+  project's conditions (daily data, 5 tickers, untuned, costs on).
+- **Every untuned algorithm loses to simply holding the assets** on
+  average (pooled −0.4 to −0.8 vs buy-and-hold 0.855), and no strategy's
+  best fold survives deflation (0/18 above 0.5 for all five). Same
+  conclusion as the PPO-only study, now across four algorithms.
+- The best-seed/split column (≈1.1–1.4) versus the pooled column
+  (≈ −0.6) is the same selection-bias gap §10.3 exists for, reproduced
+  for every algorithm.
+
+Framed per §1: the comparison is evidence about the *architecture's*
+design choice — swapping the algorithm inside the CT loop would not have
+changed its behaviour materially, which is an argument that the loop
+(detection, FR-17 gate, hot reload) is the contribution, not the learner
+inside it.
 
 **The CT loop's core claim — autonomous decay detection and recovery — has
 now been observed live, not just unit-tested (2026-09-17, same checkout).**
