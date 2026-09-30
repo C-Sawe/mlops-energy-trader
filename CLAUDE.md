@@ -442,6 +442,10 @@ scripts/              run_ingestion.py · run_baselines.py
                       · algorithm_comparison.py (PPO/A2C/SAC/TD3, §10) [post-Sprint 4]
 results/algorithm_comparison/  runs.jsonl (every run's returns) + summary.json
 .importlinter          NFR-06's layer contracts, checked by tests/test_architecture.py
+Dockerfile, frontend/Dockerfile, deploy/   cloud deployment (single VM, Compose + Caddy)  [2026-09-30, not yet run]
+.github/workflows/     ci.yml (tests on push/PR) · deploy.yml (GHCR → SSH → VM); see docs/DEPLOYMENT.md
+.github/issue-drafts/  open backlog as issue drafts; scripts/create_github_issues.sh --apply files them
+constraints.txt        pinned tested versions (mlflow especially, §13) for Docker/CI
 tests/                138 tests (backend)
 frontend/src/*.test.jsx  47 tests (Vitest + React Testing Library, added 2026-09-20)
 ```
