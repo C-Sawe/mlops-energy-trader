@@ -1,0 +1,42 @@
+[importlinter]
+root_package = src
+
+# NFR-06: "no circular dependencies between packages, verified by static
+# analysis." This is that verification, not just the architecture diagram in
+# CLAUDE.md §6 asserting it. The diagram shows a strict presentation ->
+# serving -> rlops -> dataops chain with orchestration depending on all
+# three, but the real code has one wrinkle the diagram simplifies away:
+# src/serving/api.py is the FastAPI app's composition root, and it imports
+# CTOrchestrator/IngestionState from src.orchestration to wire them into
+# `lifespan` -- while src.orchestration.ct_orchestrator imports
+# InferenceService from src.serving.inference to run its FR-17 comparison.
+# That is not a real circular *import* (api.py and inference.py are
+# different modules; neither imports the other), but a layers contract
+# naming "src.serving" as one block would wrongly flag it. Named at module
+# granularity below instead, matching what the code actually does: api.py
+# sits above orchestration (it wires it up), which sits above the serving
+# logic orchestration actually calls into (inference.py), which sits above
+# rlops and dataops like the diagram says.
+[importlinter:contract:layers]
+name = Layered architecture (CLAUDE.md §6)
+type = layers
+layers =
+    src.serving.api
+    src.orchestration
+    src.serving.inference
+    src.rlops
+    src.dataops
+
+# src/execution (CLAUDE.md §7's Alpaca deviation) is documented as sitting
+# downstream of serving, consuming InferenceService.predict()'s *output* via
+# a script (scripts/broker_paper_trade_test.py), never by importing
+# InferenceService or CTOrchestrator directly. This is the checkable version
+# of that claim.
+[importlinter:contract:execution-independence]
+name = src.execution does not import serving or orchestration directly
+type = forbidden
+source_modules =
+    src.execution
+forbidden_modules =
+    src.serving
+    src.orchestration

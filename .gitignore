@@ -10,3 +10,12 @@ mlruns/
 .DS_Store
 data/raw/
 data/processed/
+mlruns.db
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/.vite/
+
+# Generated thesis artifacts (binary, regenerated from chapter5.md) — see thesis/chapter5.md
+thesis/*.docx
+thesis/*.pdf

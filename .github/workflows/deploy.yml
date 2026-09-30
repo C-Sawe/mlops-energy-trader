@@ -1,0 +1,197 @@
+name: Deploy
+
+# Builds the backend and dashboard images, pushes them to GitHub Container
+# Registry, and rolls them out to a single cloud VM running Docker Compose.
+# Provider-agnostic: any Linux VM with Docker and SSH access works (AWS EC2,
+# GCP Compute Engine, Azure, DigitalOcean, Hetzner...). Setup, required
+# secrets, and the first-deploy bootstrap are in docs/DEPLOYMENT.md.
+#
+# Triggers: every push to main, or manually (Actions tab -> Deploy -> Run
+# workflow), which also lets you pick a branch and request a data bootstrap.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: "First deploy: backfill market data (2015 -> today) and train/promote the first model"
+        type: boolean
+        default: false
+
+# Never run two deploys against the same host at once.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build and push images
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_prefix: ${{ steps.names.outputs.image_prefix }}
+    strategy:
+      matrix:
+        include:
+          - component: backend
+            context: .
+          - component: frontend
+            context: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - id: names
+        name: Compute image name (GHCR requires lowercase)
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          echo "image_prefix=ghcr.io/${repo}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: |
+            ${{ steps.names.outputs.image_prefix }}-${{ matrix.component }}:${{ github.sha }}
+            ${{ steps.names.outputs.image_prefix }}-${{ matrix.component }}:latest
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  deploy:
+    name: Roll out to VM
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Create a "production" environment in repo settings to add required
+    # reviewers if you want a manual approval before each rollout.
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_DIR: mlops-energy-trader
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets are set
+        env:
+          S_HOST: ${{ secrets.DEPLOY_HOST }}
+          S_USER: ${{ secrets.DEPLOY_USER }}
+          S_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          S_KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          S_PG: ${{ secrets.POSTGRES_PASSWORD }}
+          S_TOKEN: ${{ secrets.API_BEARER_TOKEN }}
+          S_BAU: ${{ secrets.BASIC_AUTH_USER }}
+          S_BAP: ${{ secrets.BASIC_AUTH_PASSWORD }}
+        run: |
+          missing=0
+          for v in S_HOST S_USER S_KEY S_KNOWN S_PG S_TOKEN S_BAU S_BAP; do
+            if [ -z "${!v}" ]; then echo "::error::missing secret for $v (see docs/DEPLOYMENT.md)"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Configure SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # Pinned host key, not ssh-keyscan at deploy time: keyscan would
+          # trust whatever answers on that IP.
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host target
+            HostName ${DEPLOY_HOST}
+            User ${DEPLOY_USER}
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+          EOF
+
+      - name: Write runtime .env (NFR-10 - secrets never committed)
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          API_BEARER_TOKEN: ${{ secrets.API_BEARER_TOKEN }}
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+          BASIC_AUTH_PASSWORD: ${{ secrets.BASIC_AUTH_PASSWORD }}
+          SITE_ADDRESS: ${{ vars.SITE_ADDRESS }}
+          CT_EVALUATION_INTERVAL_SECONDS: ${{ vars.CT_EVALUATION_INTERVAL_SECONDS }}
+          INGESTION_INTERVAL_SECONDS: ${{ vars.INGESTION_INTERVAL_SECONDS }}
+        run: |
+          umask 077
+          {
+            echo "IMAGE_PREFIX=${{ needs.build.outputs.image_prefix }}"
+            echo "IMAGE_TAG=${GITHUB_SHA}"
+            echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}"
+            echo "API_BEARER_TOKEN=${API_BEARER_TOKEN}"
+            echo "BASIC_AUTH_USER=${BASIC_AUTH_USER}"
+            echo "BASIC_AUTH_PASSWORD=${BASIC_AUTH_PASSWORD}"
+            [ -n "$SITE_ADDRESS" ] && echo "SITE_ADDRESS=${SITE_ADDRESS}"
+            [ -n "$CT_EVALUATION_INTERVAL_SECONDS" ] && echo "CT_EVALUATION_INTERVAL_SECONDS=${CT_EVALUATION_INTERVAL_SECONDS}"
+            [ -n "$INGESTION_INTERVAL_SECONDS" ] && echo "INGESTION_INTERVAL_SECONDS=${INGESTION_INTERVAL_SECONDS}"
+            true
+          } > deploy.env
+
+      - name: Upload compose files and .env
+        run: |
+          ssh target "mkdir -p ~/${DEPLOY_DIR}"
+          scp deploy/docker-compose.prod.yml target:"~/${DEPLOY_DIR}/docker-compose.yml"
+          scp deploy/Caddyfile target:"~/${DEPLOY_DIR}/Caddyfile"
+          ssh target "umask 077; cat > ~/${DEPLOY_DIR}/.env" < deploy.env
+          rm -f deploy.env
+
+      - name: Pull images and restart
+        run: |
+          # Token passed on stdin so it never appears in a process listing.
+          echo "${{ secrets.GITHUB_TOKEN }}" | ssh target "docker login ghcr.io -u ${{ github.actor }} --password-stdin"
+          ssh target "cd ~/${DEPLOY_DIR} && docker compose pull && docker compose up -d --remove-orphans && docker image prune -f"
+          ssh target "docker logout ghcr.io"
+
+      - name: Wait for backend health
+        run: |
+          for i in $(seq 1 30); do
+            if ssh target "cd ~/${DEPLOY_DIR} && docker compose exec -T backend python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)\"" 2>/dev/null; then
+              echo "backend healthy after ${i} attempt(s)"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::backend did not become healthy"
+          ssh target "cd ~/${DEPLOY_DIR} && docker compose ps && docker compose logs --tail=100 backend"
+          exit 1
+
+      # First deploy only. The ingestion scheduler refetches a 120-day
+      # trailing window, which cannot fill an empty database (CLAUDE.md §13),
+      # so a fresh host needs one explicit full backfill. Then /ct/evaluate
+      # with no incumbent trains and promotes the first model (§10 bootstrap).
+      - name: Bootstrap data and first model
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap }}
+        run: |
+          ssh target "cd ~/${DEPLOY_DIR} && docker compose exec -T backend python scripts/run_ingestion.py --end \$(date -u +%F)"
+          ssh target "cd ~/${DEPLOY_DIR} && docker compose exec -T backend python -c \"
+          import os, urllib.request
+          req = urllib.request.Request('http://localhost:8000/ct/evaluate', method='POST',
+              headers={'Authorization': 'Bearer ' + os.environ['API_BEARER_TOKEN']})
+          print(urllib.request.urlopen(req, timeout=120).read().decode())
+          \""
+
+      - name: Smoke test dashboard and edge proxy
+        run: |
+          ssh target "cd ~/${DEPLOY_DIR} && docker compose exec -T frontend wget -qO- http://localhost/healthz"
+          ssh target "cd ~/${DEPLOY_DIR} && test -n \"\$(docker compose ps --status running -q caddy)\""
+
+      - name: Clean up SSH material
+        if: always()
+        run: rm -rf ~/.ssh

@@ -212,6 +212,50 @@ def partition_chronological(
     return train.reset_index(drop=True), evaluation.reset_index(drop=True)
 
 
+def walk_forward_splits(
+    start: str,
+    end: str,
+    train_days: int,
+    eval_days: int,
+    step_days: int | None = None,
+) -> list[dict[str, pd.Timestamp]]:
+    """Rolling (train, eval) windows spanning distinct market regimes.
+
+    A single train/eval split (CLAUDE.md §10, §13) risks overfitting to one
+    regime and calling it validated. Each window here advances by
+    ``step_days`` (defaulting to ``eval_days``, which gives non-overlapping
+    evaluation windows — the same evaluation day is never scored twice).
+    Generation stops once a window's evaluation period would run past
+    ``end``, so every returned split is fully contained in [start, end].
+
+    Every split satisfies DR-06 (eval strictly after train) by construction
+    — eval_start is always train_end + 1 day — not by a separate check, so
+    there is no way to call this and get an invalid split back.
+    """
+    step_days = step_days or eval_days
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+
+    splits = []
+    train_start = start_ts
+    while True:
+        train_end = train_start + pd.Timedelta(days=train_days - 1)
+        eval_start = train_end + pd.Timedelta(days=1)
+        eval_end = eval_start + pd.Timedelta(days=eval_days - 1)
+        if eval_end > end_ts:
+            break
+        splits.append(
+            {
+                "train_start": train_start,
+                "train_end": train_end,
+                "eval_start": eval_start,
+                "eval_end": eval_end,
+            }
+        )
+        train_start = train_start + pd.Timedelta(days=step_days)
+
+    return splits
+
+
 def build_feature_frame(
     equities: pd.DataFrame, vix: pd.DataFrame | None = None
 ) -> pd.DataFrame:

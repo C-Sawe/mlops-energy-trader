@@ -11,16 +11,20 @@ gymnasium>=0.29
 stable-baselines3>=2.3
 scipy>=1.11
 
-# Sprint 3 - RLOps training (install when you reach this sprint)
-# finrl
-# torch
-# mlflow>=2.17
+# Sprint 3 - RLOps training
+mlflow>=2.17
+# torch is pulled in transitively by stable-baselines3 already
+
+# finrl is deliberately NOT here: it was used only for the one-off §8
+# cross-check validation experiment (scripts/finrl_crosscheck.py), installed
+# into an isolated venv to avoid its dated dependency footprint conflicting
+# with the versions pinned above. See that script's docstring.
 
 # Sprint 4 - Serving & orchestration
-# fastapi>=0.110
-# uvicorn[standard]>=0.29
-# prefect>=3.0
-# evidently>=0.4
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27  # TestClient for the FastAPI test suite, and the Alpaca paper-trading client (src/execution)
 
 # Development
 pytest>=8.0
+import-linter>=2.15  # NFR-06: verifies the layered architecture (see .importlinter, tests/test_architecture.py)
