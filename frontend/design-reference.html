@@ -1,0 +1,882 @@
+<title>Energy Agent Telemetry</title>
+<style>
+  /* ============================ tokens ============================ */
+  :root {
+    color-scheme: light;
+    --ground:        #F2F2F7;
+    --ground-tint:   #E8E8ED;
+    --glass:         rgba(255,255,255,0.72);
+    --glass-strong:  rgba(255,255,255,0.86);
+    --hairline:      rgba(60,60,67,0.12);
+    --hairline-soft: rgba(60,60,67,0.06);
+
+    --ink:      #1C1C1E;
+    --ink-2:    #6E6E73;
+    --ink-3:    #A1A1A6;
+
+    --accent:   #007AFF;
+    --good:     #34C759;
+    --warn:     #FF9500;
+    --critical: #FF3B30;
+
+    --series-agent: #007AFF;
+    --series-bench: #8E8E93;
+
+    --grid:     rgba(60,60,67,0.10);
+    --shadow:   0 1px 2px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
+
+    --r-lg: 26px;
+    --r-md: 18px;
+    --r-sm: 12px;
+
+    --spring: cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --ground:        #000000;
+      --ground-tint:   #1C1C1E;
+      --glass:         rgba(28,28,30,0.72);
+      --glass-strong:  rgba(44,44,46,0.86);
+      --hairline:      rgba(84,84,88,0.40);
+      --hairline-soft: rgba(84,84,88,0.20);
+
+      --ink:      #F2F2F7;
+      --ink-2:    #98989D;
+      --ink-3:    #6E6E73;
+
+      --accent:   #0A84FF;
+      --good:     #30D158;
+      --warn:     #FF9F0A;
+      --critical: #FF453A;
+
+      --series-agent: #0A84FF;
+      --series-bench: #98989D;
+
+      --grid:     rgba(142,142,147,0.18);
+      --shadow:   0 1px 2px rgba(0,0,0,0.30), 0 8px 24px rgba(0,0,0,0.44);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground:        #000000;
+    --ground-tint:   #1C1C1E;
+    --glass:         rgba(28,28,30,0.72);
+    --glass-strong:  rgba(44,44,46,0.86);
+    --hairline:      rgba(84,84,88,0.40);
+    --hairline-soft: rgba(84,84,88,0.20);
+
+    --ink:      #F2F2F7;
+    --ink-2:    #98989D;
+    --ink-3:    #6E6E73;
+
+    --accent:   #0A84FF;
+    --good:     #30D158;
+    --warn:     #FF9F0A;
+    --critical: #FF453A;
+
+    --series-agent: #0A84FF;
+    --series-bench: #98989D;
+
+    --grid:     rgba(142,142,147,0.18);
+    --shadow:   0 1px 2px rgba(0,0,0,0.30), 0 8px 24px rgba(0,0,0,0.44);
+  }
+
+  /* ============================ base ============================ */
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+                 "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    letter-spacing: -0.02em;
+    font-size: 15px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding-inline: 16px;
+    padding-block: 22px 56px;
+  }
+  .num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+
+  /* ============================ glass ============================ */
+  .glass {
+    background: var(--glass);
+    -webkit-backdrop-filter: saturate(180%) blur(28px);
+    backdrop-filter: saturate(180%) blur(28px);
+    border: 0.5px solid var(--hairline);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+
+  /* ============================ masthead ============================ */
+  .masthead {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; margin-bottom: 16px;
+  }
+  .masthead h1 {
+    margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -0.035em;
+    text-wrap: balance;
+  }
+  .masthead p { margin: 2px 0 0; color: var(--ink-2); font-size: 13.5px; }
+  .mast-right { display: flex; align-items: center; gap: 8px; }
+
+  .demo-chip {
+    font-size: 11.5px; font-weight: 600; letter-spacing: 0.01em;
+    padding: 5px 10px; border-radius: 999px;
+    background: color-mix(in srgb, var(--warn) 16%, transparent);
+    color: color-mix(in srgb, var(--warn) 72%, var(--ink));
+    border: 0.5px solid color-mix(in srgb, var(--warn) 34%, transparent);
+    white-space: nowrap;
+  }
+
+  .icon-btn {
+    appearance: none; border: 0.5px solid var(--hairline);
+    background: var(--glass-strong); color: var(--ink);
+    width: 36px; height: 36px; border-radius: 999px; cursor: pointer;
+    font-size: 15px; line-height: 1; display: grid; place-items: center;
+    transition: transform 240ms var(--spring), background 240ms var(--spring);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .icon-btn:active { transform: scale(0.92); }
+  .icon-btn:focus-visible { outline: 2.5px solid var(--accent); outline-offset: 2px; }
+
+  /* ============================ status strip ============================ */
+  .strip {
+    display: flex; align-items: stretch; flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .strip-cell {
+    flex: 1 1 190px; min-width: 0;
+    padding: 13px 18px;
+    display: flex; flex-direction: column; gap: 5px;
+    border-right: 0.5px solid var(--hairline-soft);
+  }
+  .strip-cell:last-child { border-right: 0; }
+  .strip-k {
+    font-size: 10.5px; font-weight: 600; letter-spacing: 0.055em;
+    text-transform: uppercase; color: var(--ink-3);
+  }
+  .strip-v { font-size: 15px; font-weight: 600; letter-spacing: -0.015em; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 4px 11px 4px 8px; border-radius: 999px;
+    font-size: 13px; font-weight: 600; width: fit-content;
+    border: 0.5px solid transparent;
+  }
+  .pill svg { flex: none; }
+  .pill.good {
+    background: color-mix(in srgb, var(--good) 15%, transparent);
+    color: color-mix(in srgb, var(--good) 68%, var(--ink));
+    border-color: color-mix(in srgb, var(--good) 32%, transparent);
+  }
+  .pill.warn {
+    background: color-mix(in srgb, var(--warn) 16%, transparent);
+    color: color-mix(in srgb, var(--warn) 70%, var(--ink));
+    border-color: color-mix(in srgb, var(--warn) 34%, transparent);
+  }
+  .pill.crit {
+    background: color-mix(in srgb, var(--critical) 15%, transparent);
+    color: color-mix(in srgb, var(--critical) 72%, var(--ink));
+    border-color: color-mix(in srgb, var(--critical) 34%, transparent);
+  }
+  .pill.idle {
+    background: color-mix(in srgb, var(--ink-3) 14%, transparent);
+    color: var(--ink-2);
+    border-color: var(--hairline);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 999px; background: currentColor; }
+
+  /* ============================ layout ============================ */
+  .panel { display: grid; gap: 14px; grid-template-columns: 1fr; }
+  @media (min-width: 900px) {
+    .panel { grid-template-columns: minmax(0, 2.15fr) minmax(0, 1fr); }
+  }
+  .col { display: grid; gap: 14px; align-content: start; min-width: 0; }
+
+  .card-head {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 12px; padding: 16px 18px 10px;
+  }
+  .card-title { font-size: 15px; font-weight: 600; letter-spacing: -0.015em; margin: 0; }
+  .card-sub { font-size: 12.5px; color: var(--ink-2); margin: 2px 0 0; }
+
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  .legend-item {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--ink-2); font-weight: 500;
+  }
+  .swatch { width: 15px; height: 2.5px; border-radius: 2px; flex: none; }
+  .swatch.dash {
+    background: repeating-linear-gradient(90deg,
+      var(--series-bench) 0 4px, transparent 4px 7px);
+  }
+
+  .chartbox { position: relative; padding: 0 6px 12px; }
+  svg.chart { display: block; width: 100%; height: auto; overflow: visible; }
+
+  /* ============================ tooltip ============================ */
+  .tip {
+    position: absolute; pointer-events: none; z-index: 5;
+    background: var(--glass-strong);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    backdrop-filter: blur(20px) saturate(180%);
+    border: 0.5px solid var(--hairline);
+    border-radius: var(--r-sm);
+    box-shadow: var(--shadow);
+    padding: 9px 11px; min-width: 132px;
+    font-size: 12.5px; opacity: 0;
+    transition: opacity 150ms ease;
+  }
+  .tip.on { opacity: 1; }
+  .tip-d { color: var(--ink-2); font-size: 11px; font-weight: 600;
+           letter-spacing: 0.03em; text-transform: uppercase; margin-bottom: 5px; }
+  .tip-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+  .tip-row + .tip-row { margin-top: 3px; }
+  .tip-lab { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); }
+  .tip-val { font-weight: 600; }
+
+  /* ============================ gauges ============================ */
+  .gauge-card { padding: 16px 18px 18px; }
+  .gauge-wrap { display: flex; align-items: center; gap: 16px; margin-top: 10px; }
+  .gauge-fig { flex: none; }
+  .gauge-read { min-width: 0; }
+  .gauge-val {
+    font-size: 30px; font-weight: 600; letter-spacing: -0.045em; line-height: 1.05;
+  }
+  .gauge-meta { font-size: 12.5px; color: var(--ink-2); margin-top: 3px; }
+
+  /* ============================ decision log ============================ */
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; min-width: 680px; }
+  thead th {
+    text-align: left; font-size: 10.5px; font-weight: 600;
+    letter-spacing: 0.055em; text-transform: uppercase; color: var(--ink-3);
+    padding: 9px 18px; border-bottom: 0.5px solid var(--hairline);
+    white-space: nowrap; background: transparent;
+  }
+  tbody td { padding: 11px 18px; border-bottom: 0.5px solid var(--hairline-soft); }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr { cursor: pointer; transition: background 160ms var(--spring); }
+  tbody tr:hover { background: var(--hairline-soft); }
+  tbody tr:focus-visible { outline: 2.5px solid var(--accent); outline-offset: -2px; }
+  .tick { font-weight: 600; }
+  .act { font-weight: 600; }
+  .act.buy  { color: color-mix(in srgb, var(--good) 74%, var(--ink)); }
+  .act.sell { color: color-mix(in srgb, var(--critical) 78%, var(--ink)); }
+  .act.hold { color: var(--ink-2); }
+  .act.liq  { color: color-mix(in srgb, var(--warn) 74%, var(--ink)); }
+
+  .foot {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; flex-wrap: wrap; padding: 12px 18px;
+    border-top: 0.5px solid var(--hairline-soft); color: var(--ink-2); font-size: 12.5px;
+  }
+  .pager { display: flex; gap: 6px; }
+  .pg {
+    appearance: none; border: 0.5px solid var(--hairline); background: transparent;
+    color: var(--ink-2); min-width: 30px; height: 30px; border-radius: 9px;
+    font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+    transition: transform 220ms var(--spring), background 220ms var(--spring);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .pg:active { transform: scale(0.9); }
+  .pg[aria-current="true"] { background: var(--accent); color: #fff; border-color: transparent; }
+  .pg:focus-visible { outline: 2.5px solid var(--accent); outline-offset: 2px; }
+
+  /* ============================ sheet ============================ */
+  .scrim {
+    position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,0.38);
+    -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px);
+    opacity: 0; transition: opacity 320ms var(--spring);
+  }
+  .scrim.on { opacity: 1; }
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 41;
+    max-height: 86vh; overflow-y: auto;
+    background: var(--glass-strong);
+    -webkit-backdrop-filter: saturate(180%) blur(30px);
+    backdrop-filter: saturate(180%) blur(30px);
+    border-top-left-radius: 32px; border-top-right-radius: 32px;
+    border-top: 0.5px solid var(--hairline);
+    box-shadow: 0 -8px 40px rgba(0,0,0,0.20);
+    padding: 10px 20px calc(26px + env(safe-area-inset-bottom, 0px));
+    transform: translate3d(0, 100%, 0);
+  }
+  .grabber {
+    width: 38px; height: 5px; border-radius: 999px;
+    background: var(--ink-3); opacity: 0.45; margin: 0 auto 16px;
+  }
+  .sheet h2 {
+    margin: 0 0 3px; font-size: 21px; font-weight: 600; letter-spacing: -0.03em;
+    text-align: center;
+  }
+  .sheet .sub { text-align: center; color: var(--ink-2); font-size: 13px; margin: 0 0 18px; }
+  .kv { display: grid; gap: 0; border-radius: var(--r-md);
+        border: 0.5px solid var(--hairline); overflow: hidden; }
+  .kv-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    padding: 12px 15px; border-bottom: 0.5px solid var(--hairline-soft);
+  }
+  .kv-row:last-child { border-bottom: 0; }
+  .kv-k { color: var(--ink-2); font-size: 13.5px; }
+  .kv-v { font-weight: 600; font-size: 13.5px; text-align: right; }
+  .trace {
+    margin-top: 14px; padding: 12px 15px; border-radius: var(--r-md);
+    background: color-mix(in srgb, var(--accent) 9%, transparent);
+    border: 0.5px solid color-mix(in srgb, var(--accent) 24%, transparent);
+    font-size: 12.5px; color: var(--ink-2); line-height: 1.5;
+  }
+  .trace b { color: var(--ink); font-weight: 600; }
+  .btn {
+    appearance: none; border: 0; width: 100%; margin-top: 16px;
+    background: var(--accent); color: #fff;
+    font: inherit; font-size: 16px; font-weight: 600; letter-spacing: -0.01em;
+    padding: 13px 18px; border-radius: var(--r-md); cursor: pointer;
+    transition: transform 240ms var(--spring), filter 240ms var(--spring);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:active { transform: scale(0.965); filter: brightness(0.94); }
+  .btn:focus-visible { outline: 2.5px solid var(--accent); outline-offset: 2px; }
+
+  .note {
+    margin-top: 16px; color: var(--ink-2); font-size: 12.5px; line-height: 1.55;
+    padding-inline: 4px;
+  }
+  .note b { color: var(--ink); font-weight: 600; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div>
+      <h1>Energy Agent Telemetry</h1>
+      <p>PPO trading agent · continuous training pipeline · XOM · CVX · SHEL · BP · NEE</p>
+    </div>
+    <div class="mast-right">
+      <span class="demo-chip">Example data — not live results</span>
+      <button class="icon-btn" id="theme" aria-label="Switch theme" title="Switch theme">◐</button>
+    </div>
+  </header>
+
+  <!-- ===================== band 1 · status ===================== -->
+  <section class="glass strip" aria-label="System status">
+    <div class="strip-cell">
+      <span class="strip-k">CT pipeline</span>
+      <span class="pill good"><span class="dot"></span>Serving</span>
+    </div>
+    <div class="strip-cell">
+      <span class="strip-k">Active model</span>
+      <span class="strip-v num">v1.4.2</span>
+    </div>
+    <div class="strip-cell">
+      <span class="strip-k">Last ingest</span>
+      <span class="strip-v num">11 Jun · 16:30</span>
+    </div>
+    <div class="strip-cell">
+      <span class="strip-k">Volatility fail-safe</span>
+      <span class="pill idle" id="fs-pill"><span class="dot"></span>Inactive · VIX 16.4</span>
+    </div>
+  </section>
+
+  <!-- ===================== band 2 · performance ===================== -->
+  <div class="panel">
+    <div class="col">
+
+      <section class="glass">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">Portfolio equity</h2>
+            <p class="card-sub">Agent versus equal-weight buy &amp; hold, net of 10 bps costs</p>
+          </div>
+          <div class="legend">
+            <span class="legend-item"><span class="swatch" style="background:var(--series-agent)"></span>Agent</span>
+            <span class="legend-item"><span class="swatch dash"></span>Buy &amp; hold</span>
+          </div>
+        </div>
+        <div class="chartbox">
+          <svg class="chart" id="equity" viewBox="0 0 760 260" role="img"
+               aria-label="Equity curve comparing the agent against an equal-weight buy and hold benchmark over six months; both end higher, the agent by a wider margin."></svg>
+          <div class="tip" id="tip-eq"></div>
+        </div>
+      </section>
+
+      <section class="glass">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">Rolling 30-day Sharpe</h2>
+            <p class="card-sub">Retraining triggers below 1.00 — the threshold the orchestrator watches</p>
+          </div>
+        </div>
+        <div class="chartbox">
+          <svg class="chart" id="sharpe" viewBox="0 0 760 200" role="img"
+               aria-label="Rolling 30-day Sharpe ratio, currently 1.42, approaching the 1.00 retraining threshold in March."></svg>
+          <div class="tip" id="tip-sh"></div>
+        </div>
+      </section>
+
+    </div>
+
+    <div class="col">
+
+      <section class="glass gauge-card">
+        <h2 class="card-title">Rolling 30-day Sharpe</h2>
+        <div class="gauge-wrap">
+          <svg class="gauge-fig" id="g-sharpe" width="124" height="80" viewBox="0 0 124 80" aria-hidden="true"></svg>
+          <div class="gauge-read">
+            <div class="gauge-val num">1.42</div>
+            <div class="gauge-meta">Threshold 1.00 · headroom +0.42</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="glass gauge-card">
+        <h2 class="card-title">Maximum drawdown</h2>
+        <div class="gauge-wrap">
+          <svg class="gauge-fig" id="g-dd" width="124" height="80" viewBox="0 0 124 80" aria-hidden="true"></svg>
+          <div class="gauge-read">
+            <div class="gauge-val num">−12.8%</div>
+            <div class="gauge-meta">Peak 8 Apr · trough 2 May</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="glass gauge-card">
+        <h2 class="card-title">Cycle history</h2>
+        <div class="gauge-wrap" style="gap:12px">
+          <div class="gauge-read" style="flex:1">
+            <div class="gauge-val num" style="font-size:26px">3</div>
+            <div class="gauge-meta">Retrains this quarter · 1 candidate rejected</div>
+          </div>
+        </div>
+        <div style="margin-top:14px; display:flex; gap:8px; flex-wrap:wrap">
+          <span class="pill good" style="font-size:12px"><span class="dot"></span>2 promoted</span>
+          <span class="pill warn" style="font-size:12px"><span class="dot"></span>1 held back</span>
+        </div>
+      </section>
+
+    </div>
+  </div>
+
+  <!-- ===================== band 3 · decision log ===================== -->
+  <section class="glass" style="margin-top:14px">
+    <div class="card-head">
+      <div>
+        <h2 class="card-title">Autonomous decision log</h2>
+        <p class="card-sub">Every action traced to the model version that produced it</p>
+      </div>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Timestamp</th>
+            <th scope="col">Ticker</th>
+            <th scope="col">Raw weight</th>
+            <th scope="col">Action</th>
+            <th scope="col">VIX</th>
+            <th scope="col">Fail-safe</th>
+          </tr>
+        </thead>
+        <tbody id="log"></tbody>
+      </table>
+    </div>
+    <div class="foot">
+      <span>Showing 1–6 of 42</span>
+      <div class="pager">
+        <button class="pg" aria-label="Previous page">‹</button>
+        <button class="pg" aria-current="true">1</button>
+        <button class="pg">2</button>
+        <button class="pg">3</button>
+        <button class="pg" aria-label="Next page">›</button>
+      </div>
+    </div>
+  </section>
+
+  <p class="note">
+    <b>Figures on this page are generated example data</b>, shown so the interface can be
+    judged before the pipeline is wired to it. The agent series is not a backtest result and
+    carries no claim about profitability.
+  </p>
+
+</div>
+
+<div class="scrim" id="scrim" hidden></div>
+<div class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-t" hidden>
+  <div class="grabber"></div>
+  <h2 id="sheet-t">Decision detail</h2>
+  <p class="sub" id="sheet-sub">—</p>
+  <div class="kv" id="sheet-kv"></div>
+  <div class="trace" id="sheet-trace"></div>
+  <button class="btn" id="sheet-close">Done</button>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  /* ------------------------------------------------ deterministic data */
+  const rand = (s => () => (s = s * 16807 % 2147483647) / 2147483647)(42);
+
+  const N = 124;
+  const start = new Date(2026, 0, 5);
+  const dates = Array.from({length: N}, (_, i) => {
+    const d = new Date(start); d.setDate(d.getDate() + Math.round(i * 1.42)); return d;
+  });
+
+  // Agent outperforms on a rising tape; benchmark rides the sector.
+  const agent = [], bench = [];
+  let a = 100000, b = 100000;
+  for (let i = 0; i < N; i++) {
+    const t = i / (N - 1);
+    const shock = (t > 0.30 && t < 0.42) ? -0.0034 : 0;      // April drawdown
+    a *= 1 + 0.00250 + shock * 1.35 + (rand() - 0.5) * 0.0092;
+    b *= 1 + 0.00208 + shock * 1.55 + (rand() - 0.5) * 0.0104;
+    agent.push(a); bench.push(b);
+  }
+
+  const sharpe = [];
+  for (let i = 0; i < N; i++) {
+    const t = i / (N - 1);
+    const dip = Math.exp(-Math.pow((t - 0.355) / 0.085, 2)) * 0.92;
+    sharpe.push(1.86 - dip + Math.sin(t * 13.5) * 0.15 + (rand() - 0.5) * 0.1);
+  }
+
+  const fmtMoney = v => "$" + Math.round(v).toLocaleString("en-US");
+  const fmtDate  = d => d.toLocaleDateString("en-GB", {day: "numeric", month: "short"});
+  const css      = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+  /* ------------------------------------------------ chart plumbing */
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (n, at) => { const e = document.createElementNS(NS, n);
+    for (const k in at) e.setAttribute(k, at[k]); return e; };
+
+  function scales(box, pad, xs, lo, hi) {
+    const x = i => pad.l + (i / (xs - 1)) * (box.w - pad.l - pad.r);
+    const y = v => pad.t + (1 - (v - lo) / (hi - lo)) * (box.h - pad.t - pad.b);
+    return {x, y};
+  }
+  const line = (pts, s) => pts.map((v, i) => (i ? "L" : "M") + s.x(i).toFixed(2) + " " + s.y(v).toFixed(2)).join(" ");
+
+  /* ------------------------------------------------ equity chart */
+  function drawEquity() {
+    const svg = document.getElementById("equity");
+    svg.textContent = "";
+    // y labels sit on the left so the right gutter belongs to the direct
+    // labels alone — the two collided when both claimed the same edge.
+    const box = {w: 760, h: 260}, pad = {l: 54, r: 104, t: 14, b: 26};
+    const all = agent.concat(bench);
+    const lo = Math.min(...all) * 0.985, hi = Math.max(...all) * 1.015;
+    const s = scales(box, pad, N, lo, hi);
+
+    // grid + y labels (every label names a value the chart reaches)
+    const ticks = 4;
+    for (let i = 0; i <= ticks; i++) {
+      const v = lo + (hi - lo) * (i / ticks), y = s.y(v);
+      svg.appendChild(el("line", {x1: pad.l, x2: box.w - pad.r, y1: y, y2: y,
+        stroke: css("--grid"), "stroke-width": 1}));
+      svg.appendChild(Object.assign(el("text", {x: pad.l - 10, y: y + 4,
+        "font-size": 11, fill: css("--ink-3"), "font-weight": 500,
+        "text-anchor": "end"}),
+        {textContent: "$" + Math.round(v / 1000) + "k"}));
+    }
+
+    // x labels
+    [0, Math.floor(N * 0.33), Math.floor(N * 0.66), N - 1].forEach(i => {
+      svg.appendChild(Object.assign(el("text", {x: s.x(i), y: box.h - 6,
+        "font-size": 11, fill: css("--ink-3"), "font-weight": 500,
+        "text-anchor": i === 0 ? "start" : i === N - 1 ? "end" : "middle"}),
+        {textContent: fmtDate(dates[i])}));
+    });
+
+    // area under the agent line
+    const area = line(agent, s) + ` L ${s.x(N-1).toFixed(2)} ${s.y(lo).toFixed(2)}`
+                               + ` L ${s.x(0).toFixed(2)} ${s.y(lo).toFixed(2)} Z`;
+    const gid = "eqfill";
+    const defs = el("defs");
+    const lg = el("linearGradient", {id: gid, x1: "0", y1: "0", x2: "0", y2: "1"});
+    lg.appendChild(el("stop", {offset: "0%",   "stop-color": css("--series-agent"), "stop-opacity": "0.20"}));
+    lg.appendChild(el("stop", {offset: "100%", "stop-color": css("--series-agent"), "stop-opacity": "0"}));
+    defs.appendChild(lg); svg.appendChild(defs);
+    svg.appendChild(el("path", {d: area, fill: `url(#${gid})`, stroke: "none"}));
+
+    // benchmark: grey, dashed — a reference, not a peer
+    svg.appendChild(el("path", {d: line(bench, s), fill: "none",
+      stroke: css("--series-bench"), "stroke-width": 2,
+      "stroke-dasharray": "5 4", "stroke-linecap": "round"}));
+    // agent
+    svg.appendChild(el("path", {d: line(agent, s), fill: "none",
+      stroke: css("--series-agent"), "stroke-width": 2,
+      "stroke-linecap": "round", "stroke-linejoin": "round"}));
+
+    // emphasized endpoints + direct labels (identity never by color alone)
+    [[agent, "--series-agent", "Agent"], [bench, "--series-bench", "Buy & hold"]].forEach(([d, c, lab]) => {
+      const cx = s.x(N - 1), cy = s.y(d[N - 1]);
+      svg.appendChild(el("circle", {cx, cy, r: 4.5, fill: css(c),
+        stroke: css("--glass-strong"), "stroke-width": 2}));
+      svg.appendChild(Object.assign(el("text", {x: cx + 9, y: cy - 7,
+        "font-size": 11.5, "font-weight": 600, fill: css("--ink-2")}),
+        {textContent: lab}));
+      svg.appendChild(Object.assign(el("text", {x: cx + 9, y: cy + 6,
+        "font-size": 12, "font-weight": 600, fill: css("--ink")}),
+        {textContent: fmtMoney(d[N - 1])}));
+    });
+
+    hover(svg, box, pad, s, "tip-eq", i => ({
+      date: dates[i],
+      rows: [["Agent", css("--series-agent"), fmtMoney(agent[i])],
+             ["Buy & hold", css("--series-bench"), fmtMoney(bench[i])]]
+    }));
+  }
+
+  /* ------------------------------------------------ sharpe chart */
+  function drawSharpe() {
+    const svg = document.getElementById("sharpe");
+    svg.textContent = "";
+    const box = {w: 760, h: 200}, pad = {l: 44, r: 18, t: 24, b: 26};
+    const lo = 0.6, hi = 2.4;
+    const s = scales(box, pad, N, lo, hi);
+
+    [0.6, 1.0, 1.4, 1.8, 2.2].forEach(v => {
+      const y = s.y(v);
+      svg.appendChild(el("line", {x1: pad.l, x2: box.w - pad.r, y1: y, y2: y,
+        stroke: css("--grid"), "stroke-width": 1}));
+      svg.appendChild(Object.assign(el("text", {x: pad.l - 10, y: y + 4,
+        "font-size": 11, fill: css("--ink-3"), "font-weight": 500,
+        "text-anchor": "end"}),
+        {textContent: v.toFixed(1)}));
+    });
+
+    [0, Math.floor(N * 0.33), Math.floor(N * 0.66), N - 1].forEach(i => {
+      svg.appendChild(Object.assign(el("text", {x: s.x(i), y: box.h - 6,
+        "font-size": 11, fill: css("--ink-3"), "font-weight": 500,
+        "text-anchor": i === 0 ? "start" : i === N - 1 ? "end" : "middle"}),
+        {textContent: fmtDate(dates[i])}));
+    });
+
+    // the threshold that governs FR-14
+    const ty = s.y(1.0);
+    svg.appendChild(el("line", {x1: pad.l, x2: box.w - pad.r, y1: ty, y2: ty,
+      stroke: css("--warn"), "stroke-width": 2, "stroke-dasharray": "6 5",
+      "stroke-linecap": "round"}));
+    // Label sits inside the plot, above the line, clear of the y-axis column.
+    svg.appendChild(Object.assign(el("text", {x: pad.l + 8, y: ty - 8,
+      "font-size": 11, "font-weight": 600, fill: css("--warn")}),
+      {textContent: "Retraining threshold · 1.00"}));
+
+    const gid = "shfill";
+    const defs = el("defs");
+    const lg = el("linearGradient", {id: gid, x1: "0", y1: "0", x2: "0", y2: "1"});
+    lg.appendChild(el("stop", {offset: "0%",   "stop-color": css("--series-agent"), "stop-opacity": "0.18"}));
+    lg.appendChild(el("stop", {offset: "100%", "stop-color": css("--series-agent"), "stop-opacity": "0"}));
+    defs.appendChild(lg); svg.appendChild(defs);
+    svg.appendChild(el("path", {
+      d: line(sharpe, s) + ` L ${s.x(N-1).toFixed(2)} ${s.y(lo).toFixed(2)}`
+                         + ` L ${s.x(0).toFixed(2)} ${s.y(lo).toFixed(2)} Z`,
+      fill: `url(#${gid})`, stroke: "none"}));
+    svg.appendChild(el("path", {d: line(sharpe, s), fill: "none",
+      stroke: css("--series-agent"), "stroke-width": 2,
+      "stroke-linecap": "round", "stroke-linejoin": "round"}));
+
+    const cx = s.x(N - 1), cy = s.y(sharpe[N - 1]);
+    svg.appendChild(el("circle", {cx, cy, r: 4.5, fill: css("--series-agent"),
+      stroke: css("--glass-strong"), "stroke-width": 2}));
+
+    hover(svg, box, pad, s, "tip-sh", i => ({
+      date: dates[i],
+      rows: [["Sharpe", css("--series-agent"), sharpe[i].toFixed(2)]]
+    }));
+  }
+
+  /* ------------------------------------------------ crosshair + tooltip */
+  function hover(svg, box, pad, s, tipId, read) {
+    const tip = document.getElementById(tipId);
+    const cross = el("line", {y1: pad.t, y2: box.h - pad.b,
+      stroke: css("--ink-3"), "stroke-width": 1, "stroke-dasharray": "3 3", opacity: 0});
+    svg.appendChild(cross);
+    const halo = el("circle", {r: 5.5, fill: "none",
+      stroke: css("--ink-2"), "stroke-width": 1.5, opacity: 0});
+    svg.appendChild(halo);
+
+    const plotW = box.w - pad.l - pad.r;
+
+    function move(ev) {
+      const r = svg.getBoundingClientRect();
+      const px = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
+      const vx = px / r.width * box.w;
+      let i = Math.round((vx - pad.l) / plotW * (N - 1));
+      i = Math.max(0, Math.min(N - 1, i));
+      const d = read(i);
+
+      cross.setAttribute("x1", s.x(i)); cross.setAttribute("x2", s.x(i));
+      cross.setAttribute("opacity", 0.55);
+      halo.setAttribute("cx", s.x(i));
+      halo.setAttribute("cy", s.y(parseFloat(d.rows[0][2].replace(/[$,]/g, ""))));
+      halo.setAttribute("opacity", 0.9);
+
+      tip.innerHTML = `<div class="tip-d">${fmtDate(d.date)}</div>` +
+        d.rows.map(([l, c, v]) =>
+          `<div class="tip-row"><span class="tip-lab">` +
+          `<span class="swatch" style="background:${c}"></span>${l}</span>` +
+          `<span class="tip-val num">${v}</span></div>`).join("");
+      tip.classList.add("on");
+
+      const leftPx = s.x(i) / box.w * r.width;
+      const flip = leftPx > r.width - 160;
+      tip.style.left = Math.max(0, Math.min(r.width - 150, leftPx + (flip ? -152 : 14))) + "px";
+      tip.style.top = "12px";
+    }
+    function out() {
+      tip.classList.remove("on");
+      cross.setAttribute("opacity", 0);
+      halo.setAttribute("opacity", 0);
+    }
+    svg.addEventListener("pointermove", move);
+    svg.addEventListener("pointerleave", out);
+    svg.addEventListener("touchmove", move, {passive: true});
+    svg.addEventListener("touchend", out);
+  }
+
+  /* ------------------------------------------------ gauges */
+  function arc(cx, cy, r, f) {
+    const a0 = Math.PI, a1 = Math.PI + Math.PI * f;
+    const x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
+    const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
+    // The sweep is at most 180 degrees, so the large-arc flag is always 0.
+    // Setting it from f would split the arc into disjoint pieces past f = 0.5.
+    return `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${r} ${r} 0 0 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
+  }
+  function gauge(id, frac, color) {
+    const svg = document.getElementById(id);
+    svg.textContent = "";
+    const cx = 62, cy = 66, r = 46;
+    svg.appendChild(el("path", {d: arc(cx, cy, r, 1), fill: "none",
+      stroke: css("--grid"), "stroke-width": 9, "stroke-linecap": "round"}));
+    svg.appendChild(el("path", {d: arc(cx, cy, r, Math.max(0.02, frac)), fill: "none",
+      stroke: css(color), "stroke-width": 9, "stroke-linecap": "round"}));
+  }
+
+  /* ------------------------------------------------ decision log */
+  const rows = [
+    {ts: "2026-06-11 16:28:12", tk: "XOM",  w: "0.720",  act: "BUY",       vix: "15.2", fs: false},
+    {ts: "2026-06-11 15:42:07", tk: "CVX",  w: "0.140",  act: "HOLD",      vix: "14.8", fs: false},
+    {ts: "2026-06-11 14:15:33", tk: "SHEL", w: "−0.680", act: "SELL",      vix: "16.1", fs: false},
+    {ts: "2026-06-11 12:03:21", tk: "BP",   w: "0.310",  act: "HOLD",      vix: "18.6", fs: false},
+    {ts: "2026-06-11 10:27:44", tk: "NEE",  w: "0.910",  act: "BUY",       vix: "17.3", fs: false},
+    {ts: "2026-06-10 09:11:05", tk: "XOM",  w: "—",      act: "LIQUIDATE", vix: "38.4", fs: true}
+  ];
+  const cls = a => ({BUY: "buy", SELL: "sell", HOLD: "hold", LIQUIDATE: "liq"}[a]);
+
+  const tb = document.getElementById("log");
+  rows.forEach((r, i) => {
+    const tr = document.createElement("tr");
+    tr.tabIndex = 0;
+    tr.innerHTML =
+      `<td class="num">${r.ts}</td>` +
+      `<td class="tick">${r.tk}</td>` +
+      `<td class="num">${r.w}</td>` +
+      `<td class="act ${cls(r.act)}">${r.act}</td>` +
+      `<td class="num">${r.vix}</td>` +
+      `<td>${r.fs
+        ? '<span class="pill crit" style="font-size:12px"><span class="dot"></span>Triggered</span>'
+        : '<span style="color:var(--ink-3)">No</span>'}</td>`;
+    tr.addEventListener("click", () => openSheet(i));
+    tr.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSheet(i); }
+    });
+    tb.appendChild(tr);
+  });
+
+  /* ------------------------------------------------ sheet (spring) */
+  const scrim = document.getElementById("scrim");
+  const sheet = document.getElementById("sheet");
+  let raf = null, lastFocus = null;
+
+  function spring(from, to, onFrame, done) {
+    // critically damped: stiffness 300, damping 30, mass 1
+    const k = 300, c = 30, m = 1, dt = 1 / 60;
+    let x = from, v = 0;
+    cancelAnimationFrame(raf);
+    (function step() {
+      for (let n = 0; n < 2; n++) {
+        const acc = (-k * (x - to) - c * v) / m;
+        v += acc * dt; x += v * dt;
+      }
+      onFrame(x);
+      if (Math.abs(x - to) > 0.15 || Math.abs(v) > 0.15) raf = requestAnimationFrame(step);
+      else { onFrame(to); done && done(); }
+    })();
+  }
+
+  function openSheet(i) {
+    const r = rows[i];
+    lastFocus = document.activeElement;
+    document.getElementById("sheet-sub").textContent = `${r.tk} · ${r.ts}`;
+    document.getElementById("sheet-kv").innerHTML = [
+      ["Action", `<span class="act ${cls(r.act)}">${r.act}</span>`],
+      ["Raw weight", `<span class="num">${r.w}</span>`],
+      ["VIX at decision", `<span class="num">${r.vix}</span>`],
+      ["Model version", `<span class="num">v1.4.2</span>`],
+      ["Training run", `<span class="num">run_8f21c6</span>`],
+      ["Partition", `<span class="num">2015-01-01 → 2023-12-31</span>`]
+    ].map(([k, v]) => `<div class="kv-row"><span class="kv-k">${k}</span><span class="kv-v">${v}</span></div>`).join("");
+
+    document.getElementById("sheet-trace").innerHTML = r.fs
+      ? `The volatility fail-safe fired: VIX <b>38.4</b> exceeded the critical threshold of
+         <b>35.0</b>, so the request bypassed the agent entirely and returned a
+         capital-preservation instruction. <b>No model weight was consulted.</b>`
+      : `Weight <b>${r.w}</b> maps to <b>${r.act}</b> under the decision thresholds
+         (buy above 0.5, sell below −0.5, otherwise hold). VIX <b>${r.vix}</b> sat below the
+         35.0 fail-safe threshold, so the agent's output was served unchanged.`;
+
+    scrim.hidden = false; sheet.hidden = false;
+    requestAnimationFrame(() => scrim.classList.add("on"));
+    spring(100, 0, y => { sheet.style.transform = `translate3d(0, ${y}%, 0)`; },
+           () => document.getElementById("sheet-close").focus());
+  }
+
+  function closeSheet() {
+    scrim.classList.remove("on");
+    spring(0, 100, y => { sheet.style.transform = `translate3d(0, ${y}%, 0)`; }, () => {
+      sheet.hidden = true; scrim.hidden = true;
+      lastFocus && lastFocus.focus();
+    });
+  }
+  scrim.addEventListener("click", closeSheet);
+  document.getElementById("sheet-close").addEventListener("click", closeSheet);
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && !sheet.hidden) closeSheet();
+  });
+
+  /* ------------------------------------------------ theme */
+  document.getElementById("theme").addEventListener("click", () => {
+    const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+    const cur = document.documentElement.getAttribute("data-theme")
+             || (dark ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme", cur === "dark" ? "light" : "dark");
+    render();
+  });
+
+  /* ------------------------------------------------ render */
+  function render() {
+    drawEquity();
+    drawSharpe();
+    gauge("g-sharpe", (1.42 + 1) / 4, "--good");   // scale −1 … 3
+    gauge("g-dd", 12.8 / 50, "--warn");            // scale 0 … −50%
+  }
+  render();
+  addEventListener("resize", () => { clearTimeout(window.__rt);
+    window.__rt = setTimeout(render, 160); });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+})();
+</script>

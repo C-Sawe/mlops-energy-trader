@@ -58,6 +58,22 @@ def test_load_partition_respects_date_bounds(repo):
     assert loaded["date"].max() <= pd.Timestamp(hi)
 
 
+def test_load_partition_returns_correctly_shaped_empty_frame(repo):
+    """A query that matches nothing must still return the expected columns
+    — `pd.DataFrame([])` has zero *columns*, not just zero rows, and a
+    caller like `normalize_rolling` needs the real shape to fail gracefully
+    on "no data" instead of crashing on "missing columns"."""
+    repo.persist(feature_frame(60))
+
+    empty = repo.load_partition("2099-01-01", "2099-12-31")
+
+    assert empty.empty
+    assert list(empty.columns) == [
+        "date", "ticker", "open", "high", "low", "close",
+        "volume", "sma_20", "rsi_14", "vix", "is_imputed",
+    ]
+
+
 def test_load_partition_filters_by_ticker(repo):
     repo.persist(feature_frame())
     loaded = repo.load_partition("2020-01-01", "2021-12-31", tickers=("XOM",))
@@ -218,3 +234,210 @@ def test_invalid_action_is_rejected(repo):
         )
         with pytest.raises(IntegrityError):
             session.commit()
+
+
+def _make_version(repo, artifact_uri: str = "mlflow://models/ppo/1") -> str:
+    with repo.session() as session:
+        run = ModelRun(
+            train_start=pd.Timestamp("2020-01-01").date(),
+            train_end=pd.Timestamp("2022-12-31").date(),
+            eval_start=pd.Timestamp("2023-01-01").date(),
+            eval_end=pd.Timestamp("2023-12-31").date(),
+        )
+        session.add(run)
+        session.flush()
+        version = ModelVersion(run_id=run.run_id, artifact_uri=artifact_uri)
+        session.add(version)
+        session.commit()
+        return version.version_id
+
+
+# --------------------------------------------------------------- FR-19
+def test_record_decision_returns_a_traceable_id(repo):
+    version_id = _make_version(repo)
+    decision_id = repo.record_decision(version_id, "XOM", 0.72, "BUY", 18.4)
+    assert decision_id is not None
+
+
+def test_list_decisions_orders_most_recent_first(repo):
+    version_id = _make_version(repo)
+    for i in range(3):
+        repo.record_decision(version_id, "XOM", 0.1 * i, "HOLD", 15.0)
+
+    items, total = repo.list_decisions(page=1, page_size=10)
+    assert total == 3
+    assert len(items) == 3
+    assert items[0]["decided_at"] >= items[1]["decided_at"] >= items[2]["decided_at"]
+
+
+def test_list_decisions_paginates(repo):
+    version_id = _make_version(repo)
+    for i in range(5):
+        repo.record_decision(version_id, "XOM", 0.0, "HOLD", 15.0)
+
+    page1, total = repo.list_decisions(page=1, page_size=2)
+    page2, _ = repo.list_decisions(page=2, page_size=2)
+    assert total == 5
+    assert len(page1) == 2
+    assert len(page2) == 2
+    assert {d["decision_id"] for d in page1}.isdisjoint({d["decision_id"] for d in page2})
+
+
+def test_decision_records_failsafe_flag(repo):
+    version_id = _make_version(repo)
+    repo.record_decision(version_id, "XOM", None, "LIQUIDATE", 40.0, failsafe_triggered=True)
+    [item], _ = repo.list_decisions()
+    assert item["failsafe_triggered"] is True
+    assert item["raw_weight"] is None
+
+
+def test_list_decisions_includes_run_and_partition(repo):
+    """NFR-07's traceability chain (decision -> version -> run -> data
+    partition) is only actually visible if a caller gets all of it back in
+    one call, not just the version_id foreign key."""
+    version_id = _make_version(repo)
+    repo.record_decision(version_id, "XOM", 0.5, "BUY", 15.0)
+
+    [item], _ = repo.list_decisions()
+    assert item["run_id"] is not None
+    assert item["train_start"] == pd.Timestamp("2020-01-01").date()
+    assert item["train_end"] == pd.Timestamp("2022-12-31").date()
+    assert item["eval_start"] == pd.Timestamp("2023-01-01").date()
+    assert item["eval_end"] == pd.Timestamp("2023-12-31").date()
+
+
+# --------------------------------------------------------------- FR-13, FR-18
+def test_record_snapshot_and_list_snapshots_round_trip(repo):
+    repo.record_snapshot("2024-01-02", 101_500.0, rolling_sharpe_30d=1.2, max_drawdown=0.05, cumulative_return=0.015)
+    repo.record_snapshot("2024-01-03", 102_000.0, rolling_sharpe_30d=1.3, max_drawdown=0.04, cumulative_return=0.02)
+
+    df = repo.list_snapshots("2024-01-01", "2024-01-31")
+    assert len(df) == 2
+    assert df.iloc[0]["equity_value"] == pytest.approx(101_500.0)
+    assert df.iloc[1]["rolling_sharpe_30d"] == pytest.approx(1.3)
+
+
+def test_record_snapshot_is_idempotent_per_date(repo):
+    """Re-computing today's snapshot must update it, not duplicate it."""
+    repo.record_snapshot("2024-01-02", 100_000.0)
+    repo.record_snapshot("2024-01-02", 105_000.0)
+
+    df = repo.list_snapshots("2024-01-01", "2024-01-31")
+    assert len(df) == 1
+    assert df.iloc[0]["equity_value"] == pytest.approx(105_000.0)
+
+
+# --------------------------------------------------------------- I5, FR-16, FR-17
+def test_get_active_version_returns_none_when_nothing_promoted(repo):
+    _make_version(repo)  # exists, but never promoted
+    assert repo.get_active_version() is None
+
+
+def test_promote_version_activates_and_retires(repo):
+    v1 = _make_version(repo, artifact_uri="uri-1")
+    v2 = _make_version(repo, artifact_uri="uri-2")
+
+    repo.promote_version(v1)
+    active = repo.get_active_version()
+    assert active["version_id"] == v1
+
+    repo.promote_version(v2)
+    active = repo.get_active_version()
+    assert active["version_id"] == v2
+
+    with repo.session() as session:
+        from src.dataops.models import ModelVersion as MV
+
+        retired = session.get(MV, v1)
+        assert retired.is_active is False
+        assert retired.retired_at is not None
+
+
+def test_promote_version_rejects_unknown_id(repo):
+    with pytest.raises(ValueError, match="no such model_version"):
+        repo.promote_version("not-a-real-id")
+
+
+def test_get_promotion_sequence_counts_within_the_same_calendar_month(repo):
+    """Backs the dashboard's "September 2026 #2" style label — two models
+    promoted in the same month must be distinguishable, not both read as
+    an unqualified "September 2026"."""
+    v1 = _make_version(repo, artifact_uri="uri-1")
+    v2 = _make_version(repo, artifact_uri="uri-2")
+    v3 = _make_version(repo, artifact_uri="uri-3")
+
+    repo.promote_version(v1)
+    p1 = repo.get_active_version()["promoted_at"]
+    repo.promote_version(v2)
+    p2 = repo.get_active_version()["promoted_at"]
+    repo.promote_version(v3)
+    p3 = repo.get_active_version()["promoted_at"]
+
+    assert repo.get_promotion_sequence(p1) == 1
+    assert repo.get_promotion_sequence(p2) == 2
+    assert repo.get_promotion_sequence(p3) == 3
+
+
+def test_get_promotion_sequence_resets_across_calendar_months(repo):
+    v1 = _make_version(repo, artifact_uri="uri-1")
+    v2 = _make_version(repo, artifact_uri="uri-2")
+    repo.promote_version(v1)
+    repo.promote_version(v2)
+
+    with repo.session() as session:
+        moved = session.get(ModelVersion, v2)
+        moved.promoted_at = moved.promoted_at + pd.DateOffset(months=1)
+        session.commit()
+        moved_promoted_at = moved.promoted_at
+
+    with repo.session() as session:
+        v1_promoted_at = session.get(ModelVersion, v1).promoted_at
+
+    # v1 is still the only promotion in its own month; v2, moved a month
+    # forward, is the only promotion in its new month too — neither should
+    # see the other as a same-month sibling anymore.
+    assert repo.get_promotion_sequence(v1_promoted_at) == 1
+    assert repo.get_promotion_sequence(moved_promoted_at) == 1
+
+
+# --------------------------------------------------------------- FR-17 (cycle stats)
+def test_get_cycle_stats_counts_promoted_and_rejected(repo):
+    promoted_version = _make_version(repo, artifact_uri="uri-promoted")
+    repo.promote_version(promoted_version)
+
+    with repo.session() as session:
+        rejected_run = ModelRun(
+            train_start=pd.Timestamp("2020-01-01").date(),
+            train_end=pd.Timestamp("2022-12-31").date(),
+            eval_start=pd.Timestamp("2023-01-01").date(),
+            eval_end=pd.Timestamp("2023-12-31").date(),
+            status="REJECTED",
+        )
+        session.add(rejected_run)
+        session.commit()
+
+    stats = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())
+    assert stats["total_runs"] == 2
+    assert stats["promoted"] == 1
+    assert stats["rejected"] == 1
+
+
+def test_get_cycle_stats_excludes_runs_before_the_window(repo):
+    _make_version(repo)  # created "now", inside any reasonable window
+    stats = repo.get_cycle_stats(pd.Timestamp("2099-01-01").date())  # window starts in the future
+    assert stats["total_runs"] == 0
+
+
+# --------------------------------------------------------------- ingest info
+def test_latest_ingest_info_returns_most_recent_observation(repo):
+    df = feature_frame(60)
+    repo.persist(df)
+
+    info = repo.latest_ingest_info()
+    assert info is not None
+    assert info["date"] == pd.Timestamp(df["date"].max()).date()
+    assert info["vix"] is not None
+
+
+def test_latest_ingest_info_none_when_store_is_empty(repo):
+    assert repo.latest_ingest_info() is None

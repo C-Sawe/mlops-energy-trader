@@ -1,0 +1,37 @@
+# Rendered by the nginx image's envsubst step at container start. Only
+# variables present in the environment are substituted, so nginx's own
+# $uri / $host etc. are left alone.
+server {
+    listen 80;
+    server_name _;
+
+    # Single-user deployment (CLAUDE.md §12: no users table). Basic auth
+    # gates the whole dashboard and API; the password file is written by
+    # docker-entrypoint.d/10-basic-auth.sh from BASIC_AUTH_* env vars.
+    auth_basic "MLOps Energy Trader";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+
+    location = /healthz {
+        auth_basic off;
+        access_log off;
+        return 200 "ok\n";
+    }
+
+    location /api/ {
+        proxy_pass http://backend:8000/;
+        # NFR-10: the API bearer token stays server-side; the browser never
+        # sees it. The browser's own Authorization header (basic auth) is
+        # replaced here, not forwarded.
+        proxy_set_header Authorization "Bearer ${API_BEARER_TOKEN}";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # /ingest/run runs synchronously and can take a while.
+        proxy_read_timeout 300s;
+    }
+
+    location / {
+        root /usr/share/nginx/html;
+        try_files $uri /index.html;
+    }
+}

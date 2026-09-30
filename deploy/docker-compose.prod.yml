@@ -1,0 +1,85 @@
+# Production stack for a single Docker host (any cloud VM). Copied to the
+# host and run by .github/workflows/deploy.yml; see docs/DEPLOYMENT.md.
+#
+# Only Caddy publishes ports. Postgres and the backend are reachable only on
+# the internal compose network, so the API is never exposed without the
+# dashboard's basic auth in front of it.
+#
+# Required in the host's .env (written by the deploy workflow from GitHub
+# secrets — NFR-10, never committed): IMAGE_PREFIX, IMAGE_TAG,
+# POSTGRES_PASSWORD, API_BEARER_TOKEN, BASIC_AUTH_USER, BASIC_AUTH_PASSWORD.
+# Optional: SITE_ADDRESS (a domain name enables automatic HTTPS).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mlops
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: mlops_trading
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlops -d mlops_trading"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    image: ${IMAGE_PREFIX:?set IMAGE_PREFIX}-backend:${IMAGE_TAG:-latest}
+    # NFR-04: a crashed process comes back on its own; state is in Postgres
+    # and the mlruns volume, so nothing is lost across the restart.
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: mlops
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: mlops_trading
+      API_BEARER_TOKEN: ${API_BEARER_TOKEN:?set API_BEARER_TOKEN}
+      VIX_CRITICAL_THRESHOLD: ${VIX_CRITICAL_THRESHOLD:-35.0}
+      TARGET_SHARPE_THRESHOLD: ${TARGET_SHARPE_THRESHOLD:-1.0}
+      SHARPE_EVALUATION_WINDOW: ${SHARPE_EVALUATION_WINDOW:-30}
+      CT_EVALUATION_INTERVAL_SECONDS: ${CT_EVALUATION_INTERVAL_SECONDS:-300}
+      INGESTION_INTERVAL_SECONDS: ${INGESTION_INTERVAL_SECONDS:-86400}
+    volumes:
+      - mlruns:/app/mlruns
+
+  frontend:
+    image: ${IMAGE_PREFIX}-frontend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      API_BEARER_TOKEN: ${API_BEARER_TOKEN}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:?set BASIC_AUTH_USER}
+      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:?set BASIC_AUTH_PASSWORD}
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # ":80" serves plain HTTP on the VM's IP. Set a domain (with its DNS
+      # A record pointing at the VM) and Caddy obtains a TLS certificate
+      # automatically — do this before sharing the URL, since basic auth
+      # over plain HTTP sends the password in the clear.
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pgdata:
+  mlruns:
+  caddy_data:
+  caddy_config:

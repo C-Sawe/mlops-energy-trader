@@ -120,8 +120,81 @@ class EnvironmentConfig:
     )
 
 
+DEFAULT_MLFLOW_TRACKING_URI = "sqlite:///mlruns.db"
+
+
+def resolve_mlflow_tracking_uri() -> str:
+    """The MLflow tracking store this project reads and writes by default.
+
+    Shared by `ModelRegistry` (which calls `mlflow.set_tracking_uri` on
+    this) and `InferenceService` (which must do the same, not assume some
+    other object already did): `InferenceService` can legitimately be the
+    first thing in a fresh process to touch MLflow — a real server restart
+    with an already-active model does exactly this — and MLflow's own
+    ambient default tracking URI is not this project's `mlruns.db`. Found
+    via `scripts/broker_paper_trade_test.py`, whose whole point was
+    constructing `InferenceService` as the only MLflow-touching object in
+    a fresh process; every existing test happened to construct a
+    `ModelRegistry` first (to train/promote a model), which primed the
+    correct global URI before `InferenceService` ever needed it — masking
+    this until now.
+    """
+    return os.environ.get("MLFLOW_TRACKING_URI", DEFAULT_MLFLOW_TRACKING_URI)
+
+
+@dataclass(frozen=True)
+class BrokerConfig:
+    """Alpaca paper-trading credentials (NFR-10: never hard-coded, never
+    committed). Deliberately paper-trading only — `base_url` is a fixed
+    constant, not environment-configurable, so nothing in this codebase can
+    be pointed at Alpaca's live-trading endpoint by an env var typo. See
+    CLAUDE.md §7's Alpaca entry for why this exists and what it does and
+    does not demonstrate.
+
+    Properties, not `field(default_factory=...)`, for the same reason as
+    `ServingConfig.bearer_token`: a frozen dataclass field's default factory
+    runs once at module import, before a test (or a real run) has had a
+    chance to set the environment variable.
+    """
+
+    base_url: str = "https://paper-api.alpaca.markets"
+
+    @property
+    def api_key(self) -> str | None:
+        return os.environ.get("ALPACA_API_KEY")
+
+    @property
+    def secret_key(self) -> str | None:
+        return os.environ.get("ALPACA_SECRET_KEY")
+
+
+@dataclass(frozen=True)
+class ServingConfig:
+    """Sprint 4 note (CLAUDE.md §12): single-user local operation, no user
+    table. A single bearer token is proportionate for the exposed surface
+    (read telemetry + /predict); it is optional so local dev and the test
+    suite need not set one — `None` disables the check entirely, which is
+    the deliberate default, not an oversight.
+
+    `bearer_token` is a property, not a `field(default_factory=...)`: a
+    plain dataclass field's default factory runs once, at `ServingConfig()`
+    construction — since `SERVING` is a module-level singleton and
+    `src.config` is imported (and cached) well before any test gets to set
+    `API_BEARER_TOKEN`, a frozen field would never see it. A property reads
+    the environment fresh on every access, the same pattern
+    `DatabaseConfig.url` already uses for `DATABASE_URL`.
+    """
+
+    @property
+    def bearer_token(self) -> str | None:
+        return os.environ.get("API_BEARER_TOKEN")
+
+
 DATA = DataConfig()
 DATABASE = DatabaseConfig()
 INGESTION = IngestionConfig()
 RISK = RiskConfig()
+ENVIRONMENT = EnvironmentConfig()
+BROKER = BrokerConfig()
+SERVING = ServingConfig()
 ENVIRONMENT = EnvironmentConfig()

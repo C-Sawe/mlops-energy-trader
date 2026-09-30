@@ -14,7 +14,7 @@
 | Chapter 1 | Introduction & Problem Statement | ✅ Complete |
 | Chapter 2 | Literature Review | ✅ Complete |
 | Chapter 3 | Methodology & System Design | ✅ Complete |
-| Chapter 4 | System Implementation | 🔄 In Progress (Sprints 1–2 Complete) |
+| Chapter 4 | System Implementation | 🔄 In Progress (Sprints 1–4 Complete) |
 | Chapter 5 | Results, Testing & Evaluation | ⏳ Awaiting Chapter 4 |
 
 > **Proposal Defence:** Completed — June 2026  
@@ -42,8 +42,8 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 │  │ DataOps  │──▶│  RLOps   │──▶│ FastAPI  │──▶│  React.js   │  │
 │  │ Layer    │   │ Training │   │ Serving  │   │  Dashboard  │  │
 │  │          │   │  Layer   │   │  Layer   │   │             │  │
-│  │ yfinance │   │  FinRL   │   │ Inference│   │  Portfolio  │  │
-│  │PostgreSQL│   │   PPO    │   │ Gateway  │   │  Telemetry  │  │
+│  │ yfinance │   │TradingEnv│   │ Inference│   │  Portfolio  │  │
+│  │PostgreSQL│   │PPO(SB3)  │   │ Gateway  │   │  Telemetry  │  │
 │  └──────────┘   └──────────┘   └──────────┘   └─────────────┘  │
 │       ▲                                               │          │
 │       └───────── CT Orchestrator (Sharpe Monitor) ◀──┘          │
@@ -55,10 +55,10 @@ The core academic contribution is the **Deployment Chasm** framing: the gap betw
 | Layer | Responsibility | Technology | Package | Status |
 |---|---|---|---|---|
 | **DataOps** | Ingest, clean, enrich and persist market data | `yfinance` + PostgreSQL + SQLAlchemy | `src/dataops` | ✅ Sprint 1 Complete |
-| **RLOps** | MDP environment, baseline policies, PPO agent | Gymnasium + Stable Baselines3 | `src/rlops` | ✅ Sprint 2 Complete (agent: Sprint 3) |
-| **Orchestration** | Performance metrics, drift detection, CT cycle | Python (custom) | `src/orchestration` | 🔄 Sprint 2 (metrics); ⏳ Sprint 4 (CT loop) |
-| **Serving** | Inference API, volatility fail-safe | FastAPI (ASGI) | `src/serving` | ⏳ Sprint 4 |
-| **Presentation** | Real-time telemetry dashboard | React.js SPA | `frontend/` | ⏳ Sprint 4 |
+| **RLOps** | MDP environment, baseline policies, PPO agent, registry | Gymnasium + Stable Baselines3 + MLflow | `src/rlops` | ✅ Sprints 2 & 3 Complete |
+| **Orchestration** | Performance metrics, drift detection, CT cycle | Python (custom) | `src/orchestration` | ✅ Sprints 2 & 4 Complete |
+| **Serving** | Inference API, volatility fail-safe | FastAPI (ASGI) | `src/serving` | ✅ Sprint 4 Complete |
+| **Presentation** | Real-time telemetry dashboard | React, hand-rolled SVG charts, no CSS framework | `frontend/` | ✅ Sprint 4 Complete |
 
 Dependencies flow one way only — orchestration toward data and model concerns — with no cycles (NFR-06).
 
@@ -66,11 +66,15 @@ Dependencies flow one way only — orchestration toward data and model concerns 
 
 ## 🤖 The RL Agent & Universe
 
-- **Algorithm:** Proximal Policy Optimization (PPO) via Stable Baselines3 — Sprint 3
+- **Algorithm:** Proximal Policy Optimization (PPO) via Stable Baselines3, wrapped by
+  `PPOAgent` (`src/rlops/agent.py`), on `device="cpu"` — benchmarked ~12–13× faster than
+  `"mps"` on the actual training hardware (`CLAUDE.md` §9), not a default left open for tuning
 - **Environment:** `TradingEnvironment` (`src/rlops/environment.py`), a Gymnasium-compatible
   MDP implemented directly to spec. FinRL's `StockTradingEnv` was evaluated and does import
   successfully, but its reward has no override hook and its actions are hmax-scaled share
-  counts rather than continuous weights — see the recorded deviation in `CLAUDE.md` §8.
+  counts rather than continuous weights — see the recorded deviation in `CLAUDE.md` §8, and the
+  cross-check against it in `scripts/finrl_crosscheck.py` (max abs diff $0.00007 on a ~$100K
+  portfolio, correlation 1.0)
 - **Action Space:** Continuous target weight per ticker, in [-1, 1]
 - **State Space:** 8 backward-looking z-scored features per ticker (OHLCV + SMA_20 + RSI_14
   + VIX) plus the agent's own current position weights and cash weight — 46 dimensions for
@@ -79,7 +83,11 @@ Dependencies flow one way only — orchestration toward data and model concerns 
 - **Baselines:** buy-and-hold, equal-weight-rebalanced, all-cash, random (`src/rlops/baselines.py`)
 - **Metrics:** Sharpe ratio, rolling Sharpe, max drawdown, cumulative return, deflated Sharpe
   ratio (`src/orchestration/evaluator.py`)
-- **Validation:** Walk-forward time-series cross-validation (no look-ahead bias)
+- **Registry:** `ModelRegistry` (`src/rlops/registry.py`) — MLflow run logging (FR-08) and
+  `model_version` registration (FR-09)
+- **Validation:** Walk-forward cross-validation across rolling regimes
+  (`processing.walk_forward_splits`), each with a 5-seed sweep, not a single train/eval split
+  or a single seed
 
 ### Target Equities
 
@@ -116,28 +124,51 @@ mlops-energy-trader/
 │
 ├── scripts/
 │   ├── run_ingestion.py      # CLI runner for data ingestion pipeline
-│   └── run_baselines.py      # CLI runner for the baseline policies (Sprint 2)
+│   ├── run_baselines.py      # CLI runner for the baseline policies (Sprint 2)
+│   ├── benchmark_device.py   # CPU vs MPS PPO throughput benchmark (Sprint 3)
+│   ├── finrl_crosscheck.py   # §8 validation experiment against FinRL (Sprint 3)
+│   └── train_agent.py        # Walk-forward PPO training + seed sweep (Sprint 3)
 │
 ├── src/
-│   ├── config.py             # Database, risk and environment settings
+│   ├── config.py             # Database, risk, environment and serving settings
 │   ├── dataops/              # Sprint 1 — ETL pipeline (yfinance → PostgreSQL)
 │   │   ├── ingestion.py
-│   │   ├── processing.py
+│   │   ├── processing.py     # + walk_forward_splits (Sprint 3)
 │   │   ├── models.py
-│   │   └── repository.py
-│   ├── rlops/                # Sprint 2 — MDP environment + baselines; Sprint 3 — PPO agent
+│   │   └── repository.py     # + decisions/snapshots/versions (Sprint 4)
+│   ├── rlops/                # Sprint 2 — MDP environment + baselines
 │   │   ├── environment.py
-│   │   └── baselines.py
-│   ├── orchestration/        # Sprint 2 — metrics; Sprint 4 — CT loop & drift detection
-│   │   └── evaluator.py
-│   └── serving/              # Sprint 4 — FastAPI inference + CT orchestrator
+│   │   ├── baselines.py
+│   │   ├── agent.py          # PPOAgent wrapper over SB3 (Sprint 3)
+│   │   └── registry.py       # MLflow logging + model_version registration (Sprint 3)
+│   ├── orchestration/
+│   │   ├── evaluator.py      # Sprint 2 — Sharpe, drawdown, deflated Sharpe
+│   │   └── ct_orchestrator.py  # Sprint 4 — drift trigger, non-blocking retrain, acceptance gate
+│   └── serving/               # Sprint 4 — inference gateway
+│       ├── schemas.py
+│       ├── inference.py      # fail-safe, action mapping, hot reload
+│       └── api.py            # FastAPI app: /predict /telemetry /decisions /ct-status
 │
-└── tests/                    # Unit + integration tests
+├── frontend/                  # Sprint 4 — React, plain CSS tokens, hand-drawn SVG charts
+│   ├── design-reference.html # Standalone no-build version of the same dashboard
+│   └── src/
+│       ├── App.jsx           # Composition + live-API-to-view-model adapters
+│       ├── api.js            # FastAPI client, IR-07 graceful degradation
+│       ├── mock.js           # Illustrative fallback data (visibly marked as such)
+│       ├── theme.css         # Apple HIG token system, light and dark
+│       └── components/       # Charts.jsx, Primitives.jsx (glass card, pill, spring sheet)
+│
+└── tests/                    # Unit + integration tests (backend only — see Testing note below)
     ├── test_processing.py
     ├── test_repository.py
     ├── test_environment.py
     ├── test_baselines.py
-    └── test_evaluator.py
+    ├── test_evaluator.py
+    ├── test_agent.py
+    ├── test_registry.py
+    ├── test_inference.py
+    ├── test_ct_orchestrator.py
+    └── test_api.py
 ```
 
 ---
@@ -158,7 +189,7 @@ cp .env.example .env                   # edit credentials if needed
 docker compose up -d postgres          # spin up PostgreSQL container
 ```
 
-On Apple Silicon, install the MPS-enabled PyTorch build when running Sprint 3; set `device="mps"` on the PPO model.
+Benchmarked on an M5 (`scripts/benchmark_device.py`, CLAUDE.md §9): CPU beats MPS by ~12–13× for this policy network (14.7K parameters — small enough that CPU↔GPU transfer overhead dominates any arithmetic MPS would accelerate). Use `device="cpu"` on the PPO model in Sprint 3, not `device="mps"`.
 
 ---
 
@@ -177,15 +208,53 @@ python scripts/run_ingestion.py --tickers XOM --start 2024-01-01 --end 2024-06-0
 # Run the baseline policies over the evaluation partition (Sprint 2)
 python scripts/run_baselines.py
 python scripts/run_baselines.py --partition train --tickers XOM CVX
+
+# Walk-forward PPO training with a seed sweep, logged to MLflow (Sprint 3)
+python scripts/train_agent.py
+python scripts/train_agent.py --timesteps 50000 --seeds 5
 ```
+
+### Running the Dashboard (Sprint 4)
+
+Backend (FastAPI):
+
+```bash
+uvicorn src.serving.api:app --host 0.0.0.0 --port 8000
+```
+
+Requires a populated database and at least one promoted `model_version` for
+`/predict` to do anything (otherwise it returns `503`) — run
+`scripts/run_ingestion.py` then `scripts/train_agent.py` first. The CT
+orchestrator's background scheduler (FR-13) runs automatically every
+`CT_EVALUATION_INTERVAL_SECONDS` (default 300); trigger one evaluation
+on demand instead of waiting via `POST /ct/evaluate`.
+
+Frontend (Vite dev server, proxies `/api` to `localhost:8000`):
+
+```bash
+cd frontend
+npm install
+npm run dev        # http://localhost:5173
+```
+
+Set `VITE_API_BEARER_TOKEN` in the frontend's environment if
+`API_BEARER_TOKEN` is set for the backend — see `src/config.py`'s
+`ServingConfig`. Neither is set by default (single-user local operation,
+CLAUDE.md §12).
 
 ### Running Tests
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -v       # backend
+cd frontend && npm run lint      # frontend type-check (no test suite yet)
 ```
 
-The test suite uses deterministic synthetic data and in-memory SQLite, so it requires neither a network connection nor a running database.
+The backend test suite uses deterministic synthetic data and (mostly)
+in-memory SQLite, so it requires neither a network connection nor a running
+database. The CT orchestrator's tests are the one exception — they use a
+temp-file-backed SQLite database instead, because `:memory:` isn't shared
+across the background thread the orchestrator actually spawns (see
+`CLAUDE.md` §7).
 
 ---
 
@@ -231,6 +300,25 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 | FR-13 | `orchestration.evaluator.rolling_sharpe` | `test_rolling_sharpe_warmup_rows_are_nan_not_zero` |
 | I1 | `TradingEnvironment._prepare` (backward-looking alignment) | `test_observation_contains_no_future_information` |
 | I2 | `TradingEnvironment.step` (t → t+1 realisation) | `test_return_is_realised_from_t_to_t_plus_one` |
+| FR-07 | `PPOAgent.train` (reward from `TradingEnvironment`) | `test_agent_trains_without_error` |
+| FR-08 | `ModelRegistry.log_run` | `test_log_run_records_hyperparameters_in_mlflow` |
+| FR-09 | `ModelRegistry.register_version` | `test_register_version_links_to_its_run` |
+| DR-08 | `ModelRegistry.log_run` → `model_run` partition columns | `test_log_run_persists_exact_partition_boundaries` |
+| FR-10 | `serving.api.predict` | `test_predict_succeeds_with_an_active_model_and_normal_vix` |
+| FR-11 | `InferenceService._discretize` | `test_discretize_maps_weight_to_action_at_configured_thresholds` |
+| FR-12 | `InferenceService.predict` (fail-safe before inference) | `test_failsafe_triggers_above_vix_threshold` |
+| FR-13 | `CTOrchestrator.evaluate` | `test_evaluate_persists_snapshots_and_computes_rolling_sharpe` |
+| FR-14 | `CTOrchestrator.evaluate` → `_trigger_retrain` | `test_evaluate_triggers_retrain_when_no_incumbent` |
+| FR-15 | `CTOrchestrator._retrain_and_maybe_promote` (own thread) | `test_evaluate_is_non_blocking` |
+| FR-16 | `InferenceService.reload` | `test_reload_picks_up_a_newly_promoted_version` |
+| FR-17 | promote-vs-retain comparison in `_retrain_and_maybe_promote`; every candidate logged, win or lose | `test_retrain_retains_incumbent_when_candidate_does_not_beat_it` |
+| FR-18 | `MarketRepository.list_snapshots` → `/telemetry` | `test_telemetry_returns_recorded_snapshots` |
+| FR-19 | `MarketRepository.list_decisions` → `/decisions` | `test_decisions_endpoint_paginates` |
+| NFR-07 (dashboard) | `list_decisions` joins to `model_run` for run_id + both partitions | `test_list_decisions_includes_run_and_partition` |
+| FR-20 | `CTOrchestrator.status` → `/ct-status` | `test_ct_status_reflects_active_version` |
+| I5 | fail-safe lives in `InferenceService`, not the agent | `test_failsafe_does_not_trigger_below_threshold` |
+| NFR-08 | `PredictRequest` field validation | `test_predict_rejects_positions_missing_a_ticker` |
+| NFR-11 | fail-safe decisions logged with `vix_at_decision` | `test_failsafe_decision_is_logged_with_its_trigger_value` |
 
 ---
 
@@ -238,8 +326,8 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 
 - [x] **Sprint 1 — DataOps Foundation (Complete).** Ingestion, enrichment, persistence, schema, tests.
 - [x] **Sprint 2 — Trading Environment (Complete).** Gymnasium MDP, continuous action space, drawdown-incremented reward, baseline policies, evaluation metrics.
-- [ ] **Sprint 3 — Training & Model Registry.** PPO on MPS, walk-forward validation, MLflow.
-- [ ] **Sprint 4 — Serving & CT Loop.** FastAPI, VIX fail-safe, React dashboard, orchestrator.
+- [x] **Sprint 3 — Training & Model Registry (Complete).** PPO on CPU (benchmarked ~12–13× faster than MPS), walk-forward cross-validation with a seed sweep, MLflow logging, `model_version` registration.
+- [x] **Sprint 4 — Serving & CT Loop (Complete).** FastAPI inference gateway with the VIX fail-safe checked before any model call, hot-reloadable model loading, a non-blocking CT orchestrator with a real out-of-sample acceptance gate (rejected candidates now logged, not just promoted ones), and a dashboard with a real IR-07 graceful-degradation path — verified running against a real trained model, screenshotted in light and dark mode, with the backend intentionally killed mid-session to confirm the mock fallback.
 
 ---
 

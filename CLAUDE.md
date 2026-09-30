@@ -55,8 +55,10 @@ must not be filled with anything not actually measured.
 - The named technology stack in Section 3.6
 
 **Deviations from the approved design are permitted but must be recorded and
-justified in Chapter 5.** The departmental guide requires this explicitly. One
-such deviation already exists (see §8, FinRL).
+justified in Chapter 5.** The departmental guide requires this explicitly. Two
+such deviations already exist: FinRL (§8), and the Alpaca paper-trading
+integration (§7) — neither is in Section 3.6's named stack, and both need a
+Chapter 5 paragraph, not just this file.
 
 ### Outstanding items in the thesis document
 
@@ -85,13 +87,26 @@ These are not code tasks, but they are open and they cost marks:
 |---|---|---|
 | 1 | DataOps — ingestion, features, persistence, schema | **Complete** |
 | 2 | Environment — Gymnasium MDP, metrics, baselines | **Complete** |
-| 3 | Training — PPO, walk-forward validation, MLflow | Not started |
-| 4 | Serving — FastAPI, fail-safe, dashboard, CT loop | Not started |
+| 3 | Training — PPO, walk-forward validation, MLflow | **Complete** |
+| 4 | Serving — FastAPI, fail-safe, dashboard, CT loop | **Complete** |
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 56 passing — keep it that way
+python -m pytest tests/ -q     # 138 passing — keep it that way (backend)
+cd frontend && npm test        # 47 passing — Vitest + React Testing Library, added 2026-09-20
 ```
+
+Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
+`sprint-2` are retroactive markers at each sprint's completion commit, kept
+for reference. `sprint-3` **was merged into `main` (fast-forward)** in the
+same local session that built it — Sprint 4's serving layer depends on
+Sprint 3's `agent.py`/`registry.py`, so it had to land on `main` before
+`sprint-4` branched off it. `sprint-4` is where this sprint was built and,
+**as of this checkout, has not been merged to `main`** — the user
+explicitly asked for no further merges without asking first, after the
+sprint-3 merge already happened. Don't merge `sprint-4` (or anything else)
+into `main` without checking first, regardless of what any earlier version
+of this file implied about a normal merge cadence.
 
 Tests use deterministic synthetic data and in-memory SQLite. **No network and
 no database required.** If a test starts needing either, that is a regression
@@ -205,22 +220,168 @@ becoming a mechanism for compounding error.
 
 | ID | Requirement | Characteristic |
 |---|---|---|
-| NFR-01 | ≥95% of inference requests return within **[X] ms** over **[N]** requests | Performance |
-| NFR-02 | Latency degrades by no more than **[X]%** during retraining | Performance |
+| NFR-01 | ≥95% of inference requests return within **20 ms** over **100** requests | Performance |
+| NFR-02 | Latency degrades by no more than **10%** during retraining | Performance |
 | NFR-03 | Serving remains continuously available across a full CT cycle; zero failed requests | Reliability |
-| NFR-04 | Recover to serving within **[X] min** of unplanned termination, no data loss | Reliability |
+| NFR-04 | Recover to serving within **1 min** of unplanned termination, no data loss | Reliability |
 | NFR-05 | A failed retraining cycle leaves the incumbent serving and state consistent | Reliability |
 | NFR-06 | No circular dependencies between packages, verified by static analysis | Maintainability |
 | NFR-07 | Every served model traceable to run, partition boundaries, hyperparameters | Accountability |
 | NFR-08 | Payloads schema-validated; malformed input rejected, not crashed | Security |
-| NFR-09 | Dashboard renders without unbounded memory growth over **[X] h** | Performance |
+| NFR-09 | Dashboard renders without unbounded memory growth over **[X] h** — still unmeasured | Performance |
 | NFR-10 | No credential, key or connection string in source control or logs | Security |
 | NFR-11 | The fail-safe takes precedence over any model output and is logged with its trigger value | Human oversight |
 
-**The bracketed thresholds are deliberately unset.** They must be established
-by measuring a baseline on the target hardware, not asserted in advance. The
-departmental guide is explicit that thresholds must not be invented to make a
-requirement look measurable. Fill them during Sprint 4 and state the basis.
+**The bracketed thresholds were deliberately unset until measured on the
+target hardware** — the departmental guide is explicit that thresholds must
+not be invented to make a requirement look measurable. NFR-01/02/04 are now
+filled in from real measurements on the M5, taken 2026-09-17 via
+`fastapi.testclient.TestClient` against a real `/predict` call chain (real
+SQLite-backed repository, real loaded PPOAgent, real fail-safe check — the
+only thing not real is the HTTP transport itself, which `TestClient` calls
+in-process; a real deployment adds network round-trip on top of these
+numbers, but that's a constant offset, not something specific to this
+service):
+- **NFR-01: p95 = 16.9ms, p99 = 77.1ms, max = 78.3ms over 100 requests** — set
+  at 20ms with headroom over the measured p95, not at the median. The p99
+  tail (~4.5x the p50) is worth watching if this ever needs re-measuring
+  against real Postgres instead of SQLite.
+- **NFR-02: 2.1% p95 degradation while a real background retrain was
+  running** (triggered via `orchestrator._trigger_retrain()`, same code
+  path FR-14 uses) — set at 10% for margin. This is a genuinely good result,
+  not a lenient threshold chosen to pass: `predict()` and the retrain thread
+  touch different model instances and only briefly share
+  `InferenceService`'s lock at the moment of promotion, so FR-15's
+  "continue serving throughout retraining" holds up under actual
+  measurement, not just by design intent.
+- **NFR-04: corrected 2026-09-21 — the original "~8ms mean, ~11ms max" figure
+  was itself an artifact of the exact issue §7 already flagged and this
+  entry originally only speculated about.** `scripts/measure_nfr04_cold.py`
+  re-measured from N=5 genuinely separate `python3` processes, each
+  constructing `MarketRepository` + `InferenceService` as the *only* things
+  that ever touch MLflow — no `ModelRegistry`, no prior test setup, nothing
+  else in the process history. Result: **mean 497.9ms, max 523.2ms, min
+  489.9ms** — roughly **60× slower** than originally reported. Root cause
+  confirmed directly: the *first* thing in any process to touch MLflow pays
+  a one-time ~500ms cost initializing the tracking store's SQLAlchemy
+  connection and running its schema/migration check; every subsequent touch
+  in the *same* process is fast (~10ms, confirmed by timing a second
+  `InferenceService` reconstruction back-to-back with the first). The
+  original measurement's test setup had already trained/promoted a model
+  through `ModelRegistry` before timing `InferenceService`'s reconstruction
+  — so it measured the *second* touch, not the first, and a real unplanned
+  termination is always a first touch (a fresh process has nothing cached).
+  **Still comfortably meets the 1-minute threshold** (497.9ms is ~0.83% of
+  the budget, not the ~0.013% the old figure implied) — the requirement is
+  not at risk, but the number reported for it was wrong, and is fixed now
+  rather than left standing. Same scope note as before: this is the
+  *application's* readiness time once the process is running again, not
+  the OS/process-manager's crash-to-restart time, which remains outside
+  this service's own code.
+- **NFR-09, measured 2026-09-21 — and the first measurement attempt was
+  itself misleading, which is the more important part of the finding.**
+  A real Chromium tab loaded the live dashboard and was left running
+  completely normally — its own 15-second poll loop, real chart redraws,
+  nothing synthetic — while Chrome DevTools Protocol's
+  `Performance.getMetrics()` sampled `JSEventListeners` and `JSHeapUsedSize`
+  once a minute. That number climbed **linearly and without pause**: from
+  185 to over 2,000 "event listeners" and 3.9MB to 6.2MB of heap across 31
+  minutes. Taken at face value, this is exactly what NFR-09 exists to catch
+  — reported as a failure, it would have been wrong.
+
+  Four independent checks, each designed to falsify the leak hypothesis
+  rather than confirm it, all pointed the same way:
+  1. **Manual interception.** Monkey-patching `EventTarget.prototype.addEventListener`/
+     `removeEventListener` directly and tallying net registrations showed
+     **zero growth** — flat at 142 across a full 6-minute window run at the
+     same cadence.
+  2. **Authoritative introspection.** Chrome DevTools' own `getEventListeners()`
+     utility — which queries the browser's actual internal listener table,
+     not a JS-level proxy for it — showed **zero growth**: 149 listeners at
+     t=0s, 149 at t=90s, byte-for-byte identical, under the exact same live,
+     changing-data conditions the alarming metric was sampled under.
+  3. **Backend blocked, control condition.** With every backend request
+     intercepted and aborted (polling still fires, but nothing ever changes),
+     the same "growing" metric held perfectly flat at 150 for the full
+     4-minute run. Growth is tied to genuinely new data reaching the charts,
+     not to polling or re-rendering as such.
+  4. **Forced garbage collection.** Repeatedly forcing a GC pass via
+     `HeapProfiler.collectGarbage` and sampling immediately after showed the
+     *post-GC* heap baseline essentially plateau after one initial jump
+     (2.83 → 3.31 → 3.34 → 3.35 → 3.39MB across four 2-minute cycles) rather
+     than ratcheting upward — consistent with ordinary uncollected garbage
+     between GC passes, not a retained leak.
+
+  **The decisive evidence arrived on its own, uncontrolled, in the original
+  31-minute run.** At the 33-minute mark, without any GC ever being forced
+  on that process, Chromium's own garbage collector fired spontaneously:
+  the listener count collapsed from 2,025 to 185 and heap from 6.2MB to
+  4.3MB in a single sample interval — both numbers landing back within
+  noise of every other test's baseline. That is the complete
+  grow-then-reclaim cycle NFR-09 actually asks about, observed naturally
+  rather than staged, and it is bounded: the post-collection floor does not
+  drift upward from cycle to cycle.
+
+  **Conclusion: NFR-09 is met.** The dashboard does not exhibit unbounded
+  memory growth. What it exhibits is ordinary V8 behaviour — objects
+  accumulate as reclaimable garbage between collection passes, which is
+  true of any sufficiently active web page — and Chromium's
+  `JSEventListeners` performance counter tracks something closer to
+  *listener churn since the last GC* than *currently active listeners*,
+  making it actively misleading as a standalone signal for exactly the
+  kind of frequently-redrawn SVG content this dashboard renders. Not run
+  for the originally-scoped literal "[X] hours": once a complete natural
+  grow-and-reclaim cycle was observed and corroborated by all four checks
+  above, continuing to run would have shown the same cycle repeat without
+  adding information, and stopping there rather than burning more wall
+  time for its own sake matches this project's own standard for measuring
+  only what a claim actually needs. The methodological lesson is arguably
+  the more citable result: a single browser memory metric, trusted without
+  cross-checking, would have produced a false, dramatic-looking failure of
+  a genuinely well-behaved requirement.
+- **NFR-03 and NFR-05, measured 2026-09-20 — both were listed in this table
+  and never mentioned again anywhere in this file before now**, unlike
+  NFR-01/02/04's detailed write-up above. `scripts/nfr_reliability_check.py`
+  hammers a real `/predict` (real SQLite-backed repo, a real trained
+  PPOAgent, `TestClient`'s in-process ASGI transport) continuously through a
+  real retrain triggered via `orchestrator._trigger_retrain()` — the same
+  method FR-14 itself calls — and explicitly counts failures rather than
+  inferring "probably zero" from a latency chart having no obvious gaps:
+  **1,331 requests, 0 failures** (NFR-03, genuinely counted). Latency
+  under this specific load (continuous hammering for the *entire* retrain,
+  not a before/after comparison like NFR-02's own measurement) came back
+  higher — p50 22.4ms, p95 25.9ms, max 92.8ms — plausibly real GIL
+  contention between the hammering thread and the CPU-bound training
+  thread in this single-process deployment, not a regression from the
+  16.9ms NFR-01 figure, which was measured under different conditions
+  (steady-state, no concurrent retrain). NFR-05 ("a failed retraining
+  cycle leaves the incumbent serving and state consistent") is really a
+  correctness property rather than a load measurement — verified by
+  `test_retrain_survives_a_genuine_crash_and_leaves_incumbent_active`
+  (`tests/test_ct_orchestrator.py`, §7) using a genuine training crash, not
+  just FR-17's already-tested "candidate lost the comparison" — but this
+  script also confirms the incumbent kept answering correctly under real
+  concurrent load throughout a real retrain, which the crash test alone
+  doesn't exercise.
+- **NFR-06, verified 2026-09-20, not just asserted by the architecture
+  diagram in §6.** Installed `import-linter` and wrote `.importlinter` at
+  the repo root, encoding the actual dependency graph rather than the
+  diagram's simplification: `src.serving.api` (the FastAPI composition
+  root, which wires `CTOrchestrator`/`IngestionState` into `lifespan`) sits
+  above `src.orchestration`, which sits above `src.serving.inference` (the
+  module `orchestration` actually imports for FR-17's comparison) — naming
+  "src.serving" as a single layer would have wrongly flagged this, since
+  it isn't a real circular *import* (api.py and inference.py never import
+  each other), just two different modules in the same package occupying
+  different points in the dependency order. A separate `forbidden`
+  contract checks `src.execution` never imports `src.serving` or
+  `src.orchestration` directly, matching §7's Alpaca-deviation claim that
+  it consumes `predict()`'s *output* via a script, not by importing
+  `InferenceService`. Both contracts pass. Guarded by
+  `tests/test_architecture.py`, which runs the same check `lint-imports`
+  does — confirmed to actually catch a violation, not just pass trivially,
+  by pointing it at a deliberately impossible contract first and watching
+  it correctly report "BROKEN".
 
 ### Data
 
@@ -252,13 +413,41 @@ presentation ──▶ serving ──▶ rlops ──▶ dataops
                      └──── orchestration ─┘
 ```
 
+`src/execution` (§7's Alpaca deviation) sits downstream of `serving` —
+it consumes `InferenceService.predict()`'s output and nothing in the four
+layers above imports it back, so it doesn't change this diagram's shape,
+just extends past its right edge.
+
 ```
-src/dataops/          ingestion · processing · repository · models    [Sprint 1]
+src/dataops/          ingestion · processing (+ walk_forward_splits)   [Sprint 1, 3]
+                      · repository (+ decisions/snapshots/versions)    [Sprint 1, 4]
+                      · models
 src/rlops/            environment · baselines                         [Sprint 2]
+                      · agent · registry                              [Sprint 3]
 src/orchestration/    evaluator                                       [Sprint 2]
-src/serving/          (empty)                                         [Sprint 4]
+                      · ct_orchestrator                                [Sprint 4]
+                      · ingestion_scheduler                            [Sprint 4, post-hoc]
+src/serving/          schemas · inference · api                       [Sprint 4]
+src/execution/        alpaca_broker (paper trading only, §7 deviation) [post-Sprint 4]
+frontend/              React + hand-rolled SVG charts, no CSS framework [Sprint 4]
 scripts/              run_ingestion.py · run_baselines.py
-tests/                56 tests
+                      · benchmark_device.py · finrl_crosscheck.py
+                      · train_agent.py                                [Sprint 3]
+                      · broker_paper_trade_test.py                    [post-Sprint 4]
+                      · deflated_sharpe_analysis.py                   [post-Sprint 4]
+                      · nfr_reliability_check.py                      [post-Sprint 4]
+                      · sensitivity_analysis.py                       [post-Sprint 4]
+                      · measure_nfr04_cold.py                         [post-Sprint 4]
+                      · nfr09_memory_check.mjs                        [post-Sprint 4]
+                      · algorithm_comparison.py (PPO/A2C/SAC/TD3, §10) [post-Sprint 4]
+results/algorithm_comparison/  runs.jsonl (every run's returns) + summary.json
+.importlinter          NFR-06's layer contracts, checked by tests/test_architecture.py
+Dockerfile, frontend/Dockerfile, deploy/   cloud deployment (single VM, Compose + Caddy)  [2026-09-30, not yet run]
+.github/workflows/     ci.yml (tests on push/PR) · deploy.yml (GHCR → SSH → VM); see docs/DEPLOYMENT.md
+.github/issue-drafts/  open backlog as issue drafts; scripts/create_github_issues.sh --apply files them
+constraints.txt        pinned tested versions (mlflow especially, §13) for Docker/CI
+tests/                138 tests (backend)
+frontend/src/*.test.jsx  47 tests (Vitest + React Testing Library, added 2026-09-20)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -284,8 +473,75 @@ All values environment-driven (IR-03); nothing hard-coded. `src/config.py`.
 | `drawdown_penalty_coef` | 1.0 | `EnvironmentConfig`, FR-07/I4 |
 
 Thresholds are configurable rather than constant so Chapter 5 can report a
-**sensitivity analysis** over them instead of defending magic numbers. Doing
-that analysis is a genuine strengthening of the evaluation — plan for it.
+**sensitivity analysis** over them instead of defending magic numbers.
+
+**Done, 2026-09-20 (`scripts/sensitivity_analysis.py`), against real data
+throughout — not synthetic illustrations of the expected shape.** Three
+independent passes:
+
+**VIX critical threshold (FR-12, and the retrain-deferral gate, §7).**
+Swept against every real VIX reading ingested into this checkout
+(2,766 trading days, 2015-01-02→2025-12-31):
+
+| threshold | days ≥ threshold | % of history |
+|---|---|---|
+| 20.0 | 826 | 29.86% |
+| 25.0 | 377 | 13.63% |
+| 30.0 | 156 | 5.64% |
+| **35.0 (default)** | **63** | **2.28%** |
+| 40.0 | 40 | 1.45% |
+| 50.0 | 19 | 0.69% |
+
+The default fires on 2.28% of real trading days — rare enough to be a
+genuine circuit breaker (real market-stress episodes within this range:
+2015–16's correction, 2018 Q4, 2020's COVID crash), not a threshold the
+system spends its life near. A materially lower threshold (25–30) would
+put the fail-safe in play 6–14% of the time, a real design trade-off
+between missed trading opportunities and caution, not just a bigger
+number being "safer" for free.
+
+**target_sharpe_threshold (FR-14).** Using the real 18-split × 10-seed
+walk-forward sweep (§10, 180 real training runs):
+
+| threshold | % of all 180 seeds below | % of best-per-split (n=18) below |
+|---|---|---|
+| 0.0 | 67.2% | 5.6% |
+| 0.5 | 75.0% | 22.2% |
+| **1.0 (default)** | **85.6%** | **44.4%** |
+| 1.5 | 92.8% | 61.1% |
+| 2.0 | 96.1% | 83.3% |
+
+This explains something already observed live rather than just predicting
+it: at the current default, **85.6% of individual untuned seeds fail to
+clear the retrain bar** — which is exactly why the 3-day unattended run
+(§7, §13) produced 540 evaluations with only 2 promotions and 448
+rejections. That is not the threshold being miscalibrated; it is the
+threshold correctly reflecting this project's own measured seed
+sensitivity (§10.2) — PPO's seed variance is high enough that "most single
+seeds don't clear 1.0" is the honest population statistic, not a sign the
+bar is set wrong. The "best-per-split" column is included only to show how
+much more forgiving the trigger looks judged against a cherry-picked seed
+instead of a real one — the same selection effect §10.3's deflated Sharpe
+ratio exists to correct for, made visible here as a side effect rather
+than computed directly.
+
+**transaction_cost_pct (FR-07).** Re-running equal-weight-rebalanced (the
+one baseline that trades every step, so the one actually exposed to cost
+drag — buy-and-hold barely rebalances) on the real 2024–2025 eval window:
+
+| cost | Sharpe | cumulative return |
+|---|---|---|
+| 0 bps | 0.629 | 15.56% |
+| **10 bps (default)** | **0.616** | **15.16%** |
+| 20 bps | 0.603 | 14.75% |
+| 100 bps | 0.501 | 11.62% |
+
+A modest, monotonic, real degradation — the current default costs about
+2% of the frictionless Sharpe, and even a 10× harsher cost assumption
+(100bps) doesn't collapse the baseline's edge, which is itself informative:
+this project's §10.4 "keep transaction costs on" instruction is protecting
+against something real, not defending against a fragile result that only
+survives at exactly 10bps.
 
 ---
 
@@ -369,19 +625,460 @@ distinct from DR-06/I1, which is about training never seeing evaluation data —
 here the flow of information is the reverse direction (eval reading further
 into the past), which is always safe.
 
----
+**`load_partition()` returns a correctly-shaped empty frame, not `pd.DataFrame([])`.**
+Found via the dashboard, not a test: `CTOrchestrator.evaluate()`'s "Force
+Check" button hit a real 500. `pd.DataFrame([])` for a query that matched no
+rows has zero *columns*, not just zero rows, so `normalize_rolling()`'s
+column check failed with "missing required columns" — a confusing error
+that has nothing to do with the actual problem (no market data in the
+requested range, e.g. ingestion hasn't caught up to `as_of` yet). Fixed in
+`MarketRepository.load_partition` to return a frame with the right columns
+and zero rows; `CTOrchestrator.evaluate()` also now checks for this
+explicitly and logs + returns to `SERVING` rather than letting a stale
+ingestion job crash the request that triggered the evaluation. This is a
+recoverable, expected condition (the next scheduled tick likely finds
+data), not a programming error, so it is handled, not raised.
 
-## 8. FinRL — the recorded deviation
+**`sqlite:///:memory:` is not safe across threads — use a file, even in tests.**
+Found writing `tests/test_ct_orchestrator.py`: an in-memory SQLite database
+is not shared across connections, and each new thread that calls
+`repo.session()` can get a genuinely different connection from the pool. The
+CT orchestrator's whole point is a background thread retraining while the
+main thread keeps serving — with `:memory:`, that background thread's
+connection sees a separate, empty database ("no such table:
+market_observation"), not the one the test just seeded. Every CT
+orchestrator test uses a temp-file-backed SQLite DB instead
+(`sqlite:///{tmp_path}/test.db`). This is purely a test-fixture concern —
+real deployments use Postgres or a file, both genuinely shared across
+connections — but it would bite anyone who reached for `:memory:` for "quick
+local testing" of anything that touches threading, which the CT loop
+inherently does.
+
+**A rejected candidate is logged too, not just a promoted one.**
+Found while building the dashboard's "Cycle history" card, which wants a
+real "held back" count. `CTOrchestrator._retrain_and_maybe_promote`
+originally called `registry.log_run()` only inside the branch where the
+candidate beat the incumbent — a candidate that lost the FR-17 acceptance
+gate left no record anywhere that it had ever been trained. FR-17 says
+"retain the incumbent and abort promotion"; it does not say "and forget the
+attempt happened." Fixed: `log_run()` now takes a `status` argument, and
+every candidate is logged (`"COMPLETED"` if promoted, `"REJECTED"` if not)
+regardless of outcome — only `register_version()` + `promote_version()` are
+conditional on winning. `MarketRepository.get_cycle_stats()` counts both.
+
+**`/ct/evaluate` takes an optional `as_of` — `date.today()` isn't always the right anchor.**
+Found bootstrapping the CT loop against this checkout's real ingested data
+(2015-01-02→2025-12-30): the default `evaluate()`/telemetry both anchor to
+`date.today()`, but a checkout's ingested data can lag behind the literal
+current date for entirely ordinary reasons — a fresh checkout, an ingestion
+gap, or (as here) a sandboxed dev clock running ahead of the last real
+trading day the data covers. Anchoring to `date.today()` unconditionally
+made both the backend's evaluation and the dashboard's charts go silently
+blank rather than showing what data actually exists. Fixed on both ends:
+`POST /ct/evaluate?as_of=YYYY-MM-DD` lets an operator force evaluation
+against a specific date (`src/serving/api.py`), and the dashboard's
+`fetchTelemetry()` now anchors its window to `/ct-status`'s
+`last_ingest_date` instead of `new Date()` (`frontend/src/api.js`) — "last N
+days" means the same thing whether ingestion is perfectly current or a few
+days behind, not "blank unless today happens to have data."
+
+**FR-01's "without manual intervention" was a claim the comments made, not
+one the code kept — until this fix (2026-09-17).** `fetch_market_data`'s
+own docstring (`src/dataops/ingestion.py`) and `persist()`'s
+(`src/dataops/repository.py`) both referred to "the scheduled job" that
+refetches a trailing window, as if it already existed. It didn't: the only
+autonomous background task anywhere in this checkout was
+`CTOrchestrator`'s evaluation scheduler (FR-13/14), which only ever
+re-evaluates whatever is *already* in the database — nothing ever
+refetched new data on its own. Every ingestion, including the real
+2015–2025 backfill in §9, was a human running `scripts/run_ingestion.py`
+by hand. Fixed by adding `src/orchestration/ingestion_scheduler.py`
+(`run_ingestion_tick()`) and wiring a second background task into
+`src/serving/api.py`'s lifespan, mirroring the existing CT-evaluation
+scheduler exactly — same pattern, same failure handling (log and skip a
+bad tick rather than crash the process). `POST /ingest/run` is the
+on-demand counterpart, same relationship `/ct/evaluate` has to its own
+scheduler. Configurable via `INGESTION_INTERVAL_SECONDS` (default 86400 —
+daily, since yfinance's OHLCV only changes once per trading day; lower it
+for a live demo).
+
+The window this refetches on each tick can't be small. Wilder's RSI_14
+(§9) is an EMA with unbounded memory — it never fully forgets data before
+wherever a fetch happens to start — so recomputing it from only the last
+few days reproduces a measurably *colder* value than the one a full
+backfill already computed, and because `persist()` upserts, a scheduled
+tick would silently overwrite a correct, converged indicator with a wrong
+one for every date the two windows overlap. `DEFAULT_TRAILING_WINDOW_DAYS
+= 120` in `ingestion_scheduler.py` exists specifically so the EMA has
+decayed past any practical difference — `(1 - 1/14)**120 ≈ 1.9e-4` — before
+the days the tick actually cares about. `sma_20` has no such issue (a
+plain rolling mean has no memory past its own window), but 120 days covers
+it trivially too. Guarded by
+`test_ingestion_tick_reproduces_warm_indicators_not_nulls`
+(`tests/test_ingestion_scheduler.py`), which would fail immediately on a
+window narrow enough to reintroduce the NaN-clobber this is designed to
+avoid.
+
+This does not make the system a live trading system — there is still no
+broker connection, and CLAUDE.md §1's Sim2Real boundary is unchanged.
+What it fixes is DataOps actually being continuous rather than requiring a
+human to remember to re-run a script — the literal reading of FR-01, and
+part of what "the architecture, not the alpha" is supposed to mean when
+someone asks whether this pipeline runs itself.
+
+**The dashboard now shows the ingestion scheduler actually ticking, not
+just its effect.** `last_ingest_date` (the newest date *in* the data)
+already existed, but nothing showed whether the autonomous scheduler was
+still alive versus just having run once a while ago and stopped — the gap
+this session's §13 ingestion-gap incident fell into. No FR/DR ID covers
+this directly (it's a demonstrability aid, not a functional requirement),
+but it exists for the same reason FR-20 exposes the CT loop's own status:
+so the dashboard shows the automation happening, not just asks someone to
+trust it from the code. `IngestionState`
+(`src/orchestration/ingestion_scheduler.py`) tracks `IDLE`/`INGESTING`,
+the last attempt's timestamp, and whether it succeeded, shared by both the
+background scheduler and `/ingest/run` so whichever one is ticking shows
+up regardless of which triggered it. Surfaced in `/ct-status` as
+`ingestion_status` / `last_ingestion_attempted_at` / `last_ingestion_ok`,
+and in the dashboard as a fifth status-strip tile next to "Last ingest" —
+lower `INGESTION_INTERVAL_SECONDS` for a live demo and the "Checked
+HH:MM:SS" timestamp visibly advances on its own. 2 new tests
+(`tests/test_ingestion_scheduler.py`) cover both a successful and a failed
+tick, including that a failure still returns the state to `IDLE` rather
+than getting stuck `INGESTING` forever.
+
+**The "Active model" tile shows a human-readable label, not the raw
+UUID.** `active_version_id` (e.g. `bf65de93-...`) is correct but
+unreadable at a glance, and unhelpful for a demo or defense where "which
+model is live" is worth being able to just say out loud. Added
+`MarketRepository.get_promotion_sequence()` — the 1-indexed position of a
+`promoted_at` timestamp among all promotions in its calendar month — and
+`_active_model_label()` (`src/serving/api.py`) formats it as `"September
+2026 #2"`. The `#n` isn't decorative: this session alone promoted two
+different models within September 2026 (the live CT-loop bootstrap, §10,
+then a real autonomous retrain beating it later the same day), so an
+unqualified month name would have been ambiguous, not just less precise.
+`active_version_id` stays in the response and in the frontend (as the
+tile's hover title) — this is a presentation label, not a new identifier,
+and nothing that depends on NFR-07 traceability (the decision log, the
+version→run→partition chain) uses it. 3 new tests: two on
+`get_promotion_sequence` (`tests/test_repository.py` — counts correctly
+within a month, resets across a month boundary) and one on `/ct-status`
+actually returning the formatted label (`tests/test_api.py`).
+
+**Alpaca paper-trading integration — a second recorded deviation
+(2026-09-17), scoped deliberately narrow.** The user asked whether this
+could connect to a real broker. Two very different things hide inside that
+question: paper trading (simulated money, real market structure, real
+order API) is a safe architecture demonstration that stays inside §1's
+"architecture, not alpha" framing; live trading with real capital is not,
+and was explicitly ruled out for this pass rather than assumed either way
+— it would put real money at risk and tempt exactly the "the strategy is
+profitable" framing §1 exists to prevent, and it is the kind of scope
+change §2 says needs the supervisor, not just this file.
+
+What got built, with that boundary enforced in the code, not just
+documentation: `src/execution/alpaca_broker.py` (`AlpacaBroker`,
+`route_decision`) is a thin httpx client over Alpaca's REST API.
+`BrokerConfig.base_url` (`src/config.py`) is a **fixed constant** pointed
+at `paper-api.alpaca.markets`, not an environment variable — there is no
+live-endpoint override anywhere in this codebase, deliberately, so a typo
+in an env var cannot silently switch this to real trading. Credentials
+(`ALPACA_API_KEY`/`ALPACA_SECRET_KEY`) follow the same never-hard-coded,
+never-committed rule NFR-10 already enforces for the database.
+
+`route_decision` maps FR-11's three active discrete actions onto Alpaca's
+API deliberately, not uniformly:
+- `BUY`/`SELL` → a **notional** (dollar-amount) order, not a share-count
+  one — this project's target weights are continuous fractions of
+  portfolio value (FR-06), and notional sizing is the Alpaca primitive
+  that actually matches that, rather than requiring a price lookup to
+  convert dollars to shares first.
+- `LIQUIDATE` → Alpaca's "close position entirely" endpoint, not a sell
+  order. I5/FR-12's fail-safe means "get to cash," and closing the whole
+  position is the correct primitive for that meaning — a sized sell order
+  could leave a partial position behind, which is exactly what the
+  fail-safe must not do.
+- `HOLD` → no request at all, not a zero-notional order (Alpaca rejects
+  those anyway, and "do nothing" isn't better expressed as an API call
+  that does nothing).
+
+Closing a position that doesn't exist (the normal case on a fresh paper
+account, and a real possibility given LIQUIDATE can fire when no position
+was ever opened) returns Alpaca's 404 — treated as a recoverable, expected
+condition and logged, not raised, the same precedent `load_partition`'s
+empty-frame case set earlier in this section. 6 tests
+(`tests/test_alpaca_broker.py`) cover the client and the action-mapping
+logic against a mocked transport (`httpx.MockTransport` — no network,
+consistent with this project's test conventions), including the
+404-is-a-no-op case and that `HOLD` genuinely places zero requests.
+
+**Run against a real Alpaca paper account — done, 2026-09-17, this
+checkout.** `scripts/broker_paper_trade_test.py` calls the real
+`InferenceService.predict()` — the same production code path `/predict`
+uses — and routes its output to a real paper account (equity $100,000,
+buying power $400,000, standard 4× paper margin defaults). The active
+model's decision (version `e928c835-bbcb-4531-8824-0e464037f407`, VIX
+14.33, no fail-safe) was `HOLD` on all five tickers, which proved
+`route_decision` correctly places zero requests for `HOLD` — but doesn't
+exercise the order-submission code at all, since nothing was routed.
+Exercised that directly and separately, independent of what the model
+happened to decide: a real $10 notional `BUY` on XOM filled at
+$162.876/share for 0.061335003 fractional shares (`filled_qty` confirms
+Alpaca fully supports fractional notional orders, not just whole shares);
+`LIQUIDATE` then correctly closed the position back to flat via the
+close-position endpoint, confirmed via a fresh `get_positions()` call
+returning none. This is real evidence for the two HTTP call shapes that
+matter (`submit_notional_order`, `close_position`) on a real venue, not
+just a mocked assertion — the deviation this section describes is now
+backed the same way §8's FinRL cross-check is.
+
+**A second, unrelated bug surfaced by this validation:
+`InferenceService` could not survive being the first thing to touch
+MLflow in a fresh process.** `scripts/broker_paper_trade_test.py` was the
+first place in this project anything constructed `InferenceService`
+without a `ModelRegistry` having run first in the same process — every
+existing test (and `src/serving/api.py`'s own lifespan, which constructs
+`InferenceService` before `ModelRegistry`) happened to train or promote a
+model through `ModelRegistry` first, which calls
+`mlflow.set_tracking_uri()` as a side effect and silently primed the
+correct global state before `InferenceService.reload()` ever needed it.
+Without that priming, `reload()`'s call to
+`mlflow.artifacts.download_artifacts()` used MLflow's own ambient default
+tracking URI — in this checkout, `sqlite:////Users/.../mlflow.db`, a
+different file from this project's own `mlruns.db` convention, and an
+empty one — and raised `MlflowException: Run with id=... not found` even
+though the run genuinely existed, just in a different store than the one
+MLflow happened to open. This is a real NFR-04 risk, not just a script
+inconvenience: any real server restart where a model is already active
+would have hit the exact same crash on startup, since
+`src/serving/api.py`'s lifespan constructs `InferenceService` before
+`ModelRegistry` in exactly the order that triggers it. Fixed by adding
+`resolve_mlflow_tracking_uri()` (`src/config.py`) as the single shared
+resolution `ModelRegistry` and `InferenceService.reload()` both now call
+before touching MLflow, rather than one implicitly depending on the other
+having gone first. Guarded by
+`test_reload_sets_its_own_tracking_uri_not_assuming_one_is_already_set`
+(`tests/test_inference.py`) — proven to actually catch the regression by
+reverting the fix and confirming the test fails, not just written to pass
+once. Worth re-measuring NFR-04's "~8ms" figure (§9) against a process
+that genuinely never constructed a `ModelRegistry` first, since the
+original measurement may have had the same accidental priming every other
+test does.
+
+**A 3-day unattended run surfaced a real chart bug: the Rolling Sharpe
+tile could show a mathematically genuine but useless number in the tens
+of thousands.** Left running from 2026-09-17 to 2026-09-20 with no
+attention, the CT scheduler ticked autonomously roughly every 5 minutes
+the whole time — 540 training runs, 448 held back by the FR-17 gate, only
+2 promoted, a strong real demonstration that the acceptance gate is hard
+to beat. But one snapshot's `rolling_sharpe_30d` came back as `30101.4`:
+the model held a near-flat `HOLD`-heavy position for a stretch, daily
+returns were nearly constant, and `_VARIANCE_FLOOR` (§7 above) does
+exactly what it's documented to do — prevent a literal division by zero,
+not cap a merely tiny-but-nonzero variance. The ratio is real, not a bug
+in `rolling_sharpe`, but a linear chart with one point at 30,101 and the
+rest between -14 and +5 renders as a flat line — every value that
+actually matters gets compressed to nothing.
+
+Fixed on the frontend, not the metric: `SharpeChart`
+(`frontend/src/components/Charts.jsx`) now computes its axis domain from
+only the values within `OUTLIER_BOUND = 20` of zero (a value chosen
+because every genuine reading seen from this project, synthetic or real,
+has stayed in single digits — 20 is headroom, not a guess at what's
+"normal"). A point beyond that range is drawn clipped to the axis edge
+with a chevron and its true value labelled next to it, not silently
+dropped or used to rescale the whole chart — the tooltip and aria-label
+were already reading the unclamped value and still do. This is
+display-only: `/telemetry` still returns the real `30101.4`; anyone
+querying the API directly sees exactly what was computed.
+
+**The ingestion scheduler had been silently corrupting a moving ~20-day
+window of indicator history on every single tick — found 2026-09-20,
+fixed the same day.** Surfaced by a real failure: forcing
+`/ct/evaluate?as_of=2026-08-19` (to demonstrate a live retrain for Chapter
+5) raised `ValueError: no usable rows for ticker 'XOM'` inside
+`TradingEnvironment`. The `DEFAULT_TRAILING_WINDOW_DAYS = 120` note
+earlier in this section solved Wilder's RSI problem (an EMA that's merely
+*colder*, not wrong, with too little lookback) but missed a completely
+different one: `compute_indicators()`'s `sma_20` uses `min_periods=20`, so
+the first 19 rows of **any single computation call** are `NaN` by
+construction — widening the fetch doesn't give those specific rows more
+lookback, because they're a fixed distance from *that fetch's own
+starting row*, not from true history. Every scheduled tick recomputes
+indicators fresh over its own 120-day slice and its own leading ~20-day
+NaN zone lands on a *different* stretch of dates each time (since the
+fetch's start slides forward with `date.today()`) — and because
+`persist()` is idempotent, each tick permanently overwrites whatever
+correct value an earlier, better-positioned computation had left for
+whatever dates its own warm-up zone happens to land on. This is why
+2026-06-01..18 came back all-`NaN` for `sma_20`/`rsi_14` across all 5
+tickers despite having been correctly populated by an earlier, wider
+backfill: some scheduled tick's 120-day fetch had started right before
+that stretch.
+
+Fixed in `run_ingestion_tick()` (`src/orchestration/ingestion_scheduler.py`):
+drop each ticker's first `_INDICATOR_WARMUP` (= `max(sma_window,
+rsi_window)` = 20) rows before persisting, using
+`frame.groupby("ticker").cumcount() >= _INDICATOR_WARMUP` — not
+`groupby(...).apply(lambda g: g.iloc[n:])`, which was the first attempt
+and immediately failed differently: **pandas 3.x's `groupby().apply()`
+excludes the grouping column from what the callback receives by default**,
+so `g` inside the lambda no longer had a `ticker` column at all, and every
+row persisted with `ticker=NULL`, tripping the `NOT NULL` constraint —
+caught immediately by the existing test suite (4 of 5 tests in
+`test_ingestion_scheduler.py` failed) before this ever reached the real
+database. Guarded going forward by
+`test_ingestion_tick_does_not_clobber_already_warm_history_behind_it`,
+which seeds a full history, ticks with an `end` well before the seeded
+data's own end (so the fetch window starts partway through
+already-populated dates, not at the very beginning), and asserts the
+pre-existing `sma_20` values are untouched — proven to actually catch the
+original bug by reverting the fix and confirming 107 of 110 rows in the
+clobber zone came back `NaN`. The real 2026-06-01..18 corruption was
+repaired with `scripts/run_ingestion.py --start 2026-04-01 --end
+2026-09-18` (wide enough before the gap for the same warm-up reason).
+
+**FR-14's retrain trigger had no volatility awareness at all — the user
+asked directly what stops a retrain from firing during a volatile week,
+and the honest answer, before this, was nothing.** I5/FR-12's VIX
+fail-safe only gates `/predict`; it has no connection to
+`CTOrchestrator`, confirmed by grepping `ct_orchestrator.py` for any VIX
+reference and finding none. The actual trigger was one line: `if rolling
+< RISK.target_sharpe_threshold`. That's a real gap, not a benign one: a
+volatile week is exactly when the 30-day rolling Sharpe is most likely to
+cross that trigger, so the system as designed would tend to retrain
+*more*, not less, during volatility — training a fresh candidate on a
+distorted, noisy window, the opposite of what a Chapter-5-defensible CT
+loop should do.
+
+Fixed in `CTOrchestrator.evaluate()` (`src/orchestration/ct_orchestrator.py`):
+when the Sharpe check would trigger a retrain, a second check reads the
+latest VIX (`repo.latest_ingest_info()`, the same source `/ct-status`
+already surfaces) and defers — logs why, records
+`last_retrain_deferred_at`, returns to `SERVING` — rather than training
+through it, if VIX is at or above `vix_critical_threshold`. Deliberately
+reuses that threshold rather than adding a second magic number: "volatile
+enough to force capital preservation" (I5/FR-12) is a defensible bar for
+"volatile enough not to trust a retrain," and it means Chapter 5 defends
+one number, not two. Deferred, not cancelled — the next scheduled tick
+(FR-13) re-checks both Sharpe and VIX from scratch, so a retrain still
+happens once the market calms down, it just doesn't happen *during* the
+spike. No FR/DR ID covers this directly; it is to FR-14 what I5/FR-12
+already is to FR-10 — a volatility fail-safe on a different code path,
+not a new requirement.
+
+Deliberately scoped to the FR-14 decay-detection path only, not the
+"no incumbent" bootstrap path (`evaluate()`'s other call to
+`_trigger_retrain`) — deferring the very first deployment indefinitely
+because ingestion happened to start during a rough week would leave the
+system with nothing serving at all, which is a worse outcome than
+training once on a noisy bootstrap window that FR-17's acceptance gate
+would likely reject anyway.
+
+Guarded by two tests in `tests/test_ct_orchestrator.py`:
+`test_evaluate_defers_retrain_when_vix_is_critical` (seeds an elevated
+VIX and a losing incumbent replay, confirms no retrain thread spawns and
+`last_retrain_deferred_at` is set) and
+`test_evaluate_still_retrains_below_threshold_when_vix_is_normal` (the
+same losing replay under ordinary VIX still retrains as before — the
+deferral is specific to volatility, not a general brake on FR-14).
+Confirmed the first test actually exercises the new code path, not
+just a tautology: reverting the fix and re-running it fails with
+`RETRAINING` where `SERVING` was expected.
+
+**A genuinely crashing retrain was invisible — found during a "what gaps
+are left" review, not a live failure.** `_retrain_and_maybe_promote()` had
+a `try/finally` but no `except`. The `finally` already reset `_status`
+back to `SERVING` correctly on any exception, so NFR-05's actual guarantee
+("incumbent keeps serving") already held — but the exception itself just
+printed to stderr via Python's default thread-exception hook: nothing
+through this module's own `logger`, and no `model_run` row, since
+`log_run()` needs a trained candidate agent that may never have existed
+(e.g. if `PPOAgent.train()` itself threw). This is a different, stronger
+failure mode than FR-17's "candidate lost the comparison," which was
+already logged and tested — a genuine crash had zero tests and zero
+structured visibility.
+
+Fixed with an `except Exception` that logs via `logger.exception(...)` and
+records `last_retrain_failed_at` / `last_retrain_error` (surfaced on
+`/ct-status` as `last_retrain_failed_at`; the raw exception text stays
+server-side, not in the public response — NFR-10's spirit, not just its
+letter). Guarded by
+`test_retrain_survives_a_genuine_crash_and_leaves_incumbent_active`
+(`tests/test_ct_orchestrator.py`), which monkeypatches `PPOAgent.train` to
+raise directly (not "the candidate happened to score worse" — an actual
+crash) and confirms the incumbent is untouched, status returns to
+`SERVING`, the failure is recorded, and — since a crash before a candidate
+exists has nothing for `log_run()` to record — no new `model_run` row
+appears either. Confirmed as a real regression test: reverting the fix,
+the same `RuntimeError` propagates straight out uncaught.
+
+**The frontend went from zero tests to 47 — and writing them for
+testability surfaced a real, previously-unknown DST bug (2026-09-20).**
+Vitest + React Testing Library (`frontend/package.json`'s `test` script);
+`vitest@^2` specifically, not the latest major, since `vitest@5` requires
+Vite 6/7/8 and this project deliberately pins Vite 5 (`frontend/vite.config.js`'s
+`test` block, `frontend/src/test/setup.js`). Three pieces of previously
+inline, unexported logic were pulled out into standalone functions
+specifically so they're unit-testable without rendering — not a
+refactor for its own sake, but because these are exactly the pieces most
+likely to silently regress: `computeSharpeDomain`/`clampForDisplay`
+(`Charts.jsx`, the outlier-handling logic from this same section, above)
+and `pipelineToneAndLabel`/`ingestionToneAndLabel` (`Primitives.jsx`,
+`StatusStrip`'s tone mapping). `App.jsx`'s adapter functions
+(`adaptStatus`/`adaptTelemetry`/`adaptDecisions`/`adaptMetrics`) gained
+plain `export` keywords for the same reason.
+
+**A genuine DST bug, not a hypothetical one.** Writing a test for
+`fetchTelemetry`'s date-window math (`api.js`) found that
+`start.setDate(start.getDate() - days)` on a date parsed as UTC midnight
+is timezone-dependent in a way that breaks specifically when the
+`days`-wide window straddles a DST transition in the *viewer's* browser
+timezone: a 30-day window ending 2026-11-15 computed a start of
+2026-10-15 in `America/New_York` instead of the correct 2026-10-16 (the
+UTC-to-local offset used parsing the end date differs from the one
+implicitly undone converting back via `toISOString()` once a transition
+falls in between). This machine's own timezone (EAT, no DST) would never
+have hit this, which is exactly why it went unnoticed until a test
+deliberately forced `America/New_York`. Fixed with `setUTCDate`/`getUTCDate`
+throughout, sidestepping local-offset dependence entirely. Guarded by a
+test that explicitly sets `process.env.TZ` rather than trusting the
+runner's own timezone, and confirmed to actually catch the bug by
+reverting the fix and watching it fail on the exact scenario described.
+
+**Scope, honestly stated:** 47 tests covers the highest-risk pure logic
+(outlier handling, status-tone mapping, all four API-response adapters,
+`api.js`'s error-handling paths and date math) — it is not full component
+or visual coverage. `App.jsx`'s main component (data fetching, polling,
+the mock-fallback switch, the decision-detail sheet) has no rendering
+tests yet; the adapter functions it calls are now covered, but the
+component wiring them together is not.
 
 The proposal names FinRL. **It does work.** An earlier claim in this project
 that it was broken was wrong and has been corrected.
 
-`StockTradingEnv` imports successfully once six further packages are installed:
-`alpaca_trade_api`, `exchange_calendars`, `pytz`, `stockstats`, `wrds`,
-`yfinance`. It is Gymnasium-based, 538 lines, and already models transaction
-costs (`buy_cost_pct`) and a `turbulence_threshold` close in spirit to the VIX
-fail-safe. The drawdown penalty *can* be added by post-processing
-`super().step()` in a subclass — this was verified working.
+`StockTradingEnv` imports successfully once further packages are installed.
+The list of six in the previous version of this file (`alpaca_trade_api`,
+`exchange_calendars`, `pytz`, `stockstats`, `wrds`, `yfinance`) turned out to
+be incomplete for the current PyPI release (FinRL 0.3.7, 2026-09-17): the
+actual chain that fires just from `import finrl` — it eagerly imports
+`finrl.test`, which imports the env module directly — needed `gymnasium`,
+`stable-baselines3`, and `matplotlib` as well, none of which are in that
+original list. `stockstats` was needed; `alpaca_trade_api`,
+`exchange_calendars`, `pytz`, `wrds`, `yfinance` were not, at least for
+reaching `StockTradingEnv` — they may matter for FinRL's live-data
+connectors, which nothing here touches. It is Gymnasium-based, 557 lines in
+this release, and already models transaction costs (`buy_cost_pct`) and a
+`turbulence_threshold` close in spirit to the VIX fail-safe. The drawdown
+penalty *can* be added by post-processing `super().step()` in a subclass —
+this was verified working.
+
+Installed into an isolated venv, not this project's own `.venv` — FinRL's
+dependency footprint is dated enough that pinning it alongside Sprint 1/2's
+numpy 2.x/pandas 2.x/gymnasium 1.x stack risked real conflict for a
+one-off validation experiment. See `scripts/finrl_crosscheck.py`'s docstring
+for the exact install steps if this needs re-running.
 
 It is not used as the primary environment for two reasons:
 
@@ -396,22 +1093,47 @@ It is not used as the primary environment for two reasons:
 under test (30 tests across `test_environment.py` and `test_baselines.py`),
 passing Stable Baselines3's `check_env` (`test_conforms_to_gymnasium_api`).
 
-**Pending validation experiment.** Run one partition through both environments
-with the drawdown penalty disabled, so both reduce to plain PnL. Closely
-matching equity curves would corroborate this environment's accounting against
-a published implementation — turning the deviation from a liability into
-evidence of rigour. This is worth doing before the defence. Still not done —
-Sprint 2 built and tested `TradingEnvironment` on its own terms; it did not
-run this cross-check.
+**Validation experiment — done, 2026-09-17 (`scripts/finrl_crosscheck.py`).**
+Both environments hold the same fixed 100-share position in each of the
+5 tickers, bought on the same calendar date at the same (synthetic) price,
+with transaction costs and the drawdown penalty both disabled in both, so
+each reduces to plain PnL against an identical holding across a 222-day
+aligned window. Result:
+
+| | ours | FinRL |
+|---|---|---|
+| initial equity | 100,000.0000 | 100,000.0000 |
+| final equity | 102,108.6627 | 102,108.6627 |
+
+Max absolute difference **$0.00007237** on a ~$100–102K portfolio (max
+relative difference ~7×10⁻¹⁰), correlation **1.000000000000**. That residual
+is consistent with float32 action rounding on this project's side (the
+initial target weight is cast to float32 before `step()` upcasts it back to
+float64), not a real accounting divergence. This corroborates
+`TradingEnvironment`'s valuation and return accounting against FinRL's
+independently published implementation — the §8 deviation is now backed by
+evidence, not just a design justification. It does *not* validate the
+transaction-cost or reward mechanics specifically (both were disabled to
+isolate accounting), and it used single-step buy-and-hold, not a trading
+policy — see §7's transaction-cost note for what *is* tested there.
+
+One FinRL implementation detail this surfaced, worth knowing before anyone
+tries to reuse `StockTradingEnv` with `tech_indicator_list=[]`:
+`_buy_stock`/`_sell_stock` hard-code a "disabled" flag at
+`state[index + 2*stock_dim + 1]`, i.e. inside the first technical
+indicator's slot, regardless of whether indicators are otherwise used. An
+empty `tech_indicator_list` leaves that slot out of the state vector
+entirely, and every buy or sell raises `IndexError`. The workaround: supply
+one always-`False` dummy column, e.g. `tech_indicator_list=["disable"]`.
 
 ---
 
 ## 9. Verified empirical findings
 
-Measured, not assumed. Cite these rather than re-deriving them. Everything
-below this point in the section predates Sprint 2 and concerns Sprint 3
-(training), which has not started — none of it has been re-verified against
-this checkout. See §3 for why that distinction matters.
+Measured, not assumed. Cite these rather than re-deriving them. The items
+below predate Sprint 2 and concern Sprint 3 (training, not yet started) —
+most have now been re-verified against this checkout (dated where so); the
+ones that haven't are marked explicitly.
 
 **The policy network is tiny.** For 5 tickers × 8 features + positions + cash =
 46-dimensional observation, SB3's default `MlpPolicy` (two 64-unit hidden
@@ -420,22 +1142,105 @@ layers for each of π and V) is **14,731 parameters, 57.5 KB**. ResNet-50 has
 `TradingEnvironment.observation_space` itself
 (`test_observation_and_action_space_shapes`), not just asserted.
 
-**Training is CPU-viable.** 875 steps/sec on a weak cloud CPU → ~500k timesteps
-in under 10 minutes. A full Sprint 3 run on the M5 will be faster.
+**MPS vs CPU, measured on the actual M5 (2026-09-17).**
+`scripts/benchmark_device.py` runs identical `PPO("MlpPolicy", ...).learn()`
+calls against `TradingEnvironment` on the real 5-ticker/46-dim observation
+space, on both devices, with an untimed 2048-step warm-up before each timed
+measurement (MPS pays a one-time kernel-compilation and device-transfer setup
+cost on first use that would otherwise be charged to the measurement, not to
+steady-state throughput). Two independent seeds, at 20,000 measured
+timesteps each:
 
-**`device="mps"` may be slower than CPU.** PPO alternates between rollout
-collection (thousands of forward passes on a *single* observation) and small
-minibatch updates. At 14k parameters, CPU↔GPU transfer overhead dominates the
-arithmetic. **Benchmark both on the M5 and keep whichever wins** — do not
-assume the GPU helps. A GPU would only pay off with `CnnPolicy` on image
-inputs or 50+ parallel environments.
+| device | seed 0 | seed 1 |
+|---|---|---|
+| cpu | 5,677 steps/sec | 5,718 steps/sec |
+| mps | 452.6 steps/sec | 438.5 steps/sec |
+
+**CPU wins by roughly 12–13×.** This confirms the hypothesis this section
+used to only speculate about: PPO alternates rollout collection (thousands of
+forward passes on a single observation) with small minibatch updates, and at
+14.7K parameters the CPU↔GPU transfer overhead dominates whatever the
+arithmetic would have gained from the GPU. **Use `device="cpu"` for Sprint
+3** — do not pass `device="mps"` to `PPO(...)`, it is not close. A GPU would
+only pay off with `CnnPolicy` on image inputs or with 50+ parallel
+environments, neither of which applies here.
+
+**Training is CPU-viable — now confirmed at full scale, not extrapolated.**
+500,000 timesteps ran in **87.0 seconds** (5,750 steps/sec) on the actual M5
+CPU, `scripts/benchmark_device.py --timesteps 500000`. The earlier "875
+steps/sec on a weak cloud CPU → under 10 minutes" figure was itself a
+measurement, just not one taken on this hardware — the M5 turns out to be
+about 6.5× faster than that reference point, not merely "faster" as
+previously hedged.
 
 **Colab is not needed** and carries a real cost: a dropped 12-hour session at
-the wrong moment.
+the wrong moment. (Unverified against this checkout — no Colab run has been
+attempted from here; the M5 CPU numbers above make it unnecessary to try.)
 
 **Yahoo Finance is unreachable from cloud containers** (403 on CONNECT,
-gateway policy). It works fine from a local machine. This is why
-`fetch_market_data()` has never been exercised against a real response.
+gateway policy). It works fine from a local machine.
+
+**Live ingestion verified against a real response (2026-09-17, this
+checkout).** `fetch_market_data()` had never been exercised against a real
+yfinance response before this. It now has, for the full 5-ticker universe
+plus VIX over 2024-01-01→2024-06-01, with `--dry-run` and by persisting the
+real fetched frame through the ORM into SQLite (Docker Desktop was not
+running locally, so this could not be run against actual PostgreSQL — see
+the gap that leaves, below). Findings:
+- **yfinance 1.7.0 returns MultiIndex columns even for a single-ticker
+  download** — `[('Adj Close', 'XOM'), ('Close', 'XOM'), ...]`, not the flat
+  frame the module's docstring implies is the single-ticker case. This is
+  more aggressive than the "changes periodically" warning anticipated, but
+  `_normalise_yf_frame()`'s existing `isinstance(df.columns, pd.MultiIndex)`
+  branch already handles it correctly — `get_level_values(0)` drops the
+  ticker level, which is safe here specifically *because* `_fetch_one` only
+  ever requests one symbol at a time (`fetch_market_data` loops per ticker
+  rather than batching). Flattening that same way on a genuine multi-ticker
+  batch download would silently collide two tickers' `Close` columns; that
+  path is not exercised anywhere in the current code, so it stayed latent
+  rather than becoming a bug — worth remembering if a future change ever
+  batches the download.
+- **`Adj Close` is returned** with `auto_adjust=False`, for both equities and
+  `^VIX` — confirmed non-trivially different from `Close` for XOM (dividend
+  drift over ~2.5 years from the 2024 dates to today), and correctly equal to
+  `Close` for `^VIX` (no dividends/splits on an index).
+  `adjust_corporate_actions()` consumed it without changes.
+- **`^VIX` returns `Volume=0`**, not a missing column — `_normalise_yf_frame`'s
+  required-column check passes without special-casing this.
+- Over 2024-01-01→2024-06-01, the real universe had **0 imputed rows** — all
+  five tickers traded on the same calendar for this window — and **230 of 525
+  rows** had a complete normalised feature vector, exactly matching
+  `5 tickers × (105 − 59) = 230` from the 60-day zscore warm-up. The math
+  checked out against real data, not just synthetic.
+- The persisted-and-reloaded frame round-tripped through
+  `MarketRepository.persist` / `load_partition` / `latest_state` correctly —
+  dtypes, NaN handling, and numeric precision all held up against real
+  values, not just the synthetic fixtures the test suite uses.
+
+**That gap is now closed too (2026-09-17, same session).** Started Docker
+Desktop, brought up `postgres` via `docker compose up -d postgres`, and ran
+`scripts/run_ingestion.py --start 2024-01-01 --end 2024-06-01` for real (no
+`--dry-run`) against it — the same 525-row universe as above, this time
+landing in actual PostgreSQL rather than SQLite. Also confirmed, against the
+real container, the two things `tests/test_repository.py` explicitly flags as
+unverified on SQLite:
+- **Idempotency (DR-05).** Running the exact same ingestion command a second
+  time left the store at 525 rows, not 1050 — `persist()`'s upsert behaviour
+  holds on Postgres.
+- **Both CHECK constraints actually fire.** Manually inserting a `ModelRun`
+  with `eval_start <= train_end` raised `IntegrityError` (`ck_eval_after_train`,
+  DR-06/I1); inserting a `MarketObservation` with `high_price < low_price`
+  raised `IntegrityError` (`ck_high_ge_low`) — both roundly rejected rather
+  than silently accepted, and the observation count stayed at 525 after each
+  rollback.
+
+`load_partition`, `latest_state`, and `scripts/run_baselines.py` were all
+re-run against this real Postgres-backed store and produced sane output
+(buy-and-hold Sharpe 1.99, random policy losing money to cost drag over the
+2024-04-01→2024-06-01 eval slice). The persistence path is genuinely closed
+now, not just on SQLite. Docker Desktop + the `mlops_postgres` container were
+left running locally after this — `docker compose down` to stop them if
+they're not wanted between sessions.
 
 ---
 
@@ -473,6 +1278,239 @@ most common way an RL trading thesis fails at defence.
 Also report: walk-forward validation across distinct market regimes (Section
 3.3.4), not a single split.
 
+### First real training run — 2026-09-17, this checkout
+
+Real market data (13,825 rows, 2015-01-02→2025-12-30, all 5 tickers + VIX,
+ingested for real via `scripts/run_ingestion.py` with no `--start`/`--end`
+override, into the real `mlops_postgres` container) through
+`scripts/train_agent.py` at real settings (no synthetic data, no toy
+hyperparameters): **18 walk-forward splits × 5 seeds = 90 models**, ~20
+minutes on the M5 CPU. All 90 runs logged to `model_run`; the best seed per
+split registered as a `model_version` (18 total) — **none promoted**, which
+is correct, not a gap: this script produces validation folds for reporting,
+not a production deployment decision (`ModelRegistry.register_version()`
+deliberately never sets `is_active`; see §7).
+
+**The headline numbers, reported the way §10 asks them to be, not the
+flattering way:**
+
+| Statistic | Value | What it's measuring |
+|---|---|---|
+| Best-seed-per-split Sharpe, n=18 | mean 0.570, std 1.279 | what gets *registered* each split — already a maximum over 5 seeds |
+| All individual seeds pooled, n=90 | mean −0.606, std 1.507 | what an *untuned* seed actually gets you |
+| Positive splits | 10/18 | regime-dependent, not uniformly positive |
+
+That gap between 0.570 and −0.606 is the selection-bias effect §10.3 exists
+to catch, demonstrated with this project's own real numbers rather than a
+hypothetical. **The best single result across all 90 runs** was split 11
+(eval 2021-12-05→2022-06-02), seed 0, Sharpe **3.273**, `run_id`
+`7f60784a-805f-4047-ad74-fad67261920c` — re-run standalone to confirm exact
+reproducibility given a fixed seed (it reproduced to three decimal places)
+and to recover the per-period returns MLflow didn't log a copy of:
+
+- **Undeflated (treated as the only thing tried): PSR = 0.986** — 98.6%
+  probability this Sharpe is genuinely positive, taken alone.
+- **`deflated_sharpe_ratio(returns, n_trials=90)` = 0.388** — under 40%,
+  correcting for having actually tried 90 configurations and reported the
+  best. This is the number that belongs in Chapter 5, not the 0.986, and
+  not the 3.273 either.
+- **Baselines on that exact window** (§10.1, same eval partition, so the
+  comparison is fair): buy-and-hold Sharpe **2.419**, equal-weight
+  **2.388**, random (mean of 5 seeds) **−3.192**, all-cash **0.000**. The
+  agent's 3.273 beats buy-and-hold, but buy-and-hold *itself* scored 2.4 on
+  this window — Dec 2021–Jun 2022 was simply a strong period for energy
+  equities. The margin over a passive baseline is real but modest once
+  that's accounted for, not the standalone number suggests.
+
+**Read this the way §1 requires, not the way it's tempting to read it.** The
+correct sentence is: the walk-forward + seed-sweep + deflation + baseline
+pipeline ran end to end on real data and produced a disciplined, honest
+number (DSR 0.388 on the best fold) instead of an inflated one (0.986 or
+3.273) — that is the architecture responding as designed. The incorrect
+sentence is any version of "the strategy made 41% in six months" — that
+figure is one seed, one fold, in one favourable regime, and the very
+analysis above exists to stop that number from being reported as a result.
+
+**Full statistical-rigor pass — done, 2026-09-20, this checkout
+(`scripts/deflated_sharpe_analysis.py`).** The above disciplined a single
+demonstrated fold; this re-runs all 18 splits with **10 seeds each**
+(double the original sweep, for a tighter confidence interval) and
+computes `deflated_sharpe_ratio` for *every* split's best-seed run, not
+just one. A standalone analysis script, the same kind as
+`scripts/finrl_crosscheck.py` — it does not touch `ModelRegistry` or the
+production `model_run` table, since `deflated_sharpe_ratio` needs the
+actual per-period return series (to estimate skew/kurtosis, Bailey &
+López de Prado 2014), and `scripts/train_agent.py`'s sweep never
+persisted those anywhere, only the summary Sharpe scalar. 180 real
+training runs against the real 2015–2025 data, **671 seconds (~11.2
+minutes)** on the M5 CPU.
+
+| Statistic | 5 seeds (previous) | 10 seeds (this pass) |
+|---|---|---|
+| Best-seed-per-split Sharpe, n=18 | mean 0.570, std 1.279 | mean 1.173, std 0.914 |
+| All individual seeds pooled | mean −0.606, std 1.507 (n=90) | mean −0.723, std 1.583 (n=180) |
+| Positive splits | 10/18 | 17/18 |
+| Deflated Sharpe per split | one fold only: 0.388 | mean 0.055, std 0.073, **max 0.301** (all 18) |
+| Splits with DSR > 0.5 | — | **0 / 18** |
+
+**Read the middle two rows the way §10.2/§10.3 exist to make you read
+them, not the way they first look.** Doubling the seed count pushed the
+best-per-split mean *up* (0.570 → 1.173) and its std *down* — that is not
+the strategy improving; "best of 10" is a maximum-order-statistic that
+mechanically rises and tightens as you draw more samples, regardless of
+whether any single seed is actually good. The pooled-seeds row (what an
+untuned single run actually gets you) barely moved between 90 and 180
+observations — slightly worse, if anything — which is the honest
+population estimate, and it does not show "best of 10" doing anything
+more than getting luckier more often. The DSR column is what actually
+disciplines this: **every one of the 18 splits' best result has a
+deflated Sharpe under 0.31, and none clears 0.5** — not even split 11,
+the single best result across all 180 runs, whose own DSR *fell* from
+0.388 to 0.301 once the trial count was honestly counted at 180 instead
+of 90. That is the correct, complete version of §10.3's point: no fold in
+this sweep survives correction for how many configurations were actually
+tried, which is exactly what "the architecture, not the alpha" (§1) means
+in practice — nothing here should be reported to a defence committee as
+"this fold made money," only as "the disciplined evaluation protocol ran
+to completion and correctly declined to certify any fold as a real edge."
+
+Confirms determinism as a side effect, not just an evaluation result:
+split 11 seed 0 reproduced **3.2727 exactly** (five decimal places) across
+two independent runs of this script three days apart, using the same
+partition boundaries and hyperparameters — the same reproducibility
+property CLAUDE.md already relied on when it first re-ran that fold
+standalone.
+
+Not yet done: annealing the *hyperparameters themselves* (n_steps,
+learning rate, network size) rather than only the seed — everything above
+still holds the original architecture fixed and asks only "how variable
+is this specific configuration," not "is there a better configuration."
+
+**Algorithm comparison — PPO vs A2C vs SAC vs TD3, plus a selection
+ensemble — done 2026-09-24 (`scripts/algorithm_comparison.py`,
+results in `results/algorithm_comparison/`).** The user asked whether
+other model types might be more suitable before committing to one. Scoped
+deliberately to RL algorithms only (all from SB3, all acting on the same
+`TradingEnvironment`, so RL stays the project's core): random forests /
+XGBoost / LSTMs forecast returns rather than choose actions, so comparing
+them to PPO would need an invented trading rule on top, and if one "won"
+the project would stop being an RL project. **This is a scope question
+§2 says needs the supervisor — raised with the user, not yet confirmed as
+approved. Chapter 5 has not been updated with any of it.**
+
+Protocol, identical for every algorithm: the same 18 walk-forward splits,
+10 seeds each, 20,000 timesteps each, SB3 defaults for every algorithm
+(PPO has always been untuned here too), costs and drawdown penalty on.
+`RLAgent` (`src/rlops/agent.py`) generalises the wrapper; `PPOAgent` now
+subclasses it with identical behaviour, so production is untouched. TD3
+alone gets `NormalActionNoise(σ=0.1)` — SB3's TD3 has *no* exploration
+noise by default, so "untuned" would otherwise mean "never explores."
+
+The ensemble is Yang et al. (2020)'s: per split and seed, pick the
+algorithm with the best Sharpe on a **validation slice carved off the end
+of the training window** (last 90 days), then trade the eval window with
+it. Choosing on eval-window Sharpe would be look-ahead (I1). Consequence:
+every algorithm here trains on the train window *minus* those 90 days, so
+PPO's numbers below are not comparable with the 180-run study above,
+which trained on the full window.
+
+720 real training runs, ~3.1 hours wall time on 8 worker processes
+(SAC ~175s and TD3 ~186s per run single-threaded vs ~4s for PPO/A2C; the
+first estimate was wrong partly because the Mac idle-slept mid-run —
+`caffeinate -i -w <pid>` prevents that on any future long run).
+DSR `n_trials = 5 strategies × 18 × 10 = 900`.
+
+| strategy | pooled Sharpe (n=180) | best-seed/split mean | seed-mean beats buy-and-hold | DSR max | splits DSR>0.5 | vs PPO: splits better (Wilcoxon p) |
+|---|---|---|---|---|---|---|
+| PPO | −0.630 ± 1.658 | 1.206 | 4/18 | 0.170 | 0/18 | — |
+| A2C | −0.630 ± 1.568 | 1.359 | 4/18 | 0.250 | 0/18 | 7/18 (0.495) |
+| SAC | −0.623 ± 1.555 | 1.092 | 4/18 | 0.058 | 0/18 | 7/18 (0.766) |
+| TD3 | −0.430 ± 1.846 | 1.200 | 7/18 | 0.283 | 0/18 | 10/18 (0.609) |
+| Ensemble | −0.767 ± 1.757 | 1.208 | 5/18 | 0.261 | 0/18 | 8/18 (0.347) |
+
+Baselines, mean Sharpe across the same 18 eval windows: buy-and-hold
+0.855, equal-weight 0.865, all-cash 0.000, random −3.295.
+
+**What this does and does not show.**
+- **No algorithm is distinguishable from PPO.** None beats it on more
+  than 10 of 18 splits, and no paired difference is significant
+  (p 0.35–0.77). TD3's slightly higher pooled mean comes with the widest
+  spread and is well inside noise. The honest reading is that the choice
+  of PPO is now *defended by evidence* rather than just inherited from
+  the proposal — not that PPO is best.
+- **The ensemble made things slightly worse, not better.** Its picks were
+  spread almost evenly (A2C 52, PPO 37, SAC 38, TD3 53 of 180), which is
+  what selection looks like when a 90-day validation Sharpe carries
+  almost no information about the next 180 days. This is a real,
+  reportable negative result against the Yang et al. approach under this
+  project's conditions (daily data, 5 tickers, untuned, costs on).
+- **Every untuned algorithm loses to simply holding the assets** on
+  average (pooled −0.4 to −0.8 vs buy-and-hold 0.855), and no strategy's
+  best fold survives deflation (0/18 above 0.5 for all five). Same
+  conclusion as the PPO-only study, now across four algorithms.
+- The best-seed/split column (≈1.1–1.4) versus the pooled column
+  (≈ −0.6) is the same selection-bias gap §10.3 exists for, reproduced
+  for every algorithm.
+
+Framed per §1: the comparison is evidence about the *architecture's*
+design choice — swapping the algorithm inside the CT loop would not have
+changed its behaviour materially, which is an argument that the loop
+(detection, FR-17 gate, hot reload) is the contribution, not the learner
+inside it.
+
+**The CT loop's core claim — autonomous decay detection and recovery — has
+now been observed live, not just unit-tested (2026-09-17, same checkout).**
+Promoting one of the 18 candidates was the missing step above; doing it
+through the real `/ct/evaluate` endpoint (rather than a direct database
+write) exercised the whole loop end to end for the first time:
+
+1. **Bootstrap.** `POST /ct/evaluate?as_of=2025-12-30` with no incumbent yet
+   active. `CTOrchestrator` has no baseline to compare against, so it trains
+   and promotes unconditionally — this is what put candidate
+   `e928c835-bbcb-4531-8824-0e464037f407` into `is_active`.
+2. **Decay detection, live.** A second `evaluate()` call replayed that
+   incumbent over the real market data through `TradingEnvironment` and
+   computed `rolling_sharpe = -3.79` — well below `target_sharpe_threshold =
+   1.0` — and autonomously fired a background retrain (FR-14), the same code
+   path the 300-second scheduler uses.
+3. **The FR-17 gate held.** That retrain's candidate did not beat the
+   incumbent out-of-sample, so it was rejected rather than promoted —
+   `rejected_count` moved 0→1 — and the original incumbent stayed active.
+
+This is the literal architectural claim under examination (§1): a closed
+loop that notices its own performance decay and responds without human
+intervention or serving downtime, observed running against real ingested
+data rather than asserted from unit tests or design intent. It does not
+demonstrate a profitable strategy — the replayed Sharpe was strongly
+negative — and per §1 that is not the point: the system's response to a bad
+Sharpe is exactly what was supposed to happen.
+
+**A second, independent occurrence of the same loop — 2026-09-20, a
+different incumbent, a different window, requested specifically for
+Chapter 5 documentation.** After the September bootstrap above, the
+incumbent (`bf65de93`, §7's model-label entry) ran unattended for three
+days: 540 evaluations, only 2 promotions, 448 rejections — already
+recorded in §13 as evidence the FR-17 gate is genuinely hard to beat, not
+just present. To capture a second full cycle on demand rather than wait
+for one, `POST /ct/evaluate?as_of=2026-08-19` replayed the incumbent
+against a real historical window already known to be weak for it
+(`rolling_sharpe = -2.43`, found by scanning recorded telemetry for
+`rolling_sharpe_30d < 1.0` rather than guessing a date). Below target,
+this autonomously triggered a real retrain (`training_runs` 540→541); the
+candidate did not beat the incumbent out-of-sample, so it was rejected
+(`rejected_count` 448→449) and `bf65de93` stayed active — the same
+decay → retrain → gate-holds sequence as the first bootstrap, this time
+starting from an already-serving incumbent rather than no incumbent at
+all, which is the more representative steady-state case for a defence to
+cite. (Getting to this `as_of` took two attempts and surfaced §7's
+ingestion-scheduler bug along the way: `as_of=2026-09-17` first, which
+replayed straight into the `_VARIANCE_FLOOR` outlier §7's chart fix
+already documents — no retrain, since 30101.4 is nowhere near the
+threshold; then `as_of=2026-08-19`, which hit the corrupted
+2026-06-01..18 stretch and raised the `ValueError` that led to finding
+and fixing the bug; only then, with the repair applied, did this same
+`as_of` produce the real -2.43 result above.)
+
 ---
 
 ## 11. Code conventions
@@ -497,53 +1535,139 @@ Also report: walk-forward validation across distinct market regimes (Section
 
 ## 12. Next tasks, in order
 
-**1. Verify live ingestion — do this first, it blocks everything.**
+**1. ~~Verify live ingestion~~ — done 2026-09-17, see §9.** No code change was
+needed: `_normalise_yf_frame()` already handled the real (MultiIndex, even
+for a single ticker) response shape correctly, and persistence — including
+both CHECK constraints and idempotency — is now confirmed against real
+PostgreSQL, not just SQLite. `mlops_postgres` is currently running locally
+with 525 real rows in it from this check (`docker compose down` to stop it).
 
-```bash
-python scripts/run_ingestion.py --tickers XOM --start 2024-01-01 --end 2024-06-01 --dry-run
-```
+**2. ~~Benchmark MPS vs CPU~~ — done 2026-09-17, see §9.** CPU wins by
+~12–13× on this hardware. Use `device="cpu"` when `src/rlops/agent.py` is
+built in Sprint 3 — this is now a settled decision, not an open question.
 
-`--dry-run` fetches and transforms without writing. `_normalise_yf_frame()` was
-written to spec in an environment where Yahoo was firewalled and has **never
-seen a real response**. Expect it to need adjustment: yfinance changes its
-response shape periodically — notably the `auto_adjust` default and whether
-`Adj Close` is returned at all. The code requests `auto_adjust=False`
-specifically so DR-03 can apply the adjustment factor itself. Also handle the
-MultiIndex-vs-flat column difference between multi- and single-ticker
-downloads.
+**3. ~~Run the FinRL cross-check~~ — done 2026-09-17, see §8.** Max absolute
+difference $0.00007 on a ~$100K portfolio, correlation 1.000000000000. The §8
+deviation is now backed by a cross-check, not just a design justification.
 
-**2. Benchmark MPS vs CPU** on the M5 over an identical `learn()` call and
-record both numbers for Chapter 5.
+**4. ~~Sprint 3 — training and registry~~ — done 2026-09-17, on the
+`sprint-3` branch (not yet merged to `main`).**
+- `src/rlops/agent.py` — `PPOAgent`, a thin wrapper over SB3's PPO
+  (`device="cpu"`, per §9's measured decision). `train`/`predict`/`evaluate`/
+  `save`/`load`; `evaluate()` returns the same `{equity_curve, returns}`
+  shape `baselines.run_policy` does, so an agent's results and a baseline's
+  are directly comparable with no glue code.
+- `src/rlops/registry.py` — `ModelRegistry.log_run()` (FR-08: MLflow
+  params/metrics/artifact, then DR-08: the exact partition boundaries into
+  `model_run`) and `.register_version()` (FR-09). Defaults to a local
+  SQLite-backed MLflow store (`sqlite:///mlruns.db`), not `file:./mlruns` —
+  MLflow 3.x put the plain filesystem backend into maintenance mode and
+  refuses to open one without an explicit opt-out flag; the local default
+  here is the forward-compatible database URI, not a flag that silences the
+  deprecation. A real deployment points `MLFLOW_TRACKING_URI` at the
+  docker-compose `mlflow` service instead.
+- `src/dataops/processing.walk_forward_splits()` — rolling (train, eval)
+  windows across distinct regimes, each satisfying DR-06 by construction
+  (eval_start is always train_end + 1 day, not a separately-checked
+  invariant).
+- `scripts/train_agent.py` — runs the walk-forward × seed-sweep loop end to
+  end: trains, evaluates, logs every run, and registers the best-Sharpe
+  seed per split as a `model_version`. Smoke-tested against a temporary
+  SQLite store spanning ~3.5 years of synthetic data: 17 splits × 2 seeds
+  ran cleanly with no errors. Per-seed Sharpe varied wildly within some
+  splits (e.g. one split: seed 0 → 1.67, seed 1 → −7.23) — exactly the
+  seed-sensitivity §10.2 already warned about, not a bug; it is the
+  concrete demonstration of why the seed sweep is there.
+- 16 new tests (`test_agent.py`, `test_registry.py`, plus 4 for
+  `walk_forward_splits` in `test_processing.py`), all synthetic/offline —
+  the registry tests chdir into `tmp_path` (MLflow's artifact store defaults
+  to a relative `./mlruns` regardless of the tracking DB location, which
+  will otherwise leak a stray directory into the repo root on every test
+  run — it did, once, before this fix; deleted, not committed).
 
-**3. Run the FinRL cross-check (§8's pending validation experiment)**, now
-that `TradingEnvironment` exists to compare against. This is cheap relative to
-Sprint 3 and strengthens the §8 deviation before more code is built on top of
-`TradingEnvironment`.
+**5. ~~Sprint 4 — serving and the CT loop~~ — done 2026-09-17, on the
+`sprint-4` branch (branched off `main` after sprint-3 merged; not yet
+merged back — see §3).**
+- `src/serving/schemas.py` — Pydantic request/response models (IR-04, IR-05,
+  NFR-08). `PredictRequest.positions` validates its keys are exactly the
+  configured universe and every weight is in [-1, 1] — malformed input is a
+  422, never an unhandled crash.
+- `src/serving/inference.py` — `InferenceService`. Fail-safe checked
+  *before* any model call (I5/FR-12: fetches the latest VIX first, and only
+  builds the full observation / calls the agent if it's below
+  `vix_critical_threshold`); FR-11's weight→action thresholds; `reload()`
+  for hot-swapping the active model under a lock, so a promotion never
+  serves a half-loaded agent (FR-16).
+- `src/serving/api.py` — FastAPI app. `/predict` (FR-10), `/telemetry`
+  (FR-18), `/decisions` (FR-19, paginated), `/ct-status` (FR-20),
+  `/ct/evaluate` (on-demand trigger, same code path the scheduler uses).
+  Constructs its `repo`/`service`/`orchestrator` singletons in `lifespan`,
+  not at import time — `InferenceService.__init__` hits the database
+  immediately, and doing that at import time would make importing the
+  module reach for whatever `DATABASE_URL` happens to be set, including
+  from an unrelated earlier test.
+- `src/orchestration/ct_orchestrator.py` — `CTOrchestrator`. `evaluate()`
+  replays the incumbent over the most recent real market data through
+  `TradingEnvironment` (there's no live broker in this project's scope —
+  see the module's Sim2Real note), persists a snapshot per day (FR-13),
+  and triggers a background retrain (FR-14) if the resulting rolling Sharpe
+  is below target. The retrain thread trains a candidate, evaluates it
+  out-of-sample against the same window the incumbent was just evaluated
+  on, and only promotes if the candidate's Sharpe beats the incumbent's
+  (FR-17) — otherwise the incumbent is retained and nothing changes.
+  Measured, not assumed: triggering a real retrain and hammering `/predict`
+  throughout showed 2.1% p95 degradation (§9) — FR-15 holds up under load,
+  not just by design intent.
+- `frontend/` — React, plain CSS custom properties (no Tailwind), hand-drawn
+  SVG charts (no Recharts), a hand-rolled critically-damped spring
+  integrator (no Framer Motion). **Rebuilt from scratch on 2026-09-17** to a
+  design reference the user supplied directly (superseding an earlier
+  Tailwind/Framer/Recharts version built the same day) — see `frontend/README.md`
+  for the design rationale in full; the highlights:
+  - IR-07's graceful degradation is real, not aspirational: `src/api.js`
+    falls back to `src/mock.js` (visibly marked "Example data — not live
+    results") until the backend answers, and again if it later stops
+    answering. Verified both states render correctly by stopping the
+    backend mid-session and reloading.
+  - The equity chart's buy-and-hold **benchmark series is honestly absent
+    from the live path** — the backend doesn't persist one (the CT
+    orchestrator only replays the incumbent, never a baseline policy,
+    during evaluation) — rather than faked client-side. Only the clearly-
+    labelled mock data shows the full two-series comparison.
+  - The "Cycle history" card is labelled "Training runs, last N days", not
+    "Retrains this quarter" — `model_run` has no field distinguishing an
+    autonomous `CTOrchestrator` retrain from a manual
+    `scripts/train_agent.py` sweep, so the honest label is the one that
+    matches what `MarketRepository.get_cycle_stats` actually counts.
+  - This surfaced a real gap the backend needed anyway: **a rejected
+    candidate was never being logged at all.** `CTOrchestrator._retrain_and_maybe_promote`
+    only called `registry.log_run()` inside the "candidate won" branch — a
+    candidate that lost the FR-17 acceptance gate left zero record of
+    having been trained. Fixed: every candidate is now logged
+    (`status="REJECTED"` when not promoted), which is what makes "how many
+    candidates were held back" an answerable, queryable question instead
+    of always reading zero. `MarketRepository.list_decisions()` was also
+    extended to join through to `model_run` for `run_id` and both
+    partition boundaries, so NFR-07's traceability chain (decision →
+    version → run → training partition → eval partition) is something the
+    decision-detail sheet can actually *show*, not just something the
+    schema makes possible.
+  - Verified by actually running it: backend seeded with a trained+promoted
+    model, frontend driven with Playwright (`chromium-cli` wasn't available
+    in this environment), screenshotted in both light and dark mode,
+    decision-detail sheet opened and closed (including the fail-safe
+    example row), "Force Check" clicked, and the mock fallback exercised by
+    killing the backend mid-session — `console --errors` clean throughout
+    every pass. The earlier version's Playwright run is what caught the
+    `load_partition` empty-frame bug documented in §7; that fix carried
+    over unchanged into this rebuild.
+- NFR-01/02/04 established by measurement (§9); NFR-09 explicitly left
+  unmeasured (would require the dashboard actually running for hours).
 
-**4. Sprint 3 — training and registry.**
-- `src/rlops/agent.py` — PPO wrapper over Stable Baselines3
-- `src/rlops/registry.py` — MLflow run logging (FR-08) and artifact
-  registration (FR-09)
-- Walk-forward cross-validation across regimes, not a single split
-- Seed sweep with aggregated statistics
-- Persist each run to `model_run` with its exact partition boundaries (DR-08)
-
-**5. Sprint 4 — serving and the CT loop.**
-- `src/serving/schemas.py` — Pydantic models (IR-05, NFR-08)
-- `src/serving/inference.py` — action mapping (FR-11), **fail-safe before
-  inference** (FR-12), hot reload (FR-16)
-- `src/serving/api.py` — FastAPI `/predict` (FR-10)
-- `src/orchestration/ct_orchestrator.py` — drift trigger (FR-14),
-  non-blocking retrain (FR-15), **candidate acceptance gate (FR-17)**
-- React dashboard (FR-18 – FR-20)
-- Establish the NFR-01/02/04/09 thresholds by measurement
-
-A note for Sprint 4: NFR-01 scopes the system to single-user local operation,
-and there is currently **no authentication**. Nothing is mutable over HTTP —
-thresholds are environment-driven — so the exposed surface is read telemetry
-and `/predict`. A single bearer token on the endpoints is proportionate; a
-users table is out of scope and would expand the proposal without serving any
-research objective. Multi-user access control belongs in Future Work.
+A note for Sprint 4 (from before this was built, still accurate): NFR-01
+scopes the system to single-user local operation, and there is **no user
+table** — a single optional bearer token (`SERVING.bearer_token`, off by
+default) guards the endpoints that matter, which is what got built.
 
 ---
 
@@ -567,6 +1691,60 @@ research objective. Multi-user access control belongs in Future Work.
   mitigation is procedural, not technical: verify a claim about *this*
   checkout's state (file existence, test counts, "measured" numbers) by
   reading the checkout, before building on it or repeating it in Chapter 5.
+- **`mlruns.db` lost its pre-existing run history to a schema migration —
+  root cause not fully diagnosed (2026-09-17).** Restarting the backend
+  after the `resolve_mlflow_tracking_uri()` fix (§7) — the first time that
+  fix's `mlflow.set_tracking_uri()` call ran against the real, long-lived
+  `mlruns.db` rather than a test fixture — triggered a schema
+  upgrade/migration. Afterward the file had a much larger table set (many
+  tables — `webhooks`, `guardrails`, `review_queues`, `mcp_servers` — that
+  weren't there before) and the `runs` table was empty: all 92 real
+  training runs' MLflow-side metadata (params/metrics logged during
+  training) was gone. **What was not lost:** Postgres's `model_run` /
+  `model_version` tables (DR-08/NFR-07's actual source of truth — partition
+  boundaries, hyperparameters, promotion history — all 92/19 rows intact)
+  and the real trained artifact files on disk under `mlruns/1/<run_id>/`
+  (confirmed present, unchanged). The then-active version's `model_version`
+  row was pointed directly at its `model.zip`'s real filesystem path
+  instead of the `runs:/<id>/model` indirection, which let
+  `InferenceService` load it without needing MLflow's run registry to
+  resolve anything — a pragmatic patch for that one row, not a fix to
+  whatever caused the migration. Runs logged *after* this event (e.g.
+  version `bf65de93`, promoted the same session) register and resolve
+  normally through the standard `runs:/` mechanism, so this looks like a
+  one-time transition cost, not an ongoing fragility — but that's an
+  observation, not a diagnosis, and no root cause was confirmed. If this
+  ever recurs, check `mlruns.db`'s row count and `alembic_version` before
+  assuming a restart is safe, and don't assume the direct-path workaround
+  generalizes to new runs — it doesn't need to, since new runs weren't
+  affected.
+- **A ~4.5-month real data gap existed (2025-12-30 → 2026-05-20) because
+  scheduled ingestion had never actually run before this session's
+  ingestion-scheduler fix landed.** The original backfill stopped at
+  `DATA.eval_end` (2025-12-31, §6), and nothing pulled anything newer until
+  the new scheduler's first tick — which only covers its own trailing
+  window (120 days by default), not arbitrary historical gaps. Closed with
+  an explicit `scripts/run_ingestion.py --start 2025-09-01 --end
+  2026-09-16` (wide enough before the gap for SMA_20/RSI_14 warm-up, per
+  the same reasoning as `DEFAULT_TRAILING_WINDOW_DAYS`). Worth remembering:
+  the scheduler is correct for steady-state (a process that's been running
+  continuously), but a gap larger than its trailing window needs an
+  explicit backfill, not just letting the scheduler catch up on its own —
+  it won't.
+- **Ports 8000/8001 are not this project's alone on this machine.** The
+  user has a separate, unrelated project (`~/Documents/whats app
+  automation`, a WhatsApp automation tool with its own FastAPI apps) whose
+  dev servers also default to 8000 and 8001. When both are running, the OS
+  can route new connections to whichever bound most specifically/recently
+  rather than to this project's `uvicorn`, so `curl localhost:8000` can
+  silently return the *other* project's app instead of an error — no crash,
+  no obvious sign anything is wrong, just the wrong response body. Found
+  2026-09-20 when the dashboard loaded an entirely unrelated site. This
+  project's backend now defaults to port **8010** in this checkout's
+  running instance to avoid the collision; if starting it fresh, check
+  `lsof -iTCP:8000 -sTCP:LISTEN` first rather than assuming the port is
+  free, and pass `VITE_API_BASE` to the frontend to match whatever port the
+  backend actually used.
 
 ---
 
