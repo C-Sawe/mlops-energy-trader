@@ -107,68 +107,54 @@ Dependencies flow one way only — orchestration toward data and model concerns 
 mlops-energy-trader/
 │
 ├── README.md
-├── requirements.txt
-├── docker-compose.yml
+├── docker-compose.yml        # Local dev services (PostgreSQL & MLflow)
+├── pytest.ini                # Pytest root configuration
 ├── .env.example
 ├── .gitignore
 │
-├── docs/
-│   ├── proposal/
-│   │   └── Kipchirchir_169391_Proposal_Vikiru.pdf   # Approved proposal (June 2026)
-│   └── diagrams/
-│       ├── use_case_diagram.md
-│       ├── class_diagram.md
-│       ├── sequence_diagram.md
-│       ├── activity_diagram.md
-│       └── system_architecture_diagram.md
+├── backend/                  # Python MLOps Engine
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── constraints.txt
+│   ├── .importlinter
+│   ├── src/                  # Core application package
+│   │   ├── config.py         # Centralized configuration
+│   │   ├── dataops/          # Ingestion, technical indicators, models & repo
+│   │   ├── rlops/            # Gymnasium environment, PPO agent, baselines & registry
+│   │   ├── orchestration/    # CT loop, drift triggers, evaluation & ingestion scheduler
+│   │   ├── serving/          # FastAPI inference API, fail-safes & schemas
+│   │   └── execution/        # Alpaca broker integration
+│   ├── tests/                # Automated pytest suite (138 tests)
+│   └── scripts/              # CLI tools for ingestion, training & benchmarks
+│       ├── run_ingestion.py
+│       ├── run_baselines.py
+│       ├── train_agent.py
+│       ├── benchmark_device.py
+│       └── algorithm_comparison.py
 │
-├── scripts/
-│   ├── run_ingestion.py      # CLI runner for data ingestion pipeline
-│   ├── run_baselines.py      # CLI runner for the baseline policies (Sprint 2)
-│   ├── benchmark_device.py   # CPU vs MPS PPO throughput benchmark (Sprint 3)
-│   ├── finrl_crosscheck.py   # §8 validation experiment against FinRL (Sprint 3)
-│   └── train_agent.py        # Walk-forward PPO training + seed sweep (Sprint 3)
-│
-├── src/
-│   ├── config.py             # Database, risk, environment and serving settings
-│   ├── dataops/              # Sprint 1 — ETL pipeline (yfinance → PostgreSQL)
-│   │   ├── ingestion.py
-│   │   ├── processing.py     # + walk_forward_splits (Sprint 3)
-│   │   ├── models.py
-│   │   └── repository.py     # + decisions/snapshots/versions (Sprint 4)
-│   ├── rlops/                # Sprint 2 — MDP environment + baselines
-│   │   ├── environment.py
-│   │   ├── baselines.py
-│   │   ├── agent.py          # PPOAgent wrapper over SB3 (Sprint 3)
-│   │   └── registry.py       # MLflow logging + model_version registration (Sprint 3)
-│   ├── orchestration/
-│   │   ├── evaluator.py      # Sprint 2 — Sharpe, drawdown, deflated Sharpe
-│   │   └── ct_orchestrator.py  # Sprint 4 — drift trigger, non-blocking retrain, acceptance gate
-│   └── serving/               # Sprint 4 — inference gateway
-│       ├── schemas.py
-│       ├── inference.py      # fail-safe, action mapping, hot reload
-│       └── api.py            # FastAPI app: /predict /telemetry /decisions /ct-status
-│
-├── frontend/                  # Sprint 4 — React, plain CSS tokens, hand-drawn SVG charts
-│   ├── design-reference.html # Standalone no-build version of the same dashboard
+├── frontend/                 # React Telemetry Dashboard
+│   ├── Dockerfile
+│   ├── nginx.conf.template
+│   ├── package.json
 │   └── src/
-│       ├── App.jsx           # Composition + live-API-to-view-model adapters
-│       ├── api.js            # FastAPI client, IR-07 graceful degradation
-│       ├── mock.js           # Illustrative fallback data (visibly marked as such)
-│       ├── theme.css         # Apple HIG token system, light and dark
-│       └── components/       # Charts.jsx, Primitives.jsx (glass card, pill, spring sheet)
+│       ├── App.jsx           # Main dashboard & live-API adapter
+│       ├── api.js            # FastAPI client & graceful degradation
+│       ├── mock.js           # Resilience fallback data
+│       └── components/       # Charts, telemetry & UI cards
 │
-└── tests/                    # Unit + integration tests (backend only — see Testing note below)
-    ├── test_processing.py
-    ├── test_repository.py
-    ├── test_environment.py
-    ├── test_baselines.py
-    ├── test_evaluator.py
-    ├── test_agent.py
-    ├── test_registry.py
-    ├── test_inference.py
-    ├── test_ct_orchestrator.py
-    └── test_api.py
+├── deploy/                   # Cloud Infrastructure & Rollout
+│   ├── docker-compose.prod.yml
+│   └── Caddyfile
+│
+├── docs/                     # System Specifications & Diagrams
+│   ├── DEPLOYMENT.md
+│   ├── diagrams/
+│   └── proposal/
+│
+└── research/                 # Research Artifacts & Offline Experiments
+    ├── thesis/               # Chapter writeups & drafts
+    ├── results/              # Walk-forward split benchmarks & analysis
+    └── THESIS_HANDOFF.md
 ```
 
 ---
@@ -183,13 +169,13 @@ cd mlops-energy-trader
 
 python3 -m venv mlops-env
 source mlops-env/bin/activate          # Windows: mlops-env\Scripts\activate
-pip install -r requirements.txt
+pip install -r backend/requirements.txt -c backend/constraints.txt
 
 cp .env.example .env                   # edit credentials if needed
 docker compose up -d postgres          # spin up PostgreSQL container
 ```
 
-Benchmarked on an M5 (`scripts/benchmark_device.py`, CLAUDE.md §9): CPU beats MPS by ~12–13× for this policy network (14.7K parameters — small enough that CPU↔GPU transfer overhead dominates any arithmetic MPS would accelerate). Use `device="cpu"` on the PPO model in Sprint 3, not `device="mps"`.
+Benchmarked on an M5 (`backend/scripts/benchmark_device.py`, CLAUDE.md §9): CPU beats MPS by ~12–13× for this policy network (14.7K parameters — small enough that CPU↔GPU transfer overhead dominates any arithmetic MPS would accelerate). Use `device="cpu"` on the PPO model in Sprint 3, not `device="mps"`.
 
 ---
 
@@ -197,21 +183,21 @@ Benchmarked on an M5 (`scripts/benchmark_device.py`, CLAUDE.md §9): CPU beats M
 
 ```bash
 # Fetch, enrich and persist the configured universe
-python scripts/run_ingestion.py --start 2015-01-01 --end 2025-12-31
+python backend/scripts/run_ingestion.py --start 2015-01-01 --end 2025-12-31
 
 # Transform only, without writing to the database
-python scripts/run_ingestion.py --start 2024-01-01 --end 2024-03-01 --dry-run
+python backend/scripts/run_ingestion.py --start 2024-01-01 --end 2024-03-01 --dry-run
 
 # A single ticker
-python scripts/run_ingestion.py --tickers XOM --start 2024-01-01 --end 2024-06-01
+python backend/scripts/run_ingestion.py --tickers XOM --start 2024-01-01 --end 2024-06-01
 
 # Run the baseline policies over the evaluation partition (Sprint 2)
-python scripts/run_baselines.py
-python scripts/run_baselines.py --partition train --tickers XOM CVX
+python backend/scripts/run_baselines.py
+python backend/scripts/run_baselines.py --partition train --tickers XOM CVX
 
 # Walk-forward PPO training with a seed sweep, logged to MLflow (Sprint 3)
-python scripts/train_agent.py
-python scripts/train_agent.py --timesteps 50000 --seeds 5
+python backend/scripts/train_agent.py
+python backend/scripts/train_agent.py --timesteps 50000 --seeds 5
 ```
 
 ### Running the Dashboard (Sprint 4)
@@ -219,12 +205,13 @@ python scripts/train_agent.py --timesteps 50000 --seeds 5
 Backend (FastAPI):
 
 ```bash
+cd backend
 uvicorn src.serving.api:app --host 0.0.0.0 --port 8000
 ```
 
 Requires a populated database and at least one promoted `model_version` for
 `/predict` to do anything (otherwise it returns `503`) — run
-`scripts/run_ingestion.py` then `scripts/train_agent.py` first. The CT
+`backend/scripts/run_ingestion.py` then `backend/scripts/train_agent.py` first. The CT
 orchestrator's background scheduler (FR-13) runs automatically every
 `CT_EVALUATION_INTERVAL_SECONDS` (default 300); trigger one evaluation
 on demand instead of waiting via `POST /ct/evaluate`.
@@ -245,8 +232,11 @@ CLAUDE.md §12).
 ### Running Tests
 
 ```bash
-python -m pytest tests/ -v       # backend
-cd frontend && npm run lint      # frontend type-check (no test suite yet)
+# Backend pytest suite (138 tests, NFR-06 import contracts)
+python -m pytest
+
+# Frontend Vitest suite (47 tests)
+cd frontend && npm test
 ```
 
 The backend test suite uses deterministic synthetic data and (mostly)

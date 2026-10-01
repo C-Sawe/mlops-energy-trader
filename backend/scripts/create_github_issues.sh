@@ -4,9 +4,8 @@
 #
 # Prereqs: brew install gh && gh auth login
 # Usage:   scripts/create_github_issues.sh            # dry run: prints what it would file
-#          scripts/create_github_issues.sh --apply    # actually files them
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 apply=false
 [[ "${1:-}" == "--apply" ]] && apply=true
