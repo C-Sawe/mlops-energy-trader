@@ -208,13 +208,25 @@ def test_ct_evaluate_accepts_an_as_of_override(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", db_url)
     _promote_model(db_url, tmp_path, as_of)
 
+    import src.serving.api as api
+
     with TestClient(app) as client:
+        # The tiny incumbent's replayed Sharpe is usually below target, so
+        # this fires a real background retrain (FR-14). Keep it tiny and join
+        # it before the test ends: a daemon thread still inside torch at
+        # interpreter exit aborts the process ("terminate called without an
+        # active exception", exit 134 on Linux CI) after every test passed.
+        api.orchestrator.retrain_timesteps = 128
+        api.orchestrator.retrain_n_steps = 64
         resp = client.post("/ct/evaluate", params={"as_of": str(as_of)})
         assert resp.status_code == 200
         # as_of matches the seeded data's own range, so this must actually
         # evaluate (not silently no-op) — status settles back to SERVING
         # either way, but last_evaluated_at only moves if real work happened.
         assert client.get("/ct-status").json()["last_evaluated_at"] is not None
+        if api.orchestrator._retrain_thread is not None:
+            api.orchestrator._retrain_thread.join(timeout=60)
+            assert not api.orchestrator._retrain_thread.is_alive()
 
 
 # --------------------------------------------------------------- auth
