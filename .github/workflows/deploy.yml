@@ -44,7 +44,7 @@ jobs:
       matrix:
         include:
           - component: backend
-            context: .
+            context: backend
           - component: frontend
             context: frontend
     steps:
