@@ -27,7 +27,10 @@ services:
       retries: 10
 
   backend:
-    image: ${IMAGE_PREFIX:?set IMAGE_PREFIX}-backend:${IMAGE_TAG:-latest}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ${IMAGE_PREFIX:-mlops}-backend:${IMAGE_TAG:-latest}
     # NFR-04: a crashed process comes back on its own; state is in Postgres
     # and the mlruns volume, so nothing is lost across the restart.
     restart: unless-stopped
@@ -50,7 +53,10 @@ services:
       - mlruns:/app/mlruns
 
   frontend:
-    image: ${IMAGE_PREFIX}-frontend:${IMAGE_TAG:-latest}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: ${IMAGE_PREFIX:-mlops}-frontend:${IMAGE_TAG:-latest}
     restart: unless-stopped
     depends_on:
       - backend
