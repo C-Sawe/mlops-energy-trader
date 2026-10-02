@@ -13,23 +13,27 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.config import RISK, SERVING
+from src.config import DATA, PAPER, RISK, SERVING
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator
+from src.execution.alpaca_broker import AlpacaBroker, BrokerError
 from src.orchestration.ingestion_scheduler import DEFAULT_TRAILING_WINDOW_DAYS, IngestionState
+from src.orchestration.paper_trader import PaperTrader, next_run_at
 from src.rlops.registry import ModelRegistry
 from src.serving.inference import InferenceService, NoActiveModelError
 from src.serving.schemas import (
+    CandlesResponse,
     CTStatusResponse,
     DecisionLogEntry,
     DecisionLogResponse,
     EquityPoint,
     HealthResponse,
+    PaperStatusResponse,
     PredictRequest,
     PredictResponse,
     TelemetryResponse,
@@ -55,8 +59,13 @@ service: InferenceService
 registry: ModelRegistry
 orchestrator: CTOrchestrator
 ingestion: IngestionState
+paper: PaperTrader
 _scheduler_task: asyncio.Task | None = None
 _ingestion_task: asyncio.Task | None = None
+_paper_tasks: list[asyncio.Task] = []
+# Overridable so tests can substitute a broker over httpx.MockTransport —
+# nothing in the test suite reaches Alpaca (CLAUDE.md §11).
+_broker_factory = AlpacaBroker
 
 
 async def _run_scheduler() -> None:
@@ -84,20 +93,74 @@ async def _run_ingestion_scheduler() -> None:
             logging.getLogger(__name__).exception("scheduled ingestion tick failed")
 
 
+def _paper_cycle_job() -> str:
+    """Ingest today's bar first, so the cycle decides on the close that
+    just happened rather than on whatever the interval-based ingestion
+    scheduler last fetched. An ingestion failure is logged, not fatal: the
+    cycle's own "no bar for today" check then skips trading."""
+    try:
+        ingestion.run(repo)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("paper cycle: pre-trade ingestion failed")
+    broker = _broker_factory()
+    try:
+        return paper.run_cycle(broker)
+    finally:
+        broker.close()
+
+
+def _paper_sync_job() -> None:
+    broker = _broker_factory()
+    try:
+        paper.sync(broker)
+    finally:
+        broker.close()
+
+
+async def _run_paper_scheduler() -> None:
+    while True:
+        now = datetime.now(timezone.utc)
+        await asyncio.sleep((next_run_at(now, PAPER.run_time_utc) - now).total_seconds())
+        try:
+            outcome = await asyncio.to_thread(_paper_cycle_job)
+            logging.getLogger(__name__).info("paper cycle: %s", outcome)
+        except Exception:  # noqa: BLE001 - the scheduler must survive a bad tick
+            logging.getLogger(__name__).exception("scheduled paper cycle failed")
+
+
+async def _run_paper_sync() -> None:
+    while True:
+        await asyncio.sleep(PAPER.sync_interval_seconds)
+        try:
+            await asyncio.to_thread(_paper_sync_job)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("paper account sync failed")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global repo, service, registry, orchestrator, ingestion, _scheduler_task, _ingestion_task
+    global repo, service, registry, orchestrator, ingestion, paper
+    global _scheduler_task, _ingestion_task, _paper_tasks
     repo = MarketRepository()
     repo.create_schema()
     service = InferenceService(repo=repo)
     registry = ModelRegistry(repo=repo)
     orchestrator = CTOrchestrator(service, repo=repo, registry=registry)
     ingestion = IngestionState()
+    paper = PaperTrader(service, repo)
     _scheduler_task = asyncio.create_task(_run_scheduler())
     _ingestion_task = asyncio.create_task(_run_ingestion_scheduler())
+    _paper_tasks = []
+    if PAPER.enabled:
+        _paper_tasks = [
+            asyncio.create_task(_run_paper_scheduler()),
+            asyncio.create_task(_run_paper_sync()),
+        ]
     yield
     _scheduler_task.cancel()
     _ingestion_task.cancel()
+    for task in _paper_tasks:
+        task.cancel()
 
 
 app = FastAPI(title="MLOps Trading Inference API", lifespan=lifespan)
@@ -259,3 +322,81 @@ def trigger_ingestion(
     """
     ingestion.run(repo, window_days=window_days, end=end)
     return ct_status()
+
+
+@app.get("/market/candles", response_model=CandlesResponse, dependencies=[Depends(_verify_token)])
+def candles(
+    ticker: str = Query(...),
+    days: int = Query(default=120, ge=5, le=1500),
+) -> CandlesResponse:
+    """Daily OHLC for the dashboard's candlestick chart, ending at the
+    latest ingested date (not `date.today()` — the same anchoring
+    reasoning as `/ct/evaluate`'s `as_of`)."""
+    if ticker not in DATA.tickers:
+        raise HTTPException(status_code=422, detail=f"ticker must be one of {list(DATA.tickers)}")
+    ingest = repo.latest_ingest_info()
+    end = ingest["date"] if ingest else date.today()
+    return CandlesResponse(
+        ticker=ticker, candles=repo.load_candles(ticker, end - timedelta(days=days), end)
+    )
+
+
+PAPER_HISTORY_DAYS = 365
+
+
+@app.get("/paper/status", response_model=PaperStatusResponse, dependencies=[Depends(_verify_token)])
+def paper_status() -> PaperStatusResponse:
+    """The forward paper account as last synced — read from the database,
+    never from Alpaca directly, so the dashboard's polling never waits on
+    a third-party API."""
+    # One row per day, so the whole forward equity curve is small enough
+    # to return in full; only fills are windowed.
+    history = repo.list_paper_account()
+    since = date.today() - timedelta(days=PAPER_HISTORY_DAYS)
+    latest = history[-1] if history else None
+    cycle = repo.latest_paper_cycle()
+    return PaperStatusResponse(
+        enabled=PAPER.enabled,
+        status=paper.status.value,
+        next_run_at=next_run_at(datetime.now(timezone.utc), PAPER.run_time_utc) if PAPER.enabled else None,
+        last_run_at=paper.last_run_at,
+        last_outcome=paper.last_outcome,
+        last_signal_date=cycle["signal_date"] if cycle else None,
+        last_cycle_failsafe=cycle["failsafe_triggered"] if cycle else None,
+        equity=latest["equity"] if latest else None,
+        cash=latest["cash"] if latest else None,
+        synced_at=latest["synced_at"] if latest else None,
+        positions=latest["positions"] if latest else [],
+        equity_curve=[{"date": h["date"], "equity": h["equity"]} for h in history],
+        fills=repo.list_paper_fills(since),
+    )
+
+
+def _require_paper_enabled() -> None:
+    if not PAPER.enabled:
+        raise HTTPException(status_code=409, detail="paper trading is disabled (PAPER_TRADING_ENABLED)")
+
+
+@app.post("/paper/run", response_model=PaperStatusResponse, dependencies=[Depends(_verify_token)])
+def trigger_paper_cycle() -> PaperStatusResponse:
+    """On-demand counterpart to the daily paper scheduler. Still bound by
+    the same guards — it only trades if today's bar exists and today has
+    not already traded — so pressing it twice cannot double-trade."""
+    _require_paper_enabled()
+    try:
+        _paper_cycle_job()
+    except BrokerError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except NoActiveModelError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return paper_status()
+
+
+@app.post("/paper/sync", response_model=PaperStatusResponse, dependencies=[Depends(_verify_token)])
+def trigger_paper_sync() -> PaperStatusResponse:
+    _require_paper_enabled()
+    try:
+        _paper_sync_job()
+    except BrokerError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return paper_status()

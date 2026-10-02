@@ -180,3 +180,54 @@ describe("fmtShortDate", () => {
     expect(fmtShortDate(new Date("2026-09-18T00:00:00Z"))).toMatch(/18/);
   });
 });
+
+import { adaptCandles, adaptPaper } from "./App.jsx";
+
+describe("adaptCandles", () => {
+  it("keeps dates as ISO strings and maps is_imputed", () => {
+    const out = adaptCandles({
+      ticker: "XOM",
+      candles: [{ date: "2026-10-01", open: 1, high: 2, low: 0.5, close: 1.5, is_imputed: true }],
+    });
+    expect(out).toEqual([{ date: "2026-10-01", open: 1, high: 2, low: 0.5, close: 1.5, imputed: true }]);
+  });
+});
+
+describe("adaptPaper", () => {
+  const raw = {
+    enabled: true, status: "IDLE", next_run_at: "2026-10-02T22:00:00Z",
+    last_run_at: null, last_outcome: "traded 2 orders", last_signal_date: "2026-10-01",
+    last_cycle_failsafe: false, equity: 101000, cash: 40000, synced_at: null,
+    positions: [{
+      ticker: "XOM", qty: 300.5, avg_entry_price: 99.83, current_price: 101.2,
+      market_value: 30410.6, unrealized_pl: 411.7, unrealized_plpc: 0.0137,
+    }],
+    equity_curve: [{ date: "2026-09-30", equity: 100000 }, { date: "2026-10-01", equity: 101000 }],
+    fills: [{
+      order_id: "o1", ticker: "XOM", side: "buy", signal_date: "2026-09-30", decision_id: "d1",
+      filled_qty: 300.5, filled_avg_price: 99.83, filled_at: "2026-10-01T13:30:01+00:00",
+    }],
+  };
+
+  it("converts Alpaca's fractional P&L to percent and keeps entry prices", () => {
+    const p = adaptPaper(raw);
+    expect(p.positions[0].plPct).toBeCloseTo(1.37);
+    expect(p.positions[0].avgEntry).toBe(99.83);
+  });
+
+  it("uses the first synced equity as the P&L baseline", () => {
+    expect(adaptPaper(raw).startEquity).toBe(100000);
+  });
+
+  it("dates a fill by its calendar day for chart placement", () => {
+    expect(adaptPaper(raw).fills[0]).toEqual({
+      ticker: "XOM", side: "buy", price: 99.83, qty: 300.5, date: "2026-10-01",
+    });
+  });
+
+  it("tolerates a disabled account with no history at all", () => {
+    const p = adaptPaper({ enabled: false, positions: [], equity_curve: [], fills: [] });
+    expect(p.startEquity).toBeNull();
+    expect(p.positions).toEqual([]);
+  });
+});

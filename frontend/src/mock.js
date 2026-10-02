@@ -89,3 +89,64 @@ export const metrics = {
   promoted: 2,
   heldBack: 1,
 };
+
+// ------------------------------------------------------------ paper trading
+// Example candles and a paper account, same "generated, labelled" rule as
+// everything above — never shown once the backend answers.
+const BASE_PRICE = { XOM: 112, CVX: 154, SHEL: 68, BP: 34, NEE: 72 };
+
+export function candles(ticker) {
+  const r = ((s) => () => (s = (s * 16807) % 2147483647) / 2147483647)(
+    7 + ticker.charCodeAt(0) * 31 + ticker.length
+  );
+  const out = [];
+  let close = BASE_PRICE[ticker] ?? 100;
+  const d = new Date(Date.UTC(2026, 5, 1));
+  while (out.length < 84) {
+    d.setUTCDate(d.getUTCDate() + 1);
+    if (d.getUTCDay() === 0 || d.getUTCDay() === 6) continue;
+    const open = close * (1 + (r() - 0.5) * 0.012);
+    close = open * (1 + (r() - 0.48) * 0.024);
+    const high = Math.max(open, close) * (1 + r() * 0.008);
+    const low = Math.min(open, close) * (1 - r() * 0.008);
+    out.push({ date: d.toISOString().slice(0, 10), open, high, low, close, imputed: false });
+  }
+  return out;
+}
+
+export function paperFor(ticker) {
+  const c = candles(ticker);
+  const buyAt = c[30];
+  const addAt = c[52];
+  const fills = [
+    { side: "buy", date: buyAt.date, price: buyAt.open, qty: 120 },
+    { side: "buy", date: addAt.date, price: addAt.open, qty: 60 },
+  ];
+  const entry = (buyAt.open * 120 + addAt.open * 60) / 180;
+  return { fills, entryPrice: entry, lastPrice: c[c.length - 1].close };
+}
+
+export const paper = {
+  enabled: true,
+  equity: 101_284.6,
+  startEquity: 100_000,
+  cash: 38_412.1,
+  lastOutcome: "traded 3 orders",
+  lastSignalDate: "2026-09-25",
+  nextRunAt: "2026-09-28T22:00:00Z",
+  // Same calendar as the example candles, starting from the account's
+  // first sync at $100k, so the curve agrees with the P&L figure above it.
+  dates: candles("XOM").slice(30).map((c) => new Date(c.date)),
+  equityCurve: (() => {
+    const n = candles("XOM").length - 30;
+    return Array.from({ length: n }, (_, i) =>
+      100_000 + (1_284.6 * i) / (n - 1) + (i && i < n - 1 ? Math.sin(i * 0.9) * 260 : 0));
+  })(),
+  positions: ["XOM", "CVX", "NEE"].map((t) => {
+    const p = paperFor(t);
+    return {
+      ticker: t, qty: 180, avgEntry: p.entryPrice, current: p.lastPrice,
+      marketValue: 180 * p.lastPrice, plPct: (p.lastPrice / p.entryPrice - 1) * 100,
+    };
+  }),
+};

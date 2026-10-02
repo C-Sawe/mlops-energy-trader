@@ -163,8 +163,11 @@ class InferenceService:
         # steady-state one: once any version has been promoted, this branch
         # never applies again for the life of the deployment.
         for decision in decisions:
+            decision["decision_id"] = None
             if version_id is not None:
-                self.repo.record_decision(
+                # Returned so an executed order can point back at the exact
+                # decision row that caused it (I6 extended to the broker).
+                decision["decision_id"] = self.repo.record_decision(
                     version_id,
                     decision["ticker"],
                     decision["raw_weight"],

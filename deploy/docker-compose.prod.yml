@@ -49,6 +49,13 @@ services:
       SHARPE_EVALUATION_WINDOW: ${SHARPE_EVALUATION_WINDOW:-30}
       CT_EVALUATION_INTERVAL_SECONDS: ${CT_EVALUATION_INTERVAL_SECONDS:-300}
       INGESTION_INTERVAL_SECONDS: ${INGESTION_INTERVAL_SECONDS:-86400}
+      # Forward paper trading (Alpaca *paper* endpoint only; there is no
+      # live-trading URL anywhere in the code). Off unless explicitly set.
+      PAPER_TRADING_ENABLED: ${PAPER_TRADING_ENABLED:-false}
+      PAPER_TRADE_TIME_UTC: ${PAPER_TRADE_TIME_UTC:-22:00}
+      PAPER_SYNC_INTERVAL_SECONDS: ${PAPER_SYNC_INTERVAL_SECONDS:-900}
+      ALPACA_API_KEY: ${ALPACA_API_KEY:-}
+      ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY:-}
     volumes:
       - mlruns:/app/mlruns
 
