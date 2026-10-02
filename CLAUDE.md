@@ -92,8 +92,8 @@ These are not code tasks, but they are open and they cost marks:
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 138 passing — keep it that way (backend)
-cd frontend && npm test        # 47 passing — Vitest + React Testing Library, added 2026-09-20
+python -m pytest tests/ -q     # 161 passing — keep it that way (backend)
+cd frontend && npm test        # 59 passing — Vitest + React Testing Library, added 2026-09-20
 ```
 
 Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
@@ -427,8 +427,10 @@ src/rlops/            environment · baselines                         [Sprint 2
 src/orchestration/    evaluator                                       [Sprint 2]
                       · ct_orchestrator                                [Sprint 4]
                       · ingestion_scheduler                            [Sprint 4, post-hoc]
+                      · paper_trader (daily forward paper cycle, §7)   [2026-10-02]
 src/serving/          schemas · inference · api                       [Sprint 4]
 src/execution/        alpaca_broker (paper trading only, §7 deviation) [post-Sprint 4]
+                      · rebalance (weights -> long-only orders, pure)  [2026-10-02]
 frontend/              React + hand-rolled SVG charts, no CSS framework [Sprint 4]
 scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
@@ -446,8 +448,8 @@ Dockerfile, frontend/Dockerfile, deploy/   cloud deployment (single VM, Compose 
 .github/workflows/     ci.yml (tests on push/PR) · deploy.yml (GHCR → SSH → VM); see docs/DEPLOYMENT.md
 .github/issue-drafts/  open backlog as issue drafts; scripts/create_github_issues.sh --apply files them
 constraints.txt        pinned tested versions (mlflow especially, §13) for Docker/CI
-tests/                138 tests (backend)
-frontend/src/*.test.jsx  47 tests (Vitest + React Testing Library, added 2026-09-20)
+tests/                161 tests (backend)
+frontend/src/*.test.jsx  59 tests (Vitest + React Testing Library, added 2026-09-20)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -832,6 +834,60 @@ returning none. This is real evidence for the two HTTP call shapes that
 matter (`submit_notional_order`, `close_position`) on a real venue, not
 just a mocked assertion — the deviation this section describes is now
 backed the same way §8's FinRL cross-check is.
+
+**Extended to a daily forward paper-trading cycle (2026-10-02) — the
+Chapter 5 deviation paragraph must cover this too, not just the one-off
+validation above.** The user asked whether the deployed system could track
+actual (paper) performance. Before this, nothing in the deployment traded:
+the dashboard's equity curve is the CT orchestrator *replaying* the
+incumbent over recent history (a rolling backtest), and `route_decision`
+was only ever called by the one-off script. Now
+`src/orchestration/paper_trader.py` (`PaperTrader`) runs once per weekday
+at `PAPER_TRADE_TIME_UTC` (default 22:00, after the close in both EDT and
+EST): ingest → `predict()` with the paper account's *real* current
+weights → orders → Alpaca paper. Orders queue for the next open, which is
+I2's timing on a real venue. A `sync()` every
+`PAPER_SYNC_INTERVAL_SECONDS` records equity, positions and fills.
+`/paper/status`, `/paper/run`, `/paper/sync` and `/market/candles` expose
+it; the dashboard has a candlestick chart with fill markers, average entry
+and current price, plus the forward paper equity curve. **Off by default**
+(`PAPER_TRADING_ENABLED`), so tests and local dev never reach Alpaca.
+
+Decisions worth knowing before changing any of it:
+- **Long-only, no leverage — a real gap from the simulator.**
+  `TradingEnvironment` accepts weights in [-1, 1], so negative weights are
+  shorts. Alpaca won't open shorts with notional/fractional orders, so
+  `src/execution/rebalance.py` clamps negatives to 0 (flat) and scales
+  positive targets summing above 1 back to 1 (the paper account has 4×
+  margin; it is not used). The paper account therefore cannot reproduce
+  any short exposure the policy learned. Report it as a Sim2Real gap
+  (§1), not as a bug. Like the environment, sells execute in full and
+  only buys are scaled back (§7's bisection note), and there is no fee
+  term because Alpaca charges no commission.
+- **Idempotent per signal date.** `paper_cycle.signal_date` is the primary
+  key, so a restart or a repeated `/paper/run` can't trade one close twice.
+  It also refuses to trade when the latest ingested bar isn't today's
+  (New York date), which skips holidays and yfinance lag without a
+  market calendar.
+- **I6 extended to the broker.** `predict()` now returns each decision's
+  `decision_id`, and `paper_order.decision_id` stores it. Every paper
+  order traces decision → version → run → partition.
+- **The job lives in `src/orchestration`, not `src/execution`.**
+  `.importlinter` forbids execution from importing serving, and the job
+  needs `InferenceService`. The pure sizing math is in `src/execution`.
+- **Candles are adjusted prices; fills are raw.** `market_observation`
+  stores split/dividend-adjusted OHLC (FR-02), and Alpaca fill prices are
+  unadjusted. Bars before a recent ex-dividend date sit ~1% below the
+  fill markers. This is cosmetic, but don't read the gap as slippage.
+
+Not yet run against the real Alpaca paper account on the deployed VM.
+Everything above is tested against a duck-typed fake broker and
+`httpx.MockTransport` (no network, §11). The first real cycle should be
+watched and its outcome recorded here, the same way the one-off
+validation above was. **Framing (§1):** weeks of paper P&L on five tickers
+carry no statistical weight. What this is evidence of is the loop running
+forward in time, unattended, out-of-sample by construction, against a real
+order API.
 
 **A second, unrelated bug surfaced by this validation:
 `InferenceService` could not survive being the first thing to touch

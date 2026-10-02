@@ -102,7 +102,7 @@ function EmptyChart({ label }) {
 }
 
 /* ------------------------------------------------------------ equity chart */
-export function EquityChart({ dates, agent, bench }) {
+export function EquityChart({ dates, agent, bench, label = "Agent" }) {
   const ref = useRef(null);
   const n = agent.length;
   const hasBench = Array.isArray(bench) && bench.length === n;
@@ -128,7 +128,7 @@ export function EquityChart({ dates, agent, bench }) {
         [agent, "var(--series-agent)", "Agent"],
         [bench, "var(--series-bench)", "Buy & hold"],
       ]
-    : [[agent, "var(--series-agent)", "Agent"]];
+    : [[agent, "var(--series-agent)", label]];
 
   return (
     <div className="chartbox" style={{ position: "relative" }}>
@@ -140,7 +140,7 @@ export function EquityChart({ dates, agent, bench }) {
         aria-label={
           hasBench
             ? "Portfolio equity: the agent against an equal-weight buy and hold benchmark."
-            : "Portfolio equity for the agent."
+            : `Portfolio equity: ${label}.`
         }
       >
         <defs>
@@ -231,7 +231,7 @@ export function EquityChart({ dates, agent, bench }) {
                 ["Agent", token("--series-agent"), fmtMoney(agent[idx])],
                 ["Buy & hold", token("--series-bench"), fmtMoney(bench[idx])],
               ]
-            : [["Agent", token("--series-agent"), fmtMoney(agent[idx])]]
+            : [[label, token("--series-agent"), fmtMoney(agent[idx])]]
         }
       />
     </div>
@@ -390,6 +390,239 @@ export function SharpeChart({ dates, values, threshold = 1.0 }) {
         date={idx === null ? cleanDates[0] : cleanDates[idx]}
         rows={idx === null ? [] : [["Sharpe", token("--series-agent"), cleanValues[idx].toFixed(2)]]}
       />
+    </div>
+  );
+}
+
+/* ------------------------------------------------------- candlestick chart */
+// Fills are placed by *date string* ("YYYY-MM-DD"), never by Date object
+// arithmetic — the same DST/timezone trap api.js's fetchTelemetry fell into
+// once. Exported for the same reason computeSharpeDomain is: it's the part
+// most likely to silently misplace a marker, so it's tested without SVG.
+
+/** Map each fill onto the candle for its trading date, or the next candle
+ * if that date has no bar. A fill after the last candle (it filled today,
+ * and today's bar is only ingested after the close) can't be placed yet —
+ * it's counted as `pending` rather than drawn at a made-up position. */
+export function placeFills(candles, fills) {
+  const placed = [];
+  let pending = 0;
+  for (const f of fills) {
+    if (f.price == null || !f.date) continue;
+    const index = candles.findIndex((c) => c.date >= f.date);
+    if (index === -1) pending += 1;
+    else placed.push({ index, side: f.side, price: f.price, qty: f.qty });
+  }
+  return { placed, pending };
+}
+
+/** Price axis covering every candle's range plus any reference price
+ * (average entry, last price) that must stay visible even if it sits
+ * outside the window's own high/low. */
+export function candleDomain(candles, refPrices = []) {
+  const refs = refPrices.filter((v) => v != null && Number.isFinite(v));
+  if (candles.length === 0 && refs.length === 0) return [0, 1];
+  const lows = candles.map((c) => c.low).concat(refs);
+  const highs = candles.map((c) => c.high).concat(refs);
+  const lo = Math.min(...lows);
+  const hi = Math.max(...highs);
+  const span = Math.max(hi - lo, Math.abs(hi) * 0.01, 0.01);
+  return [lo - span * 0.08, hi + span * 0.08];
+}
+
+const fmtPrice = (v) => "$" + v.toFixed(2);
+// Candle dates are calendar dates, not instants: format them in UTC so a
+// viewer west of Greenwich doesn't see every label one day early.
+const fmtDay = (iso) =>
+  new Date(iso + "T00:00:00Z").toLocaleDateString("en-GB", {
+    day: "numeric", month: "short", timeZone: "UTC",
+  });
+
+export function CandleChart({ ticker, candles, fills = [], entryPrice = null, lastPrice = null }) {
+  const ref = useRef(null);
+  const n = candles.length;
+  const box = { w: 760, h: 300 };
+  const pad = { l: 54, r: 96, t: 14, b: 26 };
+  const plotW = box.w - pad.l - pad.r;
+  const slot = plotW / Math.max(n, 1);
+
+  const [lo, hi] = useMemo(
+    () => candleDomain(candles, [entryPrice, lastPrice]),
+    [candles, entryPrice, lastPrice]
+  );
+  const y = (v) => pad.t + (1 - (v - lo) / (hi - lo)) * (box.h - pad.t - pad.b);
+  const cx = (i) => pad.l + slot * (i + 0.5);
+
+  const [idx, setIdx] = useState(null);
+  useEffect(() => {
+    const svg = ref.current;
+    if (!svg || n < 1) return;
+    const move = (ev) => {
+      const r = svg.getBoundingClientRect();
+      const px = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
+      const i = Math.floor(((px / r.width) * box.w - pad.l) / slot);
+      setIdx(i >= 0 && i < n ? i : null);
+    };
+    const out = () => setIdx(null);
+    svg.addEventListener("pointermove", move);
+    svg.addEventListener("pointerleave", out);
+    return () => {
+      svg.removeEventListener("pointermove", move);
+      svg.removeEventListener("pointerleave", out);
+    };
+  }, [n, slot, box.w, pad.l]);
+
+  const { placed, pending } = useMemo(() => placeFills(candles, fills), [candles, fills]);
+
+  if (n < 2) return <EmptyChart label={`price data for ${ticker}`} />;
+
+  const bodyW = Math.max(1.5, Math.min(slot * 0.64, 12));
+  const ticks = Array.from({ length: 5 }, (_, i) => lo + ((hi - lo) * i) / 4);
+  const xTicks = [0, Math.floor(n * 0.33), Math.floor(n * 0.66), n - 1];
+
+  // Right-gutter labels for the two reference lines; nudged apart if
+  // they'd overlap, so neither price is ever hidden under the other.
+  let entryY = entryPrice != null ? y(entryPrice) : null;
+  let lastY = lastPrice != null ? y(lastPrice) : null;
+  if (entryY != null && lastY != null && Math.abs(entryY - lastY) < 26) {
+    const mid = (entryY + lastY) / 2;
+    const up = entryY < lastY ? -13 : 13;
+    entryY = mid + up;
+    lastY = mid - up;
+  }
+  const pnlPct =
+    entryPrice != null && lastPrice != null ? (lastPrice / entryPrice - 1) * 100 : null;
+
+  const dayFills = idx === null ? [] : placed.filter((f) => f.index === idx);
+
+  return (
+    <div className="chartbox" style={{ position: "relative" }}>
+      <svg
+        ref={ref} className="chart" viewBox={`0 0 ${box.w} ${box.h}`} role="img"
+        aria-label={
+          `${ticker} daily candles` +
+          (entryPrice != null ? `, average entry ${fmtPrice(entryPrice)}` : "") +
+          (lastPrice != null ? `, last ${fmtPrice(lastPrice)}` : "") +
+          `, ${placed.length} filled orders marked.`
+        }
+      >
+        {ticks.map((v) => (
+          <g key={v}>
+            <line x1={pad.l} x2={box.w - pad.r} y1={y(v)} y2={y(v)}
+                  stroke="var(--grid)" strokeWidth="1" />
+            <text x={pad.l - 10} y={y(v) + 4} textAnchor="end"
+                  fontSize="11" fontWeight="500" fill="var(--ink-3)">
+              {v.toFixed(v >= 100 ? 0 : 1)}
+            </text>
+          </g>
+        ))}
+
+        {xTicks.map((i, k) => (
+          <text key={i} x={cx(i)} y={box.h - 6} fontSize="11" fontWeight="500"
+                fill="var(--ink-3)"
+                textAnchor={k === 0 ? "start" : k === xTicks.length - 1 ? "end" : "middle"}>
+            {fmtDay(candles[i].date)}
+          </text>
+        ))}
+
+        {/* Up candles hollow, down candles filled — direction is carried
+            by shape as well as colour. Imputed (forward-filled, DR-04)
+            bars are faded: they are not real trading. */}
+        {candles.map((c, i) => {
+          const up = c.close >= c.open;
+          const colour = up ? "var(--good)" : "var(--critical)";
+          const top = y(Math.max(c.open, c.close));
+          const h = Math.max(1, Math.abs(y(c.open) - y(c.close)));
+          return (
+            <g key={c.date} opacity={c.imputed ? 0.35 : 1}>
+              <line x1={cx(i)} x2={cx(i)} y1={y(c.high)} y2={y(c.low)}
+                    stroke={colour} strokeWidth="1.2" />
+              <rect x={cx(i) - bodyW / 2} y={top} width={bodyW} height={h}
+                    fill={up ? "var(--glass-strong)" : colour}
+                    stroke={colour} strokeWidth="1.2" rx="0.8" />
+            </g>
+          );
+        })}
+
+        {entryPrice != null && (
+          <g>
+            <line x1={pad.l} x2={box.w - pad.r} y1={y(entryPrice)} y2={y(entryPrice)}
+                  stroke="var(--accent)" strokeWidth="1.6" strokeDasharray="6 5" />
+            <text x={box.w - pad.r + 8} y={entryY - 2} fontSize="11" fontWeight="600"
+                  fill="var(--accent)">Avg entry</text>
+            <text x={box.w - pad.r + 8} y={entryY + 11} fontSize="12" fontWeight="600"
+                  fill="var(--ink)">{fmtPrice(entryPrice)}</text>
+          </g>
+        )}
+
+        {lastPrice != null && (
+          <g>
+            <line x1={pad.l} x2={box.w - pad.r} y1={y(lastPrice)} y2={y(lastPrice)}
+                  stroke="var(--ink-2)" strokeWidth="1" opacity="0.7" />
+            <text x={box.w - pad.r + 8} y={lastY - 2} fontSize="11" fontWeight="600"
+                  fill="var(--ink-2)">
+              Now{pnlPct != null ? ` ${pnlPct >= 0 ? "+" : "−"}${Math.abs(pnlPct).toFixed(1)}%` : ""}
+            </text>
+            <text x={box.w - pad.r + 8} y={lastY + 11} fontSize="12" fontWeight="600"
+                  fill="var(--ink)">{fmtPrice(lastPrice)}</text>
+          </g>
+        )}
+
+        {/* Fill markers at the actual fill price: ▲ buy, ▼ sell. Shape,
+            not just colour, carries the side. */}
+        {placed.map((f, k) => {
+          const buy = f.side === "buy";
+          const py = y(f.price);
+          const d = buy
+            ? `M ${cx(f.index)} ${py + 3} l -6 10 h 12 Z`
+            : `M ${cx(f.index)} ${py - 3} l -6 -10 h 12 Z`;
+          return (
+            <g key={k}>
+              <line x1={cx(f.index) - bodyW} x2={cx(f.index) + bodyW} y1={py} y2={py}
+                    stroke="var(--ink)" strokeWidth="1.5" />
+              <path d={d} fill={buy ? "var(--good)" : "var(--critical)"}
+                    stroke="var(--glass-strong)" strokeWidth="1.5" />
+            </g>
+          );
+        })}
+
+        {idx !== null && (
+          <line x1={cx(idx)} x2={cx(idx)} y1={pad.t} y2={box.h - pad.b}
+                stroke="var(--ink-3)" strokeWidth="1" strokeDasharray="3 3" opacity="0.55" />
+        )}
+      </svg>
+
+      {pending > 0 && (
+        <p className="chart-note">
+          {pending} fill{pending > 1 ? "s" : ""} from today will appear once today's bar is ingested after the close.
+        </p>
+      )}
+
+      {idx !== null && (
+        <div
+          className="tip on"
+          style={{
+            position: "absolute", top: 12, pointerEvents: "none",
+            left: ((cx(idx) - pad.l) / plotW) * 100 + "%",
+            transform: (cx(idx) - pad.l) / plotW > 0.66 ? "translateX(-108%)" : "translateX(14px)",
+          }}
+        >
+          <div className="tip-d">{fmtDay(candles[idx].date)}{candles[idx].imputed ? " · filled gap" : ""}</div>
+          {[["Open", candles[idx].open], ["High", candles[idx].high],
+            ["Low", candles[idx].low], ["Close", candles[idx].close]].map(([k, v]) => (
+            <div className="tip-row" key={k}>
+              <span className="tip-lab">{k}</span>
+              <span className="tip-val num">{fmtPrice(v)}</span>
+            </div>
+          ))}
+          {dayFills.map((f, k) => (
+            <div className="tip-row" key={"f" + k}>
+              <span className="tip-lab">{f.side === "buy" ? "▲ Bought" : "▼ Sold"}</span>
+              <span className="tip-val num">{fmtPrice(f.price)}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

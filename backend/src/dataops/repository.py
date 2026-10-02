@@ -25,6 +25,9 @@ from src.dataops.models import (
     MarketObservation,
     ModelRun,
     ModelVersion,
+    PaperAccountSnapshot,
+    PaperCycle,
+    PaperOrder,
     PortfolioSnapshot,
     TradingDecision,
 )
@@ -444,3 +447,165 @@ class MarketRepository:
                 "vix": float(row.vix) if row.vix is not None else None,
                 "ingested_at": row.ingested_at,
             }
+
+    # -------------------------------------------------------------- candles
+    def load_candles(self, ticker: str, start: date | str, end: date | str) -> list[dict]:
+        """Daily OHLC for one ticker, for the dashboard's candlestick chart.
+        These are the stored, split/dividend-adjusted prices (FR-02/DR-03),
+        so bars before a recent ex-dividend date sit slightly below the raw
+        prices a broker fill is quoted in."""
+        start = pd.Timestamp(start).date()
+        end = pd.Timestamp(end).date()
+        stmt = (
+            select(MarketObservation)
+            .where(
+                MarketObservation.ticker == ticker,
+                MarketObservation.observation_date >= start,
+                MarketObservation.observation_date <= end,
+            )
+            .order_by(MarketObservation.observation_date)
+        )
+        with self.session() as session:
+            return [
+                {
+                    "date": r.observation_date,
+                    "open": float(r.open_price),
+                    "high": float(r.high_price),
+                    "low": float(r.low_price),
+                    "close": float(r.close_price),
+                    "is_imputed": r.is_imputed,
+                }
+                for r in session.execute(stmt).scalars().all()
+            ]
+
+    # ------------------------------------------------------- paper trading
+    def has_paper_cycle(self, signal_date: date) -> bool:
+        with self.session() as session:
+            return session.get(PaperCycle, signal_date) is not None
+
+    def record_paper_cycle(
+        self,
+        signal_date: date,
+        version_id: str | None,
+        failsafe_triggered: bool,
+        orders: list[dict],
+        orders_failed: int,
+    ) -> None:
+        """One cycle and the orders it submitted, in a single transaction —
+        a cycle row without its orders (or the reverse) would misreport
+        what was actually sent to the broker."""
+        with self.session() as session:
+            with session.begin():
+                session.add(
+                    PaperCycle(
+                        signal_date=signal_date,
+                        version_id=version_id,
+                        failsafe_triggered=failsafe_triggered,
+                        orders_submitted=len(orders),
+                        orders_failed=orders_failed,
+                    )
+                )
+                session.flush()
+                for o in orders:
+                    session.add(PaperOrder(signal_date=signal_date, **o))
+
+    def latest_paper_cycle(self) -> dict | None:
+        stmt = select(PaperCycle).order_by(PaperCycle.signal_date.desc()).limit(1)
+        with self.session() as session:
+            c = session.execute(stmt).scalars().first()
+            if c is None:
+                return None
+            return {
+                "signal_date": c.signal_date,
+                "ran_at": c.ran_at,
+                "version_id": c.version_id,
+                "failsafe_triggered": c.failsafe_triggered,
+                "orders_submitted": c.orders_submitted,
+                "orders_failed": c.orders_failed,
+            }
+
+    def unfilled_paper_order_ids(self) -> list[str]:
+        """Orders still waiting on a terminal broker status."""
+        open_states = ("new", "accepted", "pending_new", "partially_filled", "held", "accepted_for_bidding")
+        stmt = select(PaperOrder.order_id).where(PaperOrder.status.in_(open_states))
+        with self.session() as session:
+            return list(session.execute(stmt).scalars().all())
+
+    def update_paper_order(
+        self,
+        order_id: str,
+        status: str,
+        filled_qty: float | None,
+        filled_avg_price: float | None,
+        filled_at: datetime | None,
+    ) -> None:
+        with self.session() as session:
+            with session.begin():
+                order = session.get(PaperOrder, order_id)
+                if order is None:
+                    return
+                order.status = status
+                order.filled_qty = filled_qty
+                order.filled_avg_price = filled_avg_price
+                order.filled_at = filled_at
+
+    def list_paper_fills(self, since: date | str, ticker: str | None = None) -> list[dict]:
+        """Filled paper orders — the entry/exit markers on the candlestick chart."""
+        stmt = select(PaperOrder).where(
+            PaperOrder.filled_at.is_not(None),
+            PaperOrder.signal_date >= pd.Timestamp(since).date(),
+        )
+        if ticker:
+            stmt = stmt.where(PaperOrder.ticker == ticker)
+        stmt = stmt.order_by(PaperOrder.filled_at)
+        with self.session() as session:
+            return [
+                {
+                    "order_id": o.order_id,
+                    "ticker": o.ticker,
+                    "side": o.side,
+                    "signal_date": o.signal_date,
+                    "decision_id": o.decision_id,
+                    "filled_qty": float(o.filled_qty) if o.filled_qty is not None else None,
+                    "filled_avg_price": float(o.filled_avg_price) if o.filled_avg_price is not None else None,
+                    "filled_at": o.filled_at,
+                }
+                for o in session.execute(stmt).scalars().all()
+            ]
+
+    def record_paper_account(
+        self, snapshot_date: date, equity: float, cash: float, positions: list[dict], synced_at: datetime
+    ) -> None:
+        """Idempotent per date, like `record_snapshot`: the last sync of a
+        day is that day's point on the forward equity curve."""
+        with self.session() as session:
+            with session.begin():
+                existing = session.get(PaperAccountSnapshot, snapshot_date)
+                if existing is None:
+                    session.add(
+                        PaperAccountSnapshot(
+                            snapshot_date=snapshot_date, equity=equity, cash=cash,
+                            positions=positions, synced_at=synced_at,
+                        )
+                    )
+                else:
+                    existing.equity = equity
+                    existing.cash = cash
+                    existing.positions = positions
+                    existing.synced_at = synced_at
+
+    def list_paper_account(self, start: date | str | None = None) -> list[dict]:
+        stmt = select(PaperAccountSnapshot).order_by(PaperAccountSnapshot.snapshot_date)
+        if start is not None:
+            stmt = stmt.where(PaperAccountSnapshot.snapshot_date >= pd.Timestamp(start).date())
+        with self.session() as session:
+            return [
+                {
+                    "date": r.snapshot_date,
+                    "equity": float(r.equity),
+                    "cash": float(r.cash),
+                    "positions": list(r.positions or []),
+                    "synced_at": r.synced_at,
+                }
+                for r in session.execute(stmt).scalars().all()
+            ]

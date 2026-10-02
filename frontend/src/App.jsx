@@ -14,11 +14,13 @@
  * so every field read here is null-guarded rather than assumed present.
  */
 import { useEffect, useState } from "react";
-import { EquityChart, SharpeChart, Gauge } from "./components/Charts.jsx";
+import { CandleChart, EquityChart, SharpeChart, Gauge } from "./components/Charts.jsx";
 import {
   GlassCard, CardHead, Pill, StatusStrip, Sheet, Button,
 } from "./components/Primitives.jsx";
-import { fetchStatus, fetchTelemetry, fetchDecisions, triggerEvaluation, poll } from "./api.js";
+import {
+  fetchCandles, fetchDecisions, fetchPaper, fetchStatus, fetchTelemetry, poll, triggerEvaluation,
+} from "./api.js";
 import * as mock from "./mock.js";
 
 export const actionClass = (a) =>
@@ -91,6 +93,56 @@ export function adaptMetrics(statusRaw, telemetryAdapted) {
   };
 }
 
+export const TICKERS = ["XOM", "CVX", "SHEL", "BP", "NEE"];
+
+const money = (v) =>
+  v == null ? "—" : "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const signedPct = (v) =>
+  v == null ? "—" : `${v >= 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}%`;
+
+/** /market/candles -> the chart's candle shape. Dates stay ISO strings
+ * ("YYYY-MM-DD"): fills are matched to candles by string, not Date. */
+export function adaptCandles(raw) {
+  return (raw.candles ?? []).map((c) => ({
+    date: c.date, open: c.open, high: c.high, low: c.low, close: c.close,
+    imputed: Boolean(c.is_imputed),
+  }));
+}
+
+/** /paper/status -> view model. Alpaca reports unrealized_plpc as a
+ * fraction (0.0123), the dashboard shows percent. A fill's chart date is
+ * its UTC calendar date — fills happen in US market hours, where the UTC
+ * and New York dates agree. */
+export function adaptPaper(raw) {
+  const curve = raw.equity_curve ?? [];
+  return {
+    enabled: raw.enabled,
+    equity: raw.equity,
+    cash: raw.cash,
+    startEquity: curve.length ? curve[0].equity : null,
+    lastOutcome: raw.last_outcome,
+    lastSignalDate: raw.last_signal_date,
+    nextRunAt: raw.next_run_at,
+    dates: curve.map((p) => new Date(p.date)),
+    equityCurve: curve.map((p) => p.equity),
+    positions: (raw.positions ?? []).map((p) => ({
+      ticker: p.ticker,
+      qty: p.qty,
+      avgEntry: p.avg_entry_price,
+      current: p.current_price,
+      marketValue: p.market_value,
+      plPct: p.unrealized_plpc != null ? p.unrealized_plpc * 100 : null,
+    })),
+    fills: (raw.fills ?? []).map((f) => ({
+      ticker: f.ticker,
+      side: f.side,
+      price: f.filled_avg_price,
+      qty: f.filled_qty,
+      date: f.filled_at ? f.filled_at.slice(0, 10) : null,
+    })),
+  };
+}
+
 export default function App() {
   const [live, setLive] = useState(null); // null until the backend answers
   const [stale, setStale] = useState(false);
@@ -98,6 +150,23 @@ export default function App() {
   const [page, setPage] = useState(1);
   const [checking, setChecking] = useState(false);
   const pageSize = 6;
+  const [ticker, setTicker] = useState("XOM");
+  const [paperLive, setPaperLive] = useState(null);
+  const [candlesLive, setCandlesLive] = useState(null);
+
+  // Polled separately from the main loop: a paper or candle failure (e.g.
+  // an older backend without these endpoints) must not mark the whole
+  // dashboard stale.
+  useEffect(
+    () => poll(fetchPaper, 60000, (r) => { if (r.ok) setPaperLive(adaptPaper(r.data)); }),
+    []
+  );
+  useEffect(() => {
+    setCandlesLive(null);
+    return poll(() => fetchCandles(ticker, 120), 60000, (r) => {
+      if (r.ok) setCandlesLive(adaptCandles(r.data));
+    });
+  }, [ticker]);
 
   // IR-07: when the backend is unreachable the page keeps rendering and says
   // so, rather than blanking. Until data has ever loaded, this is the mock.
@@ -141,6 +210,22 @@ export default function App() {
   const benchSeries = usingMock ? mock.bench : live.telemetry.bench;
   const sharpeSeries = live?.telemetry?.sharpe ?? mock.sharpe;
   const m = live ? adaptMetrics(live.statusRaw, live.telemetry) : mock.metrics;
+
+  const paperView = usingMock ? mock.paper : paperLive;
+  const candleView = usingMock ? mock.candles(ticker) : candlesLive;
+  const position = paperView?.positions.find((p) => p.ticker === ticker) ?? null;
+  const chartFills = usingMock
+    ? mock.paperFor(ticker).fills
+    : (paperView?.fills ?? []).filter((f) => f.ticker === ticker);
+  const entryPrice = usingMock ? mock.paperFor(ticker).entryPrice : position?.avgEntry ?? null;
+  const lastPrice = usingMock
+    ? mock.paperFor(ticker).lastPrice
+    : position?.current ?? (candleView?.length ? candleView[candleView.length - 1].close : null);
+  const paperPnl =
+    paperView?.equity != null && paperView?.startEquity
+      ? { abs: paperView.equity - paperView.startEquity,
+          pct: (paperView.equity / paperView.startEquity - 1) * 100 }
+      : null;
 
   const toggleTheme = () => {
     const root = document.documentElement;
@@ -286,6 +371,120 @@ export default function App() {
               <Pill tone="warn">{m.heldBack} held back</Pill>
             </div>
           </GlassCard>
+        </div>
+      </div>
+
+      <div className="panel" style={{ marginTop: 14 }}>
+        <div className="col">
+          <GlassCard>
+            <CardHead
+              title="Price & entries"
+              sub={
+                position
+                  ? `Holding ${Number(position.qty?.toFixed(3))} shares · ▲ buys ▼ sells at their fill price`
+                  : "Daily candles · ▲ buys ▼ sells at their fill price · not currently held"
+              }
+              right={
+                <div className="seg" role="group" aria-label="Ticker">
+                  {TICKERS.map((t) => (
+                    <button key={t} aria-pressed={t === ticker} onClick={() => setTicker(t)}>
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              }
+            />
+            {candleView
+              ? <CandleChart ticker={ticker} candles={candleView} fills={chartFills}
+                             entryPrice={entryPrice} lastPrice={lastPrice} />
+              : <div className="chart-empty">Loading {ticker}…</div>}
+          </GlassCard>
+
+          {paperView?.enabled && (
+            <GlassCard>
+              <CardHead
+                title="Paper account equity"
+                sub="Alpaca paper venue — simulated money, real order API, traded forward from each day's close"
+              />
+              <EquityChart dates={paperView.dates} agent={paperView.equityCurve} label="Paper" />
+            </GlassCard>
+          )}
+        </div>
+
+        <div className="col">
+          <GlassCard className="gauge-card">
+            <h2 className="card-title">Paper account</h2>
+            {!paperView ? (
+              <div className="gauge-meta" style={{ marginTop: 10 }}>Waiting for the backend…</div>
+            ) : !paperView.enabled ? (
+              <div className="gauge-meta" style={{ marginTop: 10 }}>
+                Paper trading is off on this deployment. It runs once each weekday after the
+                close when <span className="num">PAPER_TRADING_ENABLED=true</span> and Alpaca
+                paper keys are set.
+              </div>
+            ) : (
+              <>
+                <div className="gauge-read" style={{ marginTop: 10 }}>
+                  <div className="gauge-val num">{money(paperView.equity)}</div>
+                  <div className="gauge-meta">
+                    {paperPnl
+                      ? <span className={paperPnl.abs >= 0 ? "up" : "down"}>
+                          {paperPnl.abs >= 0 ? "+" : "−"}{money(Math.abs(paperPnl.abs))} ({signedPct(paperPnl.pct)})
+                        </span>
+                      : "No history yet"}
+                    {" "}since the first sync
+                  </div>
+                </div>
+                <div className="stats">
+                  <div><div className="stat-k">Cash</div><div className="stat-v num">{money(paperView.cash)}</div></div>
+                  <div><div className="stat-k">Last signal</div><div className="stat-v num">{paperView.lastSignalDate ?? "—"}</div></div>
+                  <div><div className="stat-k">Next run</div><div className="stat-v num">
+                    {paperView.nextRunAt ? fmtDateTime(new Date(paperView.nextRunAt)).slice(0, 16) : "—"}
+                  </div></div>
+                  <div><div className="stat-k">Last cycle</div><div className="stat-v" style={{ fontSize: 13 }}>
+                    {paperView.lastOutcome ?? "—"}
+                  </div></div>
+                </div>
+              </>
+            )}
+          </GlassCard>
+
+          {paperView?.enabled && (
+            <GlassCard>
+              <CardHead title="Open positions" sub="Average entry versus the last synced price" />
+              <div className="tablewrap">
+                <table className="pos-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Ticker</th>
+                      <th scope="col">Entry</th>
+                      <th scope="col">Now</th>
+                      <th scope="col">P&amp;L</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {paperView.positions.map((p) => (
+                      <tr key={p.ticker} onClick={() => setTicker(p.ticker)} style={{ cursor: "pointer" }}>
+                        <td className="tick">{p.ticker}</td>
+                        <td className="num">{money(p.avgEntry)}</td>
+                        <td className="num">{money(p.current)}</td>
+                        <td className={`num ${p.plPct == null ? "" : p.plPct >= 0 ? "up" : "down"}`}>
+                          {signedPct(p.plPct)}
+                        </td>
+                      </tr>
+                    ))}
+                    {paperView.positions.length === 0 && (
+                      <tr>
+                        <td colSpan={4} style={{ textAlign: "center", color: "var(--ink-3)", padding: "20px 12px" }}>
+                          Flat — no open positions.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </GlassCard>
+          )}
         </div>
       </div>
 

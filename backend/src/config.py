@@ -190,6 +190,40 @@ class ServingConfig:
         return os.environ.get("API_BEARER_TOKEN")
 
 
+@dataclass(frozen=True)
+class PaperTradingConfig:
+    """The daily forward paper-trading job (CLAUDE.md §7's Alpaca
+    deviation, extended from a one-off validation to a scheduled cycle).
+    Off by default: it needs Alpaca paper credentials, and the test suite
+    and local dev must never reach the network unasked.
+
+    Properties for the same reason as `ServingConfig.bearer_token`.
+    """
+
+    @property
+    def enabled(self) -> bool:
+        return os.environ.get("PAPER_TRADING_ENABLED", "false").lower() in ("1", "true", "yes")
+
+    @property
+    def run_time_utc(self) -> str:
+        """HH:MM, weekdays. 22:00 UTC is after the 16:00 ET close in both
+        EDT (20:00 UTC) and EST (21:00 UTC), with margin for yfinance to
+        publish the day's bar."""
+        return os.environ.get("PAPER_TRADE_TIME_UTC", "22:00")
+
+    @property
+    def sync_interval_seconds(self) -> int:
+        """How often account equity, positions and fills are refreshed
+        between daily cycles — orders queued after the close fill at the
+        next open, so fills only appear on a later sync."""
+        return int(os.environ.get("PAPER_SYNC_INTERVAL_SECONDS", "900"))
+
+    @property
+    def min_order_notional(self) -> float:
+        """Alpaca's minimum notional order is $1; smaller deltas are skipped."""
+        return float(os.environ.get("PAPER_MIN_ORDER_NOTIONAL", "1.0"))
+
+
 DATA = DataConfig()
 DATABASE = DatabaseConfig()
 INGESTION = IngestionConfig()
@@ -197,4 +231,5 @@ RISK = RiskConfig()
 ENVIRONMENT = EnvironmentConfig()
 BROKER = BrokerConfig()
 SERVING = ServingConfig()
+PAPER = PaperTradingConfig()
 ENVIRONMENT = EnvironmentConfig()

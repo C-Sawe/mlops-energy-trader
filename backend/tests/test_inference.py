@@ -129,6 +129,20 @@ def test_predict_returns_one_decision_per_ticker(tmp_path, monkeypatch):
     assert result["decided_at"] is not None
 
 
+def test_predict_returns_the_persisted_decision_id_for_each_decision(tmp_path, monkeypatch):
+    """I6 extended to the broker: the paper trader stores each order's
+    decision_id, so it must be the id of a row that actually exists."""
+    repo = _seed_repo_and_promote_model(
+        tmp_path, monkeypatch, final_vix=RISK.vix_critical_threshold - 10.0
+    )
+    result = InferenceService(repo=repo).predict(_flat_positions(), cash_weight=1.0)
+
+    logged, _ = repo.list_decisions(page=1, page_size=50)
+    logged_ids = {d["decision_id"] for d in logged}
+    returned_ids = {d["decision_id"] for d in result["decisions"]}
+    assert returned_ids == logged_ids and None not in returned_ids
+
+
 # --------------------------------------------------------------- FR-16
 def test_reload_picks_up_a_newly_promoted_version(tmp_path, monkeypatch):
     repo = _seed_repo_and_promote_model(

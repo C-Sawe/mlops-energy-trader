@@ -74,3 +74,58 @@ describe("SHARPE_OUTLIER_BOUND", () => {
     expect(SHARPE_OUTLIER_BOUND).toBeGreaterThan(14);
   });
 });
+
+import { candleDomain, placeFills } from "./Charts.jsx";
+
+const bars = [
+  { date: "2026-09-28", open: 10, high: 11, low: 9, close: 10.5 },
+  { date: "2026-09-29", open: 10.5, high: 12, low: 10, close: 11.5 },
+  // 2026-09-30 missing (no bar)
+  { date: "2026-10-01", open: 11.5, high: 12.5, low: 11, close: 12 },
+];
+
+describe("placeFills", () => {
+  it("places a fill on the candle for its own trading date", () => {
+    const { placed } = placeFills(bars, [{ side: "buy", date: "2026-09-29", price: 10.6 }]);
+    expect(placed).toEqual([{ index: 1, side: "buy", price: 10.6, qty: undefined }]);
+  });
+
+  it("moves a fill on a date with no bar to the next candle, not the previous one", () => {
+    const { placed } = placeFills(bars, [{ side: "sell", date: "2026-09-30", price: 11.8 }]);
+    expect(placed[0].index).toBe(2);
+  });
+
+  it("counts a fill after the last candle as pending instead of inventing a position", () => {
+    const { placed, pending } = placeFills(bars, [{ side: "buy", date: "2026-10-02", price: 12.1 }]);
+    expect(placed).toEqual([]);
+    expect(pending).toBe(1);
+  });
+
+  it("skips fills with no price or date (an order that hasn't filled yet)", () => {
+    const { placed, pending } = placeFills(bars, [
+      { side: "buy", date: null, price: 10 },
+      { side: "buy", date: "2026-09-28", price: null },
+    ]);
+    expect(placed).toEqual([]);
+    expect(pending).toBe(0);
+  });
+});
+
+describe("candleDomain", () => {
+  it("covers every candle's high and low with padding", () => {
+    const [lo, hi] = candleDomain(bars);
+    expect(lo).toBeLessThan(9);
+    expect(hi).toBeGreaterThan(12.5);
+  });
+
+  it("stretches to keep an entry price outside the window visible", () => {
+    const [lo] = candleDomain(bars, [7.5, null]);
+    expect(lo).toBeLessThan(7.5);
+  });
+
+  it("never returns a zero-height domain for a perfectly flat series", () => {
+    const flat = [{ date: "2026-09-28", open: 5, high: 5, low: 5, close: 5 }];
+    const [lo, hi] = candleDomain(flat);
+    expect(hi).toBeGreaterThan(lo);
+  });
+});

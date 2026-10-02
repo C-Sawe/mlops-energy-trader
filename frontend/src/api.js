@@ -108,6 +108,17 @@ export const fetchDecisions = (page = 1, pageSize = 6) =>
 export const predict = (positions, cashWeight) =>
   post("/predict", { positions, cash_weight: cashWeight });
 
+/** Daily OHLC for one ticker, ending at the latest ingested bar. */
+export const fetchCandles = (ticker, days = 120) =>
+  get(`/market/candles?ticker=${encodeURIComponent(ticker)}&days=${days}`);
+
+/**
+ * The forward paper account (Alpaca paper venue): equity curve, positions
+ * with entry prices, and filled orders. Read from the backend's database,
+ * never from Alpaca directly.
+ */
+export const fetchPaper = () => get("/paper/status");
+
 /** On-demand counterpart to the backend's scheduled CT evaluation (FR-13/14). */
 export const triggerEvaluation = () => post("/ct/evaluate");
 

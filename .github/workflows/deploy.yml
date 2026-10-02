@@ -130,6 +130,10 @@ jobs:
           SITE_ADDRESS: ${{ vars.SITE_ADDRESS }}
           CT_EVALUATION_INTERVAL_SECONDS: ${{ vars.CT_EVALUATION_INTERVAL_SECONDS }}
           INGESTION_INTERVAL_SECONDS: ${{ vars.INGESTION_INTERVAL_SECONDS }}
+          PAPER_TRADING_ENABLED: ${{ vars.PAPER_TRADING_ENABLED }}
+          PAPER_TRADE_TIME_UTC: ${{ vars.PAPER_TRADE_TIME_UTC }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
           umask 077
           {
@@ -142,6 +146,10 @@ jobs:
             [ -n "$SITE_ADDRESS" ] && echo "SITE_ADDRESS=${SITE_ADDRESS}"
             [ -n "$CT_EVALUATION_INTERVAL_SECONDS" ] && echo "CT_EVALUATION_INTERVAL_SECONDS=${CT_EVALUATION_INTERVAL_SECONDS}"
             [ -n "$INGESTION_INTERVAL_SECONDS" ] && echo "INGESTION_INTERVAL_SECONDS=${INGESTION_INTERVAL_SECONDS}"
+            [ -n "$PAPER_TRADING_ENABLED" ] && echo "PAPER_TRADING_ENABLED=${PAPER_TRADING_ENABLED}"
+            [ -n "$PAPER_TRADE_TIME_UTC" ] && echo "PAPER_TRADE_TIME_UTC=${PAPER_TRADE_TIME_UTC}"
+            [ -n "$ALPACA_API_KEY" ] && echo "ALPACA_API_KEY=${ALPACA_API_KEY}"
+            [ -n "$ALPACA_SECRET_KEY" ] && echo "ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}"
             true
           } > deploy.env
 
