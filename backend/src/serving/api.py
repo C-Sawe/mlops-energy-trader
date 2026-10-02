@@ -88,6 +88,7 @@ async def _run_ingestion_scheduler() -> None:
 async def lifespan(_app: FastAPI):
     global repo, service, registry, orchestrator, ingestion, _scheduler_task, _ingestion_task
     repo = MarketRepository()
+    repo.create_schema()
     service = InferenceService(repo=repo)
     registry = ModelRegistry(repo=repo)
     orchestrator = CTOrchestrator(service, repo=repo, registry=registry)
