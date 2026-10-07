@@ -18,3 +18,7 @@ frontend/.vite/
 
 research/thesis/*.docx
 research/thesis/*.pdf
+
+# Database/model backups written by deploy/backup.sh (#40); never commit them
+deploy/backups/
+backups/

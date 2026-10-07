@@ -96,7 +96,7 @@ describe("adaptTelemetry", () => {
     expect(telemetry.dates).toHaveLength(3);
     expect(telemetry.agent).toEqual([100000, 102140, 100941]);
     expect(telemetry.sharpe).toEqual([null, 30101.4, 4.79]);
-    expect(telemetry.bench).toBeNull(); // not persisted server-side (Charts.jsx's note)
+    expect(telemetry.bench).toBeNull(); // no point carries a benchmark_equity
     expect(telemetry.lastMaxDrawdown).toBe(0.0117);
   });
 
@@ -109,6 +109,27 @@ describe("adaptTelemetry", () => {
   it("handles a missing points key the same way as an empty array", () => {
     const telemetry = adaptTelemetry({});
     expect(telemetry.dates).toEqual([]);
+  });
+
+  it("maps the persisted buy-and-hold benchmark alongside the agent", () => {
+    const telemetry = adaptTelemetry({
+      points: [
+        { date: "2026-10-01", equity_value: 100000, benchmark_equity: 100000 },
+        { date: "2026-10-02", equity_value: 100800, benchmark_equity: 100350 },
+      ],
+    });
+    expect(telemetry.bench).toEqual([100000, 100350]);
+  });
+
+  it("keeps nulls where older snapshots predate the benchmark, rather than inventing values", () => {
+    const telemetry = adaptTelemetry({
+      points: [
+        { date: "2026-09-30", equity_value: 99500, benchmark_equity: null },
+        { date: "2026-10-01", equity_value: 100000 },
+        { date: "2026-10-02", equity_value: 100800, benchmark_equity: 100350 },
+      ],
+    });
+    expect(telemetry.bench).toEqual([null, null, 100350]);
   });
 });
 
@@ -163,6 +184,21 @@ describe("adaptMetrics", () => {
     expect(metrics.maxDrawdown).toBeCloseTo(-8.7, 5);
     expect(metrics.promoted).toBe(2);
     expect(metrics.heldBack).toBe(448);
+  });
+
+  it("reports autonomous CT retrains separately from all training runs", () => {
+    const metrics = adaptMetrics(
+      { training_runs: 12, autonomous_retrains: 5, autonomous_promoted: 1 },
+      { lastMaxDrawdown: null }
+    );
+    expect(metrics.trainingRuns).toBe(12);
+    expect(metrics.autonomous).toBe(5);
+    expect(metrics.autonomousPromoted).toBe(1);
+  });
+
+  it("leaves the autonomous count unknown for a backend that does not report it", () => {
+    const metrics = adaptMetrics({ training_runs: 12 }, { lastMaxDrawdown: null });
+    expect(metrics.autonomous).toBeNull();
   });
 
   it("null-guards when no snapshot has ever been recorded", () => {

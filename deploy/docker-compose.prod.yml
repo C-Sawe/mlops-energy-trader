@@ -8,7 +8,9 @@
 # Required in the host's .env (written by the deploy workflow from GitHub
 # secrets — NFR-10, never committed): IMAGE_PREFIX, IMAGE_TAG,
 # POSTGRES_PASSWORD, API_BEARER_TOKEN, BASIC_AUTH_USER, BASIC_AUTH_PASSWORD.
-# Optional: SITE_ADDRESS (a domain name enables automatic HTTPS).
+# Optional: SITE_ADDRESS (a domain name enables automatic HTTPS),
+# BACKUP_TIME_UTC, BACKUP_RETENTION_DAYS. BACKUP_UID is appended on the host
+# by the deploy workflow so backup files belong to the deploy user.
 
 services:
   postgres:
@@ -90,6 +92,32 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+
+  # Issue #40: daily backups of pgdata and mlruns into ./backups on the host,
+  # outside Docker's volumes, so `docker compose down -v` or a corrupted
+  # volume can't take the backups with it. Same image as `postgres`, so
+  # pg_dump matches the server's major version. Usage and restore steps:
+  # deploy/backup.sh and docs/DEPLOYMENT.md, "Backups".
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/usr/local/bin/backup.sh"]
+    command: ["loop"]
+    environment:
+      PGHOST: postgres
+      PGUSER: mlops
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: mlops_trading
+      BACKUP_TIME_UTC: ${BACKUP_TIME_UTC:-03:00}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_UID: ${BACKUP_UID:-0}
+    volumes:
+      - ./backup.sh:/usr/local/bin/backup.sh:ro
+      - ./backups:/backups
+      - mlruns:/mlruns
 
 volumes:
   pgdata:

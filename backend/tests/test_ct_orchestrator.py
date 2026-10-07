@@ -17,12 +17,15 @@ import time
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.config import DATA, RISK
 from src.dataops import processing as P
+from src.dataops.models import ModelRun
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator, CTStatus
 from src.rlops.agent import PPOAgent
+from src.rlops.baselines import buy_and_hold, run_policy
 from src.rlops.environment import TradingEnvironment
 from src.rlops.registry import ModelRegistry
 from src.serving.inference import InferenceService
@@ -303,3 +306,71 @@ def test_retrain_survives_a_genuine_crash_and_leaves_incumbent_active(tmp_path, 
     # never happened.
     runs_after = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())["total_runs"]
     assert runs_after == runs_before
+
+
+# --------------------------------------------------------------- NFR-07 (trigger provenance)
+def _runs_with_trigger(repo, trigger):
+    with repo.session() as session:
+        return session.query(ModelRun).filter(ModelRun.trigger_reason == trigger).all()
+
+
+def test_bootstrap_retrain_is_recorded_as_ct_bootstrap(tmp_path, monkeypatch):
+    repo, as_of = _seed_repo(tmp_path, final_vix=20.0)
+    monkeypatch.chdir(tmp_path)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+
+    orchestrator.evaluate(as_of=as_of)
+    orchestrator._retrain_thread.join(timeout=60)
+
+    [run] = _runs_with_trigger(repo, "ct_bootstrap")
+    assert run.trigger_rolling_sharpe is None  # nothing was evaluated; there was no incumbent
+    assert float(run.trigger_vix) == pytest.approx(20.0)
+
+
+def test_decay_retrain_records_the_sharpe_and_vix_that_caused_it(tmp_path, monkeypatch):
+    repo, as_of = _seed_repo(tmp_path, final_vix=20.0)
+    _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+
+    losing = {"equity_curve": np.array([100_000.0, 95_000.0, 90_000.0]), "returns": np.array([-0.05, -0.0526])}
+    monkeypatch.setattr(PPOAgent, "evaluate", lambda self, env, n_episodes=1, seed=None, deterministic=True: [losing])
+
+    orchestrator.evaluate(as_of=as_of)
+    orchestrator._retrain_thread.join(timeout=60)
+
+    [run] = _runs_with_trigger(repo, "ct_decay")
+    assert float(run.trigger_rolling_sharpe) == pytest.approx(orchestrator.last_rolling_sharpe, abs=1e-6)
+    assert float(run.trigger_rolling_sharpe) < RISK.target_sharpe_threshold
+    assert float(run.trigger_vix) == pytest.approx(20.0)
+    assert _runs_with_trigger(repo, "ct_bootstrap") == []
+
+
+# --------------------------------------------------------------- FR-18 (benchmark)
+def test_evaluate_persists_a_buy_and_hold_benchmark_on_the_same_window(tmp_path, monkeypatch):
+    """§10.1: the live equity chart needs a benchmark, and it is only a fair
+    one if it ran over the identical window with identical environment
+    settings (costs, accounting) as the incumbent it is drawn next to."""
+    repo, as_of = _seed_repo(tmp_path)
+    _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+
+    orchestrator.evaluate(as_of=as_of)
+    if orchestrator._retrain_thread is not None:
+        orchestrator._retrain_thread.join(timeout=60)
+
+    end = pd.Timestamp(as_of)
+    frame = orchestrator._load_normalised_frame(end - pd.Timedelta(days=200), end)
+    eval_slice = frame[frame["date"] >= end - pd.Timedelta(days=RISK.sharpe_evaluation_window + 15)]
+    expected = run_policy(TradingEnvironment(eval_slice.reset_index(drop=True), tickers=DATA.tickers), buy_and_hold)
+
+    snaps = repo.list_snapshots(eval_slice["date"].min(), as_of)
+    assert len(snaps) == len(expected["equity_curve"])
+    assert snaps["benchmark_equity"].notna().all()
+    np.testing.assert_allclose(snaps["benchmark_equity"].to_numpy(), expected["equity_curve"], rtol=1e-8)
+    # Both series start from the same capital on the same first day.
+    assert snaps["benchmark_equity"].iloc[0] == pytest.approx(snaps["equity_value"].iloc[0])
+    # And it is a real second series, not the incumbent's curve copied over.
+    assert not np.allclose(snaps["benchmark_equity"].to_numpy(), snaps["equity_value"].to_numpy())

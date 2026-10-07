@@ -13,12 +13,12 @@
  *   - chart text takes theme tokens, so it reads in both modes
  *   - identity is never carried by colour alone (direct labels + dash pattern)
  *
- * `bench` (the buy-and-hold comparison) is optional throughout: this
- * project's backend does not currently persist a benchmark equity series
- * alongside the agent's (CLAUDE.md records this as a known gap, not an
- * oversight), so the live dashboard renders a single agent line with no
- * legend collision or dangling "Buy & hold" label. The mock data still
- * supplies both, so the illustrative version keeps showing the comparison.
+ * `bench` (the buy-and-hold comparison) is optional throughout. The
+ * backend persists it with every CT evaluation, replayed over the same
+ * window and costs as the incumbent, but snapshots written before it did
+ * have none: those entries are null and the dashed line simply has a gap
+ * there, rather than being invented client-side. With no benchmark at all
+ * the chart renders a single line with no dangling "Buy & hold" label.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -40,6 +40,24 @@ function useScales(box, pad, n, lo, hi) {
 
 const path = (pts, s) =>
   pts.map((v, i) => `${i ? "L" : "M"}${s.x(i).toFixed(2)} ${s.y(v).toFixed(2)}`).join(" ");
+
+/** Like `path`, but a null lifts the pen instead of plotting a zero, so a
+ * series recorded only over part of the window draws only over that part. */
+export const gappedPath = (pts, s) => {
+  let pen = false;
+  const out = [];
+  pts.forEach((v, i) => {
+    if (v == null) { pen = false; return; }
+    out.push(`${pen ? "L" : "M"}${s.x(i).toFixed(2)} ${s.y(v).toFixed(2)}`);
+    pen = true;
+  });
+  return out.join(" ");
+};
+
+const lastIndexWithValue = (pts) => {
+  for (let i = pts.length - 1; i >= 0; i -= 1) if (pts[i] != null) return i;
+  return -1;
+};
 
 /* ------------------------------------------------------------------ hover */
 function useCrosshair(ref, box, pad, n) {
@@ -105,13 +123,13 @@ function EmptyChart({ label }) {
 export function EquityChart({ dates, agent, bench, label = "Agent" }) {
   const ref = useRef(null);
   const n = agent.length;
-  const hasBench = Array.isArray(bench) && bench.length === n;
+  const hasBench = Array.isArray(bench) && bench.length === n && bench.some((v) => v != null);
   const box = { w: 760, h: 260 };
   // Left gutter holds the axis; the right gutter belongs to the direct labels.
   const pad = { l: 54, r: 104, t: 14, b: 26 };
 
   const [lo, hi] = useMemo(() => {
-    const all = hasBench ? agent.concat(bench) : agent;
+    const all = hasBench ? agent.concat(bench.filter((v) => v != null)) : agent;
     return [Math.min(...all) * 0.985, Math.max(...all) * 1.015];
   }, [agent, bench, hasBench]);
 
@@ -123,12 +141,13 @@ export function EquityChart({ dates, agent, bench, label = "Agent" }) {
   const ticks = Array.from({ length: 5 }, (_, i) => lo + ((hi - lo) * i) / 4);
   const xTicks = [0, Math.floor(n * 0.33), Math.floor(n * 0.66), n - 1];
 
+  // [values, colour, label, index of the point the end label sits on]
   const series = hasBench
     ? [
-        [agent, "var(--series-agent)", "Agent"],
-        [bench, "var(--series-bench)", "Buy & hold"],
+        [agent, "var(--series-agent)", "Agent", n - 1],
+        [bench, "var(--series-bench)", "Buy & hold", lastIndexWithValue(bench)],
       ]
-    : [[agent, "var(--series-agent)", label]];
+    : [[agent, "var(--series-agent)", label, n - 1]];
 
   return (
     <div className="chartbox" style={{ position: "relative" }}>
@@ -181,7 +200,7 @@ export function EquityChart({ dates, agent, bench, label = "Agent" }) {
         />
         {hasBench && (
           <path
-            d={path(bench, s)} fill="none" stroke="var(--series-bench)"
+            d={gappedPath(bench, s)} fill="none" stroke="var(--series-bench)"
             strokeWidth="2" strokeDasharray="5 4" strokeLinecap="round"
           />
         )}
@@ -190,19 +209,19 @@ export function EquityChart({ dates, agent, bench, label = "Agent" }) {
           strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
         />
 
-        {series.map(([d, c, label]) => (
+        {series.map(([d, c, label, end]) => (
           <g key={label}>
             <circle
-              cx={s.x(n - 1)} cy={s.y(d[n - 1])} r="4.5"
+              cx={s.x(end)} cy={s.y(d[end])} r="4.5"
               fill={c} stroke="var(--glass-strong)" strokeWidth="2"
             />
-            <text x={s.x(n - 1) + 9} y={s.y(d[n - 1]) - 7}
+            <text x={s.x(end) + 9} y={s.y(d[end]) - 7}
                   fontSize="11.5" fontWeight="600" fill="var(--ink-2)">
               {label}
             </text>
-            <text x={s.x(n - 1) + 9} y={s.y(d[n - 1]) + 6}
+            <text x={s.x(end) + 9} y={s.y(d[end]) + 6}
                   fontSize="12" fontWeight="600" fill="var(--ink)">
-              {fmtMoney(d[n - 1])}
+              {fmtMoney(d[end])}
             </text>
           </g>
         ))}
@@ -229,7 +248,7 @@ export function EquityChart({ dates, agent, bench, label = "Agent" }) {
           idx === null ? [] : hasBench
             ? [
                 ["Agent", token("--series-agent"), fmtMoney(agent[idx])],
-                ["Buy & hold", token("--series-bench"), fmtMoney(bench[idx])],
+                ["Buy & hold", token("--series-bench"), bench[idx] != null ? fmtMoney(bench[idx]) : "—"],
               ]
             : [[label, token("--series-agent"), fmtMoney(agent[idx])]]
         }

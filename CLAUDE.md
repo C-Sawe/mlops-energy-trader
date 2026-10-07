@@ -89,14 +89,26 @@ These are not code tasks, but they are open and they cost marks:
 | 2 | Environment — Gymnasium MDP, metrics, baselines | **Complete** |
 | 3 | Training — PPO, walk-forward validation, MLflow | **Complete** |
 | 4 | Serving — FastAPI, fail-safe, dashboard, CT loop | **Complete** |
+| 5 | Hardening — GitHub issues #40–#46 (backups, gap backfill, trigger provenance, live benchmark, App tests, cleanup) | **Complete, on `sprint-5`** |
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q     # 161 passing — keep it that way (backend)
-cd frontend && npm test        # 59 passing — Vitest + React Testing Library, added 2026-09-20
+cd backend && python -m pytest tests/ -q     # 176 passing — keep it that way
+cd frontend && npm test                      # 78 passing — Vitest + React Testing Library
 ```
 
-Branches (all local, none pushed): `main` is the trunk. `sprint-1` and
+**Branch state, verified against GitHub 2026-10-07** (supersedes the
+history below where they disagree): every branch is pushed to
+`origin` (`C-Sawe/mlops-energy-trader`). `sprint-4` reached `main` through
+PRs #1, #48 and #49, but its last two commits, `645da7f` (paper trader) and
+`bbbe8fb` (multi-arch Docker builds), are **not on `main`**. Every Deploy
+run on `main` has failed; the latest because the VM is arm64 and `main`
+only builds amd64, which `bbbe8fb` fixes. `sprint-5` branches off
+`sprint-4` and holds issues #40–#46 (§7, "Sprint 5 hardening"). Commit
+history was rewritten on 2026-10-07 to remove Claude co-author trailers
+(trees unchanged); don't add them back.
+
+History: `main` is the trunk. `sprint-1` and
 `sprint-2` are retroactive markers at each sprint's completion commit, kept
 for reference. `sprint-3` **was merged into `main` (fast-forward)** in the
 same local session that built it — Sprint 4's serving layer depends on
@@ -432,6 +444,7 @@ src/serving/          schemas · inference · api                       [Sprint 
 src/execution/        alpaca_broker (paper trading only, §7 deviation) [post-Sprint 4]
                       · rebalance (weights -> long-only orders, pure)  [2026-10-02]
 frontend/              React + hand-rolled SVG charts, no CSS framework [Sprint 4]
+                       · App.render.test.jsx (component rendering tests) [Sprint 5]
 scripts/              run_ingestion.py · run_baselines.py
                       · benchmark_device.py · finrl_crosscheck.py
                       · train_agent.py                                [Sprint 3]
@@ -444,12 +457,13 @@ scripts/              run_ingestion.py · run_baselines.py
                       · algorithm_comparison.py (PPO/A2C/SAC/TD3, §10) [post-Sprint 4]
 results/algorithm_comparison/  runs.jsonl (every run's returns) + summary.json
 .importlinter          NFR-06's layer contracts, checked by tests/test_architecture.py
-Dockerfile, frontend/Dockerfile, deploy/   cloud deployment (single VM, Compose + Caddy)  [2026-09-30, not yet run]
+Dockerfile, frontend/Dockerfile, deploy/   cloud deployment (single VM, Compose + Caddy)  [2026-09-30, never deployed successfully]
+deploy/backup.sh       daily pgdata + mlruns backups and restore (#40)   [Sprint 5]
 .github/workflows/     ci.yml (tests on push/PR) · deploy.yml (GHCR → SSH → VM); see docs/DEPLOYMENT.md
 .github/issue-drafts/  open backlog as issue drafts; scripts/create_github_issues.sh --apply files them
 constraints.txt        pinned tested versions (mlflow especially, §13) for Docker/CI
-tests/                161 tests (backend)
-frontend/src/*.test.jsx  59 tests (Vitest + React Testing Library, added 2026-09-20)
+backend/tests/        176 tests
+frontend/src/*.test.jsx  78 tests (Vitest + React Testing Library)
 ```
 
 The closed feedback loop that constitutes the contribution: telemetry from the
@@ -712,8 +726,12 @@ backfill already computed, and because `persist()` upserts, a scheduled
 tick would silently overwrite a correct, converged indicator with a wrong
 one for every date the two windows overlap. `DEFAULT_TRAILING_WINDOW_DAYS
 = 120` in `ingestion_scheduler.py` exists specifically so the EMA has
-decayed past any practical difference — `(1 - 1/14)**120 ≈ 1.9e-4` — before
-the days the tick actually cares about. `sma_20` has no such issue (a
+decayed past any practical difference before the days the tick actually
+cares about. (Corrected 2026-10-07: this note originally said
+`(1 - 1/14)**120 ≈ 1.9e-4`, but 120 *calendar* days is ~83 *trading* rows,
+so the residual weight is `(13/14)**83 ≈ 2e-3`. Measured: the newest rows
+land within 0.21 RSI points of the full-history value. Still negligible,
+but that is the real figure.) `sma_20` has no such issue (a
 plain rolling mean has no memory past its own window), but 120 days covers
 it trivially too. Guarded by
 `test_ingestion_tick_reproduces_warm_indicators_not_nulls`
@@ -1110,6 +1128,73 @@ or visual coverage. `App.jsx`'s main component (data fetching, polling,
 the mock-fallback switch, the decision-detail sheet) has no rendering
 tests yet; the adapter functions it calls are now covered, but the
 component wiring them together is not.
+
+**Sprint 5 hardening — GitHub issues #40–#46, 2026-10-07, on `sprint-5`.**
+What each fix decided, where it isn't obvious from the code:
+
+- **#41 — gaps longer than the ingestion window now backfill themselves.**
+  `_fetch_start()` anchors the trailing window to `min(end, last stored
+  bar)`. In steady state that is the old window, give or take a weekend.
+  After an outage it gives the first missing day the same 120 days of
+  lookback a normal tick gets, so the trimmed warm-up rows land on dates
+  that are already stored, never on the gap. That is why it doesn't use the
+  issue draft's "last stored − 40 days": 40 days would have left RSI cold
+  across the start of the gap. It logs a warning when the gap is longer
+  than `window − 2 × warm-up` days. Guarded by
+  `test_ingestion_tick_backfills_a_gap_longer_than_its_window` (a 200-day
+  gap, every trading day filled, indicators matching a full backfill).
+  This retires §13's "a gap larger than the window needs an explicit
+  backfill" for non-empty databases. An empty database still needs the
+  deploy bootstrap.
+- **#42 — `model_run.trigger_reason`**, not `trigger`: TRIGGER is an SQL
+  keyword. One of `ct_bootstrap`, `ct_decay`, `manual_sweep`, `analysis`
+  (`RUN_TRIGGERS`), plus `trigger_rolling_sharpe`/`trigger_vix` for CT
+  runs. Existing rows stay NULL, meaning unknown, never back-filled as
+  autonomous. `scripts/nfr_reliability_check.py` forces a retrain on
+  purpose, so it records `analysis`, not `ct_decay`. `/ct-status` now
+  returns `autonomous_retrains`/`autonomous_promoted`, and the Cycle-history
+  card shows them. That is the queryable "the loop retrained itself N
+  times" Chapter 5 needs. Historic runs (the 540 from the 3-day run) can't
+  be counted this way because they predate the column.
+- **Schema changes reach existing databases.** `create_all()` never alters
+  an existing table, so `MarketRepository.create_schema()` now also adds
+  any *nullable, non-key* model column missing from an existing table
+  (`_add_missing_columns`, via `ALTER TABLE ... ADD COLUMN`). Anything else
+  is logged as needing a real migration, not guessed. Verified against a
+  real `postgres:16` built from `sprint-4`'s schema with rows in it: the
+  columns were added, old rows read NULL, and a second startup was a no-op.
+  The `ck_trigger_reason_enum` CHECK therefore exists only on freshly
+  created tables; `ModelRegistry.log_run()` validates the value in Python
+  too.
+- **#43 — live benchmark.** `evaluate()` replays `buy_and_hold` through an
+  identical `TradingEnvironment` over the same slice (same costs, no model)
+  and stores `portfolio_snapshot.benchmark_equity`. The equity chart draws
+  it with gaps (`gappedPath`) where older snapshots predate it, and the
+  subtitle says from which date. It is never back-filled client-side.
+- **#44 — `App.render.test.jsx`.** Drives the real `poll()` with Vitest fake
+  timers and mocks only the fetch functions. Two gotchas: jsdom has no
+  `window.matchMedia` (the sheet's spring calls it), so it's stubbed with
+  reduced motion; and RTL's `waitFor` can hang under Vitest fake timers
+  instead of timing out, so each step advances the clock explicitly.
+- **#46 — yfinance guard.** `_flatten_single_symbol()` finds the OHLCV level
+  by name (so `group_by="ticker"` ordering works too) and raises if any
+  other level holds more than one symbol.
+- **#40 — backups.** See `docs/DEPLOYMENT.md`, "Backups". The service runs
+  on `postgres:16-alpine`, the database's own image, so pg_dump's version
+  matches the server. (The backend image is Debian-based, and its
+  `postgresql-client` would be a different major version.)
+  `mlruns.db` is copied with `sqlite3 .backup`, not `cp`, so a write in
+  progress can't tear it. The daily loop calls `sh "$0" now` as a separate
+  process: `set -e` is ignored inside anything on the left of `||`, so
+  calling the function directly would have published a half-written backup
+  after a failed pg_dump. Rehearsed locally at production scale: 8 s
+  backup, 3 s restore, every table hash and artifact identical. Not yet
+  run on the VM. Backups live on the VM's own disk (§13).
+- **Found along the way:** `importlinter`'s `lint_imports()` calls
+  `logging.config.dictConfig()`, whose default `disable_existing_loggers`
+  silenced every `src.*` logger for the rest of the pytest session.
+  Any `caplog` test after `test_architecture.py` captured nothing.
+  `test_architecture.py` now restores the loggers' state.
 
 The proposal names FinRL. **It does work.** An earlier claim in this project
 that it was broken was wrong and has been corrected.
@@ -1786,7 +1871,13 @@ default) guards the endpoints that matter, which is what got built.
   the scheduler is correct for steady-state (a process that's been running
   continuously), but a gap larger than its trailing window needs an
   explicit backfill, not just letting the scheduler catch up on its own —
-  it won't.
+  it won't. **Fixed 2026-10-07 (#41):** the next tick now anchors to the
+  last stored bar and fills the gap itself (§7, "Sprint 5 hardening"). An
+  *empty* database still needs the explicit bootstrap backfill.
+- **Backups exist only on the VM's own disk (#40).** They survive a
+  broken container, a bad deploy or a deleted volume, but not losing the
+  VM. Until an off-site copy is automated, `rsync` them off or use the
+  provider's disk snapshots (`docs/DEPLOYMENT.md`).
 - **Ports 8000/8001 are not this project's alone on this machine.** The
   user has a separate, unrelated project (`~/Documents/whats app
   automation`, a WhatsApp automation tool with its own FastAPI apps) whose

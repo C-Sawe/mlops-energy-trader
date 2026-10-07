@@ -5,7 +5,7 @@
  * flat line — CLAUDE.md §7) is unit-testable without rendering SVG.
  */
 import { describe, expect, it } from "vitest";
-import { SHARPE_OUTLIER_BOUND, clampForDisplay, computeSharpeDomain } from "./Charts.jsx";
+import { SHARPE_OUTLIER_BOUND, clampForDisplay, computeSharpeDomain, gappedPath } from "./Charts.jsx";
 
 describe("computeSharpeDomain", () => {
   it("computes a normal domain from ordinary values", () => {
@@ -127,5 +127,24 @@ describe("candleDomain", () => {
     const flat = [{ date: "2026-09-28", open: 5, high: 5, low: 5, close: 5 }];
     const [lo, hi] = candleDomain(flat);
     expect(hi).toBeGreaterThan(lo);
+  });
+});
+
+describe("gappedPath", () => {
+  const identity = { x: (i) => i, y: (v) => v };
+
+  it("draws a continuous series exactly like a plain path", () => {
+    expect(gappedPath([1, 2, 3], identity)).toBe("M0.00 1.00 L1.00 2.00 L2.00 3.00");
+  });
+
+  it("lifts the pen over nulls instead of plotting them as zero", () => {
+    // A benchmark persisted only from some date onward (older snapshots
+    // predate it) must not dive to $0 across the missing stretch.
+    expect(gappedPath([null, null, 3, 4], identity)).toBe("M2.00 3.00 L3.00 4.00");
+    expect(gappedPath([1, null, 3, 4], identity)).toBe("M0.00 1.00 M2.00 3.00 L3.00 4.00");
+  });
+
+  it("returns an empty path when there is nothing to draw", () => {
+    expect(gappedPath([null, null], identity)).toBe("");
   });
 });

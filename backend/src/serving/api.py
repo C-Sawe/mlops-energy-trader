@@ -221,6 +221,7 @@ def telemetry(
             rolling_sharpe_30d=row["rolling_sharpe_30d"],
             max_drawdown=row["max_drawdown"],
             cumulative_return=row["cumulative_return"],
+            benchmark_equity=row["benchmark_equity"],
         )
         for row in df.to_dict(orient="records")
     ]
@@ -281,6 +282,8 @@ def ct_status() -> CTStatusResponse:
         training_runs=cycle["total_runs"],
         promoted_count=cycle["promoted"],
         rejected_count=cycle["rejected"],
+        autonomous_retrains=cycle["autonomous_runs"],
+        autonomous_promoted=cycle["autonomous_promoted"],
         ingestion_status=ingestion.status.value,
         last_ingestion_attempted_at=ingestion.last_attempted_at,
         last_ingestion_ok=ingestion.last_ok,

@@ -88,6 +88,8 @@ export const metrics = {
   trainingRuns: 3,
   promoted: 2,
   heldBack: 1,
+  autonomous: 3,
+  autonomousPromoted: 2,
 };
 
 // ------------------------------------------------------------ paper trading

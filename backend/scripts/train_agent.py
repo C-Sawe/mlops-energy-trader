@@ -112,6 +112,7 @@ def main() -> int:
                 split["eval_start"],
                 split["eval_end"],
                 metrics,
+                trigger_reason="manual_sweep",
             )
             run_ids.append(run_id)
             sharpes.append(metrics["sharpe_ratio"])

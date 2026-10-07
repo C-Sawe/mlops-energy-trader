@@ -164,7 +164,10 @@ def test_telemetry_returns_recorded_snapshots(tmp_path, monkeypatch):
     db_url, as_of = _seed_db(tmp_path)
     monkeypatch.setenv("DATABASE_URL", db_url)
     repo = MarketRepository(url=db_url)
-    repo.record_snapshot(as_of, 101_000.0, rolling_sharpe_30d=1.1, max_drawdown=0.02, cumulative_return=0.01)
+    repo.record_snapshot(
+        as_of, 101_000.0, rolling_sharpe_30d=1.1, max_drawdown=0.02, cumulative_return=0.01,
+        benchmark_equity=100_400.0,
+    )
 
     with TestClient(app) as client:
         resp = client.get(
@@ -175,6 +178,7 @@ def test_telemetry_returns_recorded_snapshots(tmp_path, monkeypatch):
         points = resp.json()["points"]
         assert len(points) == 1
         assert points[0]["equity_value"] == 101_000.0
+        assert points[0]["benchmark_equity"] == 100_400.0
 
 
 # --------------------------------------------------------------- FR-20
@@ -196,6 +200,10 @@ def test_ct_status_reflects_active_version(tmp_path, monkeypatch):
         import re
 
         assert re.match(r"^[A-Z][a-z]+ \d{4} #1$", body["active_model_label"])
+        # _promote_model logs its run with no trigger_reason: counted as
+        # training activity, but not claimed as an autonomous retrain.
+        assert body["training_runs"] == 1
+        assert body["autonomous_retrains"] == 0
 
 
 def test_ct_evaluate_accepts_an_as_of_override(tmp_path, monkeypatch):

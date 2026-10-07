@@ -2,7 +2,7 @@
 
 Entity-to-requirement mapping:
   market_observation  -> DR-02, DR-04, DR-05
-  model_run           -> DR-08, NFR-07
+  model_run           -> DR-08, NFR-07 (+ trigger_reason: what caused the run)
   model_version       -> DR-09, NFR-07
   trading_decision    -> FR-19, NFR-07, NFR-11
   portfolio_snapshot  -> FR-13, FR-18
@@ -82,6 +82,15 @@ class MarketObservation(Base):
         )
 
 
+# What caused a training run (model_run.trigger_reason):
+#   ct_bootstrap  CTOrchestrator, no incumbent to serve yet
+#   ct_decay      CTOrchestrator, rolling Sharpe fell below target (FR-14)
+#   manual_sweep  scripts/train_agent.py's walk-forward x seed sweep
+#   analysis      a measurement or validation script, not a deployment candidate
+RUN_TRIGGERS = ("ct_bootstrap", "ct_decay", "manual_sweep", "analysis")
+AUTONOMOUS_TRIGGERS = ("ct_bootstrap", "ct_decay")
+
+
 class ModelRun(Base):
     """A single training run and its resulting metrics.
 
@@ -110,6 +119,15 @@ class ModelRun(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # NFR-07: what caused this run (one of RUN_TRIGGERS). NULL means
+    # unknown — rows logged before this column existed are left NULL, not
+    # guessed. For CT runs, the rolling Sharpe and VIX the decision was
+    # made on are kept too, so "the loop retrained itself because Sharpe
+    # fell to X" is a query, not a log search.
+    trigger_reason: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    trigger_rolling_sharpe: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    trigger_vix: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+
     versions: Mapped[list["ModelVersion"]] = relationship(back_populates="run")
 
     __table_args__ = (
@@ -117,6 +135,14 @@ class ModelRun(Base):
         CheckConstraint("eval_start > train_end", name="ck_eval_after_train"),
         CheckConstraint("train_end > train_start", name="ck_train_range_valid"),
         CheckConstraint("eval_end > eval_start", name="ck_eval_range_valid"),
+        # Only on freshly created tables: MarketRepository.create_schema()
+        # adds the column to an existing table without it, so
+        # ModelRegistry.log_run() validates against RUN_TRIGGERS as well.
+        CheckConstraint(
+            "trigger_reason IS NULL OR trigger_reason IN "
+            "('ct_bootstrap', 'ct_decay', 'manual_sweep', 'analysis')",
+            name="ck_trigger_reason_enum",
+        ),
     )
 
 
@@ -194,6 +220,11 @@ class PortfolioSnapshot(Base):
     cumulative_return: Mapped[float | None] = mapped_column(
         Numeric(18, 6), nullable=True
     )
+    # §10.1: buy-and-hold replayed over the same window, with the same
+    # environment and costs as the incumbent, so the live equity chart has
+    # something to be compared against. NULL on snapshots written before
+    # this column existed.
+    benchmark_equity: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
 
 
 class PaperCycle(Base):

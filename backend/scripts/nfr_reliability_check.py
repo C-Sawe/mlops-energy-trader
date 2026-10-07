@@ -92,7 +92,7 @@ def main() -> int:
     agent = PPOAgent(train_env, n_steps=256, seed=0).train(total_timesteps=2000)
 
     registry = ModelRegistry(repo=repo)
-    run_id = registry.log_run(agent, "2020-01-01", "2020-10-01", "2020-10-02", str(as_of), {"sharpe_ratio": 0.0})
+    run_id = registry.log_run(agent, "2020-01-01", "2020-10-01", "2020-10-02", str(as_of), {"sharpe_ratio": 0.0}, trigger_reason="analysis")
     from src.dataops.models import ModelRun
 
     with repo.session() as session:
@@ -133,7 +133,7 @@ def main() -> int:
         time.sleep(1.0)  # a moment of baseline traffic before the retrain starts
 
         print("triggering a real retrain (same code path FR-14 uses)...")
-        api_module.orchestrator._trigger_retrain(as_of)
+        api_module.orchestrator._trigger_retrain(as_of, "analysis")
         retrain_thread = api_module.orchestrator._retrain_thread
         assert retrain_thread is not None
         retrain_thread.join(timeout=120)

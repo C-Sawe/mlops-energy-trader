@@ -137,3 +137,41 @@ def test_registered_version_defaults_to_inactive(registry):
         version = session.get(ModelVersion, version_id)
         assert version.is_active is False
         assert version.promoted_at is None
+
+
+# --------------------------------------------------------------- NFR-07 (trigger provenance)
+def test_log_run_records_what_triggered_it(registry, repo):
+    run_id = registry.log_run(
+        _trained_agent(), "2020-01-01", "2021-12-31", "2022-01-01", "2022-06-30",
+        {"sharpe_ratio": 0.4},
+        trigger_reason="ct_decay", trigger_rolling_sharpe=-1.25, trigger_vix=22.5,
+    )
+
+    from src.dataops.models import ModelRun
+
+    with repo.session() as session:
+        record = session.get(ModelRun, run_id)
+        assert record.trigger_reason == "ct_decay"
+        assert float(record.trigger_rolling_sharpe) == pytest.approx(-1.25)
+        assert float(record.trigger_vix) == pytest.approx(22.5)
+        mlflow_ref = record.mlflow_run_ref
+    assert mlflow.get_run(mlflow_ref).data.tags["trigger_reason"] == "ct_decay"
+
+
+def test_log_run_leaves_trigger_unknown_rather_than_guessing(registry, repo):
+    run_id = registry.log_run(
+        _trained_agent(), "2020-01-01", "2021-12-31", "2022-01-01", "2022-06-30", {"sharpe_ratio": 0.0}
+    )
+
+    from src.dataops.models import ModelRun
+
+    with repo.session() as session:
+        assert session.get(ModelRun, run_id).trigger_reason is None
+
+
+def test_log_run_rejects_an_unknown_trigger_reason(registry):
+    with pytest.raises(ValueError, match="trigger_reason"):
+        registry.log_run(
+            _trained_agent(), "2020-01-01", "2021-12-31", "2022-01-01", "2022-06-30",
+            {"sharpe_ratio": 0.0}, trigger_reason="cron",
+        )

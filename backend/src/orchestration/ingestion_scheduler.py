@@ -26,10 +26,12 @@ logger = logging.getLogger(__name__)
 # Wilder's RSI_14 is an EMA with unbounded memory (CLAUDE.md §7, §9): the
 # smoothing never fully "forgets" data before the fetch window starts, so a
 # too-narrow trailing re-fetch computes a measurably *colder* RSI than the
-# one already sitting in the store from the original backfill. At 120 days
-# the EMA's weight on anything before the fetch starts has decayed to
-# (1 - 1/14)**120 ≈ 1.9e-4 — close enough to full convergence that
-# recomputing from this window reproduces the full-history value.
+# one already sitting in the store from the original backfill. 120 calendar
+# days is ~83 trading rows, so the EMA's weight on anything before the fetch
+# starts has decayed to (1 - 1/14)**83 ≈ 2e-3 at the window's end (an
+# earlier version of this comment used 120 rows, ≈1.9e-4). Measured on
+# synthetic data, that leaves the newest rows within ~0.2 RSI points of the
+# full-history value (test_ingestion_tick_backfills_a_gap_longer_than_its_window).
 #
 # That handles RSI's "colder, not wrong" problem, but not SMA_20's
 # different one: `compute_indicators()` uses `min_periods=window`, so the
@@ -51,6 +53,43 @@ logger = logging.getLogger(__name__)
 _INDICATOR_WARMUP = max(DATA.sma_window, DATA.rsi_window)
 
 DEFAULT_TRAILING_WINDOW_DAYS = 120
+
+def _gap_warning_days(window_days: int) -> int:
+    """A gap this many calendar days or longer would have defeated a fixed
+    `end - window_days` fetch: its first missing dates land at or before
+    the fetch's own leading warm-up rows (`_INDICATOR_WARMUP` trading rows,
+    ~1.4× that in calendar days; doubled for margin), so they would be
+    trimmed and never filled. Only decides when a gap backfill is logged
+    as a warning; the fetch start is anchored to the last stored bar
+    regardless (`_fetch_start`)."""
+    return window_days - 2 * _INDICATOR_WARMUP
+
+
+def _fetch_start(repo: MarketRepository, end: date, window_days: int) -> date:
+    """FR-01: where this tick's fetch must start so no gap is left behind.
+
+    Anchors the trailing window to whichever is earlier, `end` or the last
+    stored bar. In steady state the two are a day or a weekend apart, so
+    this is the plain trailing window. After an outage longer than the
+    window (CLAUDE.md §13's real 4.5-month gap), anchoring to `end` alone
+    would start the fetch *after* the last stored bar and leave a permanent
+    hole. Anchoring to the last stored bar instead gives the first missing
+    day the same `window_days` of lookback a normal tick gets, so RSI is as
+    converged as usual and the trimmed warm-up rows fall on dates that are
+    already stored, never on the gap.
+    """
+    latest = repo.latest_ingest_info()
+    last_stored = latest["date"] if latest else None
+    anchor = min(end, last_stored) if last_stored else end
+    start = anchor - timedelta(days=window_days)
+
+    if last_stored and (end - last_stored).days >= _gap_warning_days(window_days):
+        logger.warning(
+            "ingestion tick: last stored bar is %s, %d days before %s, longer than "
+            "the %d-day trailing window covers on its own; backfilling from %s",
+            last_stored, (end - last_stored).days, end, window_days, start,
+        )
+    return start
 
 
 def run_ingestion_tick(
@@ -75,6 +114,11 @@ def run_ingestion_tick(
     comfortably larger than `_INDICATOR_WARMUP` or every ticker's trimmed
     frame comes back empty; the default (120) has wide margin.
 
+    Gaps longer than the window are backfilled in the same tick: the
+    window is anchored to the last stored bar when that is older than
+    `end` (`_fetch_start`), so an outage never leaves a permanent hole that
+    needs a manual `run_ingestion.py` run.
+
     Returns the number of rows actually persisted (post-trim), not the
     number fetched.
 
@@ -86,7 +130,7 @@ def run_ingestion_tick(
     """
     repo = repo or MarketRepository()
     end = end or date.today()
-    start = end - timedelta(days=window_days)
+    start = _fetch_start(repo, end, window_days)
     result = fetch_market_data(str(start), str(end), tickers=tickers or DATA.tickers)
     frame = build_feature_frame(result.equities, result.vix)
     # Not groupby(...).apply(lambda g: g.iloc[n:]) — pandas 3.x's groupby
