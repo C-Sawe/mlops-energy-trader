@@ -6,6 +6,10 @@ Entity-to-requirement mapping:
   model_version       -> DR-09, NFR-07
   trading_decision    -> FR-19, NFR-07, NFR-11
   portfolio_snapshot  -> FR-13, FR-18
+  paper_cycle / paper_order / paper_account_snapshot
+                      -> CLAUDE.md §7's Alpaca deviation (forward paper
+                         trading); paper_order.decision_id extends I6 to
+                         the broker: every order traces to a decision.
 """
 from __future__ import annotations
 
@@ -190,3 +194,65 @@ class PortfolioSnapshot(Base):
     cumulative_return: Mapped[float | None] = mapped_column(
         Numeric(18, 6), nullable=True
     )
+
+
+class PaperCycle(Base):
+    """One daily forward paper-trading cycle, keyed by the market date whose
+    close produced the signal. The primary key is what makes the job
+    idempotent: a second cycle for the same signal date cannot be recorded,
+    so a restart or a manual re-run never trades the same day twice."""
+
+    __tablename__ = "paper_cycle"
+
+    signal_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    ran_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    failsafe_triggered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    orders_submitted: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    orders_failed: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+
+
+class PaperOrder(Base):
+    """An order sent to the Alpaca *paper* account. Fill fields stay null
+    until a later sync sees the fill — orders queued after the close
+    execute at the next open, not when they are submitted."""
+
+    __tablename__ = "paper_order"
+
+    order_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    signal_date: Mapped[date] = mapped_column(
+        ForeignKey("paper_cycle.signal_date"), nullable=False
+    )
+    decision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("trading_decision.decision_id"), nullable=True
+    )
+    ticker: Mapped[str] = mapped_column(String(16), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    requested_notional: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    filled_qty: Mapped[float | None] = mapped_column(Numeric(18, 9), nullable=True)
+    filled_avg_price: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("side IN ('buy', 'sell')", name="ck_paper_side"),
+        Index("ix_paper_order_ticker", "ticker"),
+    )
+
+
+class PaperAccountSnapshot(Base):
+    """The paper account's equity, cash and positions as last synced on a
+    given date — the forward equity curve. Last sync of the day wins."""
+
+    __tablename__ = "paper_account_snapshot"
+
+    snapshot_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    equity: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+    cash: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+    positions: Mapped[list] = mapped_column(JSON, default=list)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

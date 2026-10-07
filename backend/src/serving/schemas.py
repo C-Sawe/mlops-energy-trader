@@ -135,3 +135,64 @@ class CTStatusResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     active_version_id: str | None
+
+
+class Candle(BaseModel):
+    date: date
+    open: float
+    high: float
+    low: float
+    close: float
+    is_imputed: bool
+
+
+class CandlesResponse(BaseModel):
+    """Daily OHLC for one ticker — split/dividend adjusted (FR-02/DR-03)."""
+
+    ticker: str
+    candles: list[Candle]
+
+
+class PaperPosition(BaseModel):
+    ticker: str
+    qty: float | None
+    avg_entry_price: float | None
+    current_price: float | None
+    market_value: float | None
+    unrealized_pl: float | None
+    unrealized_plpc: float | None
+
+
+class PaperFill(BaseModel):
+    order_id: str
+    ticker: str
+    side: str  # buy | sell
+    signal_date: date
+    decision_id: str | None  # I6: the decision that produced this order
+    filled_qty: float | None
+    filled_avg_price: float | None
+    filled_at: datetime | None
+
+
+class PaperEquityPoint(BaseModel):
+    date: date
+    equity: float
+
+
+class PaperStatusResponse(BaseModel):
+    """The forward paper account (CLAUDE.md §7's Alpaca deviation). Simulated
+    money on Alpaca's paper venue — never a profitability claim (§1)."""
+
+    enabled: bool
+    status: str  # IDLE | TRADING
+    next_run_at: datetime | None
+    last_run_at: datetime | None
+    last_outcome: str | None
+    last_signal_date: date | None
+    last_cycle_failsafe: bool | None
+    equity: float | None
+    cash: float | None
+    synced_at: datetime | None
+    positions: list[PaperPosition]
+    equity_curve: list[PaperEquityPoint]
+    fills: list[PaperFill]

@@ -229,6 +229,87 @@ def test_ct_evaluate_accepts_an_as_of_override(tmp_path, monkeypatch):
             assert not api.orchestrator._retrain_thread.is_alive()
 
 
+# ---------------------------------------------------- candles + paper
+def test_candles_returns_ohlc_ending_at_the_latest_ingested_bar(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    db_url, last_date = _seed_db(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", db_url)
+
+    with TestClient(app) as client:
+        body = client.get("/market/candles", params={"ticker": "XOM", "days": 30}).json()
+        assert body["ticker"] == "XOM"
+        assert body["candles"][-1]["date"] == str(last_date)
+        assert all(c["high"] >= c["low"] for c in body["candles"])
+
+        assert client.get("/market/candles", params={"ticker": "AAPL"}).status_code == 422
+
+
+def test_paper_status_reports_disabled_and_run_is_refused(tmp_path, monkeypatch):
+    """Off by default: nothing reaches Alpaca unless explicitly enabled."""
+    monkeypatch.chdir(tmp_path)
+    db_url, _ = _seed_db(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.delenv("PAPER_TRADING_ENABLED", raising=False)
+
+    with TestClient(app) as client:
+        body = client.get("/paper/status").json()
+        assert body["enabled"] is False
+        assert body["positions"] == [] and body["equity"] is None
+        assert client.post("/paper/run").status_code == 409
+
+
+def test_paper_run_trades_through_the_api_with_a_mocked_broker(tmp_path, monkeypatch):
+    """End to end through the real InferenceService and a real promoted
+    model, with Alpaca replaced by httpx.MockTransport (no network)."""
+    import httpx
+
+    import src.serving.api as api
+    from src.execution.alpaca_broker import AlpacaBroker
+    from src.orchestration import paper_trader
+
+    monkeypatch.chdir(tmp_path)
+    db_url, as_of = _seed_db(tmp_path, final_vix=RISK.vix_critical_threshold - 10.0)
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("PAPER_TRADING_ENABLED", "true")
+    _promote_model(db_url, tmp_path, as_of)
+
+    # Today, in market time, is the seeded data's last date; and the
+    # pre-trade ingestion must not reach yfinance.
+    monkeypatch.setattr(paper_trader, "market_today", lambda now=None: as_of)
+    monkeypatch.setattr(api.ingestion, "run", lambda *a, **k: 0, raising=False)
+
+    orders = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v2/account":
+            return httpx.Response(200, json={"equity": "100000", "cash": "100000"})
+        if path == "/v2/positions":
+            return httpx.Response(200, json=[])
+        if path == "/v2/orders" and request.method == "POST":
+            orders.append(request.content)
+            return httpx.Response(200, json={"id": f"o{len(orders)}", "status": "accepted"})
+        return httpx.Response(404, json={})
+
+    def factory():
+        client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://paper-api.alpaca.markets")
+        return AlpacaBroker(api_key="k", secret_key="s", client=client)
+
+    monkeypatch.setattr(api, "_broker_factory", factory)
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(api.ingestion, "run", lambda *a, **k: 0)
+        body = client.post("/paper/run").json()
+        assert body["last_signal_date"] == str(as_of)
+        assert body["last_outcome"].startswith("traded")
+        assert body["equity"] == 100000.0
+        # A second press on the same signal date cannot double-trade.
+        again = client.post("/paper/run").json()
+        assert "already traded" in again["last_outcome"]
+    for raw in orders:
+        assert b'"side":"buy"' in raw  # an empty account can only buy
+
+
 # --------------------------------------------------------------- auth
 def test_protected_endpoint_requires_token_when_configured(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)

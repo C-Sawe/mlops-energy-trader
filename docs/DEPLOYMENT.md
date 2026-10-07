@@ -93,6 +93,14 @@ Go to Repo → Settings → Secrets and variables → Actions.
 | `SITE_ADDRESS` | `:80` | Set a domain (e.g. `trader.example.com`) whose DNS A record points at the VM. Caddy then serves HTTPS automatically. **Do this before sharing the URL**: basic auth over plain HTTP sends the password in the clear. |
 | `CT_EVALUATION_INTERVAL_SECONDS` | `300` | FR-13 cadence |
 | `INGESTION_INTERVAL_SECONDS` | `86400` | FR-01 cadence. Lower it for a live demo. |
+| `IMAGE_PLATFORMS` | `linux/amd64,linux/arm64` | CPU architectures to build. Run `uname -m` on the VM: `aarch64` → set `linux/arm64`, `x86_64` → `linux/amd64`. Building only the one you need roughly halves build time. |
+| `PAPER_TRADING_ENABLED` | `false` | `true` turns on the daily forward paper-trading cycle (see below). Needs the two Alpaca secrets. |
+| `PAPER_TRADE_TIME_UTC` | `22:00` | Weekday run time. 22:00 UTC is after the US close in both EDT and EST. |
+
+**Paper-trading secrets** (only if `PAPER_TRADING_ENABLED=true`): `ALPACA_API_KEY`
+and `ALPACA_SECRET_KEY` from a free Alpaca **paper** account. The backend's
+broker URL is a fixed constant pointing at `paper-api.alpaca.markets`; no
+setting can point it at live trading.
 
 Optionally, open Settings → Environments → `production` and add yourself as
 a required reviewer, so each rollout waits for a click.
@@ -132,12 +140,35 @@ Postgres, and FR-17's gate governs them.
 and archive the `mlruns` volume. Nothing in this setup does this for you
 (see the issue backlog).
 
+## Forward paper trading
+
+With `PAPER_TRADING_ENABLED=true`, every weekday at `PAPER_TRADE_TIME_UTC`
+the backend:
+
+1. ingests the day's bar;
+2. skips if that bar isn't today's (holiday, data lag) or today already traded;
+3. calls `predict()` with the paper account's real current weights;
+4. converts the raw target weights to long-only notional orders
+   (`src/execution/rebalance.py`) and submits them to the paper account.
+   They queue and fill at the next open.
+
+Every `PAPER_SYNC_INTERVAL_SECONDS` (default 900) it records equity,
+positions and fills. The dashboard's "Price & entries" and "Paper account"
+cards read those records.
+
+Trigger a cycle by hand (it obeys the same skip rules, so it can't
+double-trade):
+
+```bash
+curl -X POST -u "$BASIC_AUTH_USER:$BASIC_AUTH_PASSWORD" https://<site>/api/paper/run   # nginx swaps basic auth for the bearer token
+```
+
 ## What this deployment does not change
 
-- It is **not live trading.** The deployed system makes paper decisions
-  against ingested daily data (CLAUDE.md §1's Sim2Real boundary). The Alpaca
-  integration (§7) is a separate one-off script, and it is not wired into
-  this stack.
+- It is **not live trading.** With paper trading enabled, orders go to
+  Alpaca's paper venue: simulated money, real order API. Paper P&L is
+  evidence that the loop runs forward unattended, not a profitability
+  result (CLAUDE.md §1).
 - NFR-01/02/04 were measured locally on the M5 against SQLite/TestClient.
   Numbers from the cloud VM will differ and must be re-measured before they
   are cited.
