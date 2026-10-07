@@ -62,6 +62,9 @@ class EquityPoint(BaseModel):
     rolling_sharpe_30d: float | None = None
     max_drawdown: float | None = None
     cumulative_return: float | None = None
+    # Buy-and-hold over the same replay window and costs (§10.1). None on
+    # snapshots recorded before the benchmark was persisted.
+    benchmark_equity: float | None = None
 
 
 class TelemetryResponse(BaseModel):
@@ -124,6 +127,11 @@ class CTStatusResponse(BaseModel):
     training_runs: int
     promoted_count: int
     rejected_count: int
+    # Of training_runs, those the CT loop started itself (trigger_reason
+    # ct_bootstrap / ct_decay), and how many of them were promoted. Runs
+    # logged before trigger_reason existed are in neither count.
+    autonomous_retrains: int = 0
+    autonomous_promoted: int = 0
     # Not FR-20 itself (that's the CT loop) — shows FR-01's "without manual
     # intervention" ingestion actually ticking, the same way the fields
     # above show FR-13/14 actually ticking.

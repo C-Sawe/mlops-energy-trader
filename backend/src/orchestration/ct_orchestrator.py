@@ -28,6 +28,7 @@ from src.dataops.processing import normalize_rolling, partition_chronological
 from src.dataops.repository import MarketRepository
 from src.orchestration.evaluator import max_drawdown, sharpe_ratio
 from src.rlops.agent import PPOAgent
+from src.rlops.baselines import buy_and_hold, run_policy
 from src.rlops.environment import TradingEnvironment
 from src.rlops.registry import ModelRegistry
 from src.serving.inference import InferenceService
@@ -140,7 +141,7 @@ class CTOrchestrator:
             agent = self.inference_service.get_agent()
             if agent is None:
                 logger.info("no incumbent model; triggering an initial training run")
-                self._trigger_retrain(as_of)
+                self._trigger_retrain(as_of, "ct_bootstrap", vix=self._current_vix())
                 return self.status
 
             # Fetch far more than the evaluation window itself: normalize_rolling's
@@ -173,7 +174,13 @@ class CTOrchestrator:
             env = TradingEnvironment(eval_slice, tickers=self.tickers)
             [result] = agent.evaluate(env, n_episodes=1, deterministic=True)
 
-            self._persist_snapshots(env, result)
+            # §10.1: a Sharpe Ratio is meaningless alone. Buy-and-hold over
+            # the identical slice and environment settings (same costs,
+            # same accounting) gives the live equity chart its benchmark.
+            # No model involved, so this costs one cheap episode.
+            benchmark = run_policy(TradingEnvironment(eval_slice, tickers=self.tickers), buy_and_hold)
+
+            self._persist_snapshots(env, result, benchmark["equity_curve"])
 
             recent_returns = result["returns"][-RISK.sharpe_evaluation_window :]
             rolling = sharpe_ratio(recent_returns)
@@ -204,7 +211,7 @@ class CTOrchestrator:
                         self._status = CTStatus.SERVING
                     return self.status
                 logger.info("rolling Sharpe %.3f below target %.3f; retraining", rolling, RISK.target_sharpe_threshold)
-                self._trigger_retrain(as_of)
+                self._trigger_retrain(as_of, "ct_decay", rolling_sharpe=rolling, vix=current_vix)
             else:
                 with self._lock:
                     self._status = CTStatus.SERVING
@@ -215,10 +222,15 @@ class CTOrchestrator:
 
         return self.status
 
-    def _persist_snapshots(self, env: TradingEnvironment, result: dict) -> None:
+    def _persist_snapshots(
+        self, env: TradingEnvironment, result: dict, benchmark_curve: np.ndarray | None = None
+    ) -> None:
         """FR-13/FR-18: one snapshot per simulated day, each computed only
         from the days up to and including it — the dashboard's charts must
-        never show a metric that used information from a future day."""
+        never show a metric that used information from a future day.
+        `benchmark_curve` is buy-and-hold over the same slice; it is the
+        same length as the incumbent's curve because both episodes run the
+        same environment to its end."""
         dates = env._dates[: len(result["equity_curve"])]
         equity_curve = result["equity_curve"]
         returns = result["returns"]
@@ -232,20 +244,44 @@ class CTOrchestrator:
                 rolling_sharpe_30d=sharpe_ratio(window_returns) if len(window_returns) >= 2 else None,
                 max_drawdown=max_drawdown(window),
                 cumulative_return=float(equity / equity_curve[0] - 1.0),
+                benchmark_equity=(
+                    float(benchmark_curve[i])
+                    if benchmark_curve is not None and i < len(benchmark_curve)
+                    else None
+                ),
             )
 
-    def _trigger_retrain(self, as_of: date | None = None) -> None:
+    def _trigger_retrain(
+        self,
+        as_of: date | None,
+        reason: str,
+        rolling_sharpe: float | None = None,
+        vix: float | None = None,
+    ) -> None:
+        """`reason` is "ct_bootstrap" or "ct_decay" from `evaluate()`
+        ("analysis" from measurement scripts that force a retrain) —
+        recorded on the candidate's `model_run` row with the Sharpe and VIX
+        the decision was made on, so autonomous retrains are queryable
+        (NFR-07)."""
         with self._lock:
             if self._status == CTStatus.RETRAINING:
                 return
             self._status = CTStatus.RETRAINING
         thread = threading.Thread(
-            target=self._retrain_and_maybe_promote, args=(as_of,), daemon=True
+            target=self._retrain_and_maybe_promote,
+            args=(as_of, reason, rolling_sharpe, vix),
+            daemon=True,
         )
         self._retrain_thread = thread
         thread.start()
 
-    def _retrain_and_maybe_promote(self, as_of: date | None = None) -> None:
+    def _retrain_and_maybe_promote(
+        self,
+        as_of: date | None = None,
+        reason: str | None = None,
+        rolling_sharpe: float | None = None,
+        vix: float | None = None,
+    ) -> None:
         """FR-15: runs in its own thread — `InferenceService.predict()` is
         untouched while this executes, since it only ever reads the
         currently-loaded agent under `InferenceService`'s own lock, and this
@@ -294,6 +330,9 @@ class CTOrchestrator:
                 eval_end,
                 {"sharpe_ratio": candidate_sharpe},
                 status="COMPLETED" if accepted else "REJECTED",
+                trigger_reason=reason,
+                trigger_rolling_sharpe=rolling_sharpe,
+                trigger_vix=vix,
             )
 
             if accepted:

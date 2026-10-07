@@ -28,12 +28,13 @@ Internet ──▶ caddy (:80/:443, auto-TLS) ──▶ frontend (nginx: static 
 | `pgdata` | market data, decisions, snapshots, `model_run`/`model_version` | you lose traceability (NFR-07) |
 | `mlruns` | MLflow tracking DB and trained model artifacts | the active model can't be reloaded |
 | `caddy_data` | TLS certificates | Caddy re-issues them (rate-limited) |
+| `./backups` (host directory) | daily backups of `pgdata` and `mlruns` | you have no restore point (see [Backups](#backups)) |
 
 ## Workflows
 
 | File | When | What |
 |---|---|---|
-| `.github/workflows/ci.yml` | every push (not main) and PR | pytest (138) + Vitest (47) + frontend build |
+| `.github/workflows/ci.yml` | every push (not main) and PR | pytest (176) + Vitest (78) + frontend build |
 | `.github/workflows/deploy.yml` | push to `main`, or manual | CI gate → build and push both images to GHCR → SSH to VM → `docker compose up -d` → health checks |
 
 Pushing to `main` deploys. `sprint-4` is **not merged into `main` yet**
@@ -96,6 +97,8 @@ Go to Repo → Settings → Secrets and variables → Actions.
 | `IMAGE_PLATFORMS` | `linux/amd64,linux/arm64` | CPU architectures to build. Run `uname -m` on the VM: `aarch64` → set `linux/arm64`, `x86_64` → `linux/amd64`. Building only the one you need roughly halves build time. |
 | `PAPER_TRADING_ENABLED` | `false` | `true` turns on the daily forward paper-trading cycle (see below). Needs the two Alpaca secrets. |
 | `PAPER_TRADE_TIME_UTC` | `22:00` | Weekday run time. 22:00 UTC is after the US close in both EDT and EST. |
+| `BACKUP_TIME_UTC` | `03:00` | Daily backup time (see [Backups](#backups)). |
+| `BACKUP_RETENTION_DAYS` | `14` | Backups older than this are deleted after each new one. |
 
 **Paper-trading secrets** (only if `PAPER_TRADING_ENABLED=true`): `ALPACA_API_KEY`
 and `ALPACA_SECRET_KEY` from a free Alpaca **paper** account. The backend's
@@ -128,17 +131,85 @@ ssh <user>@<vm-ip>
 cd ~/mlops-energy-trader
 docker compose ps
 docker compose logs -f backend          # CT ticks, retrains, FR-17 decisions
-docker compose exec backend python scripts/run_ingestion.py --start 2026-01-01 --end 2026-09-30   # manual backfill after an outage longer than 120 days
+docker compose exec backend python scripts/run_ingestion.py --start 2026-01-01 --end 2026-09-30   # manual backfill of an arbitrary range
 ```
+
+An outage longer than the ingestion scheduler's 120-day window no longer
+needs a manual backfill: the next tick anchors its fetch to the last stored
+bar and fills the gap itself, logging a warning when it does
+(`ingestion_scheduler._fetch_start`). An empty database still needs the
+bootstrap step above, since there is no last stored bar to anchor to.
 
 **Rollback:** re-run the Deploy workflow from an earlier commit, or on the VM
 set `IMAGE_TAG=<older sha>` in `.env` and run `docker compose up -d`. Model
 promotions are *not* rolled back by an image rollback. They live in
 Postgres, and FR-17's gate governs them.
 
-**Backups:** `docker compose exec postgres pg_dump -U mlops mlops_trading > backup.sql`,
-and archive the `mlruns` volume. Nothing in this setup does this for you
-(see the issue backlog).
+## Backups
+
+The `backup` service (`deploy/backup.sh`) backs up both stateful volumes
+every day at `BACKUP_TIME_UTC` (default 03:00) into `~/mlops-energy-trader/backups/`
+on the VM, and deletes backups older than `BACKUP_RETENTION_DAYS` (default 14).
+Each backup is one directory named by its UTC time, e.g. `20261007T030000Z/`:
+
+| File | From | Notes |
+|---|---|---|
+| `postgres.dump` | `pgdata` | `pg_dump` custom format, same major version as the server |
+| `mlruns.db` | `mlruns` | MLflow tracking store, copied with `sqlite3 .backup` so a write in progress can't tear it |
+| `mlruns-artifacts.tar.gz` | `mlruns` | trained model files |
+| `SHA256SUMS` | | checked before any restore |
+
+A backup is written to a hidden `.partial-*` directory and renamed only when
+complete, so a failure part-way never leaves something that looks finished.
+Files are readable only by the deploy user.
+
+```bash
+cd ~/mlops-energy-trader
+docker compose logs backup                                    # one line per backup, with size and duration
+docker compose exec backup sh /usr/local/bin/backup.sh now    # back up right now (e.g. before a risky change)
+ls backups/
+```
+
+### Restore
+
+```bash
+cd ~/mlops-energy-trader
+docker compose stop backend                                   # restore refuses while anything else is connected
+docker compose exec backup sh /usr/local/bin/backup.sh restore 20261007T030000Z
+docker compose start backend
+```
+
+The restore verifies the checksums first and refuses a backup that fails
+them. It then replaces the database contents and the whole `mlruns` volume.
+On a new VM, run the first deploy without bootstrap, copy a backup
+directory into `backups/`, and restore it as above.
+
+**Rehearsed 2026-10-07, locally, not on the VM.** A throwaway
+`postgres:16-alpine` was seeded at production scale (13,830 market rows,
+540 model runs, 135 versions, 300 decisions and 180 snapshots), and the
+`mlruns` volume held a copy of the real local MLflow store (313 MB, 1,443
+files). The backup took **8 s** (260 MB). The database and volume were
+then deleted and replaced with empty ones. The restore took **3 s**, and
+afterwards every table's row count and content hash matched, the artifact
+files were byte-identical, `mlruns.db` passed `PRAGMA integrity_check`, and
+the active model version was intact. Both refusals were also checked: a
+tampered backup was rejected on its checksum, and a restore with another
+open connection was rejected. Re-time it on the VM's own disk before citing
+a recovery time for the deployed system.
+
+### Off-site copies
+
+`backups/` is on the VM's own disk. It survives a broken container, a bad
+deploy or a deleted volume, but **not the loss of the VM or its disk**.
+Until there is an off-site copy, pull the backups to another machine
+regularly:
+
+```bash
+rsync -a <user>@<vm-ip>:mlops-energy-trader/backups/ ~/mlops-backups/
+```
+
+Most providers can also snapshot the whole disk on a schedule, which covers
+the same failure.
 
 ## Forward paper trading
 

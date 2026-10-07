@@ -192,3 +192,79 @@ def test_ingestion_state_records_a_failed_tick_and_still_returns_to_idle(tmp_pat
     assert state.status == S.IngestionStatus.IDLE
     assert state.last_ok is False
     assert state.last_attempted_at is not None
+
+
+# --------------------------------------------------------------- gap backfill
+def test_ingestion_tick_backfills_a_gap_longer_than_its_window(tmp_path, monkeypatch, caplog):
+    """FR-01: an outage longer than the trailing window (CLAUDE.md §13's
+    real 4.5-month gap) must be closed by the next tick on its own, not
+    left as a permanent hole that needs a manual `run_ingestion.py` run.
+    The gap's first days must also get the same warm indicators a full
+    backfill would have computed, not cold or NaN ones."""
+    db_url = f"sqlite:///{tmp_path / 'test.db'}"
+    equities = make_series(450, tickers=DATA.tickers)
+    dates = pd.DatetimeIndex(sorted(equities["date"].unique()))
+    vix = pd.DataFrame({"date": dates, "close": 18.0})
+    full = P.build_feature_frame(equities, vix)
+
+    end = dates.max().date()
+    last_stored = (pd.Timestamp(end) - pd.Timedelta(days=200)).date()
+    gap_days = (end - last_stored).days
+    assert gap_days > S.DEFAULT_TRAILING_WINDOW_DAYS
+
+    repo = MarketRepository(url=db_url)
+    repo.create_schema()
+    repo.persist(full[full["date"] <= pd.Timestamp(last_stored)])
+    last_stored = repo.latest_ingest_info()["date"]
+
+    requested = {}
+
+    def fake_fetch(start, end, tickers=None, strict=True):
+        requested["start"] = pd.Timestamp(start).date()
+        start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+        eq = equities[(equities["date"] >= start_ts) & (equities["date"] <= end_ts)].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(DATA.tickers), failed_tickers=())
+
+    monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
+
+    with caplog.at_level("WARNING", logger=S.__name__):
+        S.run_ingestion_tick(repo, end=end)
+
+    # Anchored to the last stored bar, so the gap gets a full window of lookback.
+    assert requested["start"] == last_stored - pd.Timedelta(days=S.DEFAULT_TRAILING_WINDOW_DAYS)
+    assert "backfilling from" in caplog.text
+
+    gap = repo.load_partition(last_stored + pd.Timedelta(days=1), end)
+    expected = full[full["date"] > pd.Timestamp(last_stored)]
+    assert len(gap) == len(expected)  # no missing trading days, for any ticker
+    assert gap["sma_20"].notna().all()
+    assert gap["rsi_14"].notna().all()
+
+    merged = gap.merge(expected, on=["date", "ticker"], suffixes=("", "_full"))
+    assert (merged["sma_20"] - merged["sma_20_full"]).abs().max() == pytest.approx(0, abs=1e-6)
+    # Same residual a steady-state tick leaves: 120 calendar days is ~83
+    # trading rows of EMA lookback, (13/14)**83 ≈ 2e-3. Measured max 0.21.
+    assert (merged["rsi_14"] - merged["rsi_14_full"]).abs().max() < 0.5
+
+
+def test_ingestion_tick_without_a_gap_keeps_the_plain_trailing_window(tmp_path, monkeypatch, caplog):
+    """Steady state: the last stored bar is the tick's own end date, so the
+    fetch is the ordinary trailing window and nothing is logged as a gap."""
+    repo, equities, vix, as_of = _seed_full_history(tmp_path)
+    requested = {}
+
+    def fake_fetch(start, end, tickers=None, strict=True):
+        requested["start"] = pd.Timestamp(start).date()
+        start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+        eq = equities[(equities["date"] >= start_ts) & (equities["date"] <= end_ts)].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(DATA.tickers), failed_tickers=())
+
+    monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
+
+    with caplog.at_level("WARNING", logger=S.__name__):
+        S.run_ingestion_tick(repo, end=as_of)
+
+    assert requested["start"] == as_of - pd.Timedelta(days=S.DEFAULT_TRAILING_WINDOW_DAYS)
+    assert "backfilling" not in caplog.text

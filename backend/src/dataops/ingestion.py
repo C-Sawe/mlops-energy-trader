@@ -31,17 +31,55 @@ class IngestionResult:
     failed_tickers: tuple[str, ...]
 
 
+_PRICE_FIELDS = frozenset({"open", "high", "low", "close", "adj close", "volume"})
+
+
+def _flatten_single_symbol(columns: pd.MultiIndex, ticker: str) -> pd.Index:
+    """Drop the ticker level of a MultiIndex, refusing if it holds >1 symbol.
+
+    yfinance 1.7 returns ``(field, ticker)`` columns even for a one-symbol
+    download (CLAUDE.md §9). Keeping only the field level is safe solely
+    because ``_fetch_one`` requests one symbol per call: on a batched
+    download every ticker's ``Close`` would flatten to the same name and
+    one would silently overwrite the rest. That is a corrupted dataset
+    with no error, so it is refused explicitly instead (§11).
+    """
+    price_level = next(
+        (
+            i for i in range(columns.nlevels)
+            if {str(v).strip().lower() for v in columns.get_level_values(i)} & _PRICE_FIELDS
+        ),
+        None,
+    )
+    if price_level is None:
+        raise IngestionError(f"{ticker}: no OHLCV field level in MultiIndex columns")
+
+    for level in range(columns.nlevels):
+        if level == price_level:
+            continue
+        symbols = sorted({str(v) for v in columns.get_level_values(level)})
+        if len(symbols) > 1:
+            raise IngestionError(
+                f"{ticker}: response holds {len(symbols)} symbols {symbols}; "
+                "flattening would merge their columns. Fetch one symbol per "
+                "call or split the frame by ticker first."
+            )
+
+    return columns.get_level_values(price_level)
+
+
 def _normalise_yf_frame(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """Flatten a yfinance frame into the canonical column contract.
 
-    yfinance returns a MultiIndex column frame for multi-ticker downloads
-    and a flat frame for single-ticker ones; both shapes are handled so
-    callers see one schema.
+    yfinance may return flat columns or ``(field, ticker)`` MultiIndex
+    columns (the latter even for one symbol, in 1.7); both are handled so
+    callers see one schema. A MultiIndex holding more than one symbol is
+    rejected rather than flattened (see ``_flatten_single_symbol``).
     """
     df = raw.copy()
 
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+        df.columns = _flatten_single_symbol(df.columns, ticker)
 
     df = df.reset_index()
     df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]

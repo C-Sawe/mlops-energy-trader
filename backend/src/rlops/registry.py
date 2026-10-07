@@ -18,7 +18,7 @@ import mlflow
 import pandas as pd
 
 from src.config import resolve_mlflow_tracking_uri
-from src.dataops.models import ModelRun, ModelVersion
+from src.dataops.models import RUN_TRIGGERS, ModelRun, ModelVersion
 from src.dataops.repository import MarketRepository
 from src.rlops.agent import PPOAgent
 
@@ -60,6 +60,9 @@ class ModelRegistry:
         metrics: dict[str, float],
         experiment_name: str = "ppo-trading-agent",
         status: str = "COMPLETED",
+        trigger_reason: str | None = None,
+        trigger_rolling_sharpe: float | None = None,
+        trigger_vix: float | None = None,
     ) -> str:
         """FR-08: log hyperparameters and metrics to MLflow, then persist
         the exact partition boundaries to `model_run` (DR-08) so the run is
@@ -70,9 +73,19 @@ class ModelRegistry:
         every trained candidate is logged either way, so "how many
         candidates were rejected" is an answerable question, not silently
         discarded information.
+
+        `trigger_reason` (one of `RUN_TRIGGERS`) records what caused the
+        run (NFR-07), so autonomous CT retrains can be counted separately
+        from manual sweeps. `None` is accepted and stored as unknown rather
+        than defaulted to a guess.
         """
+        if trigger_reason is not None and trigger_reason not in RUN_TRIGGERS:
+            raise ValueError(f"trigger_reason must be one of {RUN_TRIGGERS}, got {trigger_reason!r}")
+
         mlflow.set_experiment(experiment_name)
         with mlflow.start_run() as run:
+            if trigger_reason is not None:
+                mlflow.set_tag("trigger_reason", trigger_reason)
             mlflow.log_params(agent.hyperparameters)
             mlflow.log_metrics(metrics)
             with tempfile.TemporaryDirectory() as tmp_dir:
@@ -92,6 +105,9 @@ class ModelRegistry:
             max_drawdown=metrics.get("max_drawdown"),
             cumulative_return=metrics.get("cumulative_return"),
             status=status,
+            trigger_reason=trigger_reason,
+            trigger_rolling_sharpe=trigger_rolling_sharpe,
+            trigger_vix=trigger_vix,
         )
         with self.repo.session() as session:
             session.add(record)

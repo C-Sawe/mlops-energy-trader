@@ -58,7 +58,12 @@ export function adaptTelemetry(raw) {
   return {
     dates: points.map((p) => new Date(p.date)),
     agent: points.map((p) => p.equity_value),
-    bench: null, // not persisted server-side yet — see Charts.jsx's note
+    // Buy-and-hold replayed by the backend over the same window and costs.
+    // null where a snapshot predates it (the chart leaves a gap there); null
+    // overall when no snapshot has one, so the chart shows a single line.
+    bench: points.some((p) => p.benchmark_equity != null)
+      ? points.map((p) => p.benchmark_equity ?? null)
+      : null,
     sharpe: points.map((p) => p.rolling_sharpe_30d),
     lastMaxDrawdown: last?.max_drawdown ?? null,
   };
@@ -90,6 +95,11 @@ export function adaptMetrics(statusRaw, telemetryAdapted) {
     trainingRuns: statusRaw.training_runs,
     promoted: statusRaw.promoted_count,
     heldBack: statusRaw.rejected_count,
+    // Started by the CT loop itself (bootstrap or Sharpe decay), as opposed
+    // to manual sweeps; runs logged before the backend recorded a trigger
+    // are in training_runs but not here.
+    autonomous: statusRaw.autonomous_retrains ?? null,
+    autonomousPromoted: statusRaw.autonomous_promoted ?? null,
   };
 }
 
@@ -208,6 +218,9 @@ export default function App() {
   const dates = live?.telemetry?.dates ?? mock.dates;
   const agentSeries = live?.telemetry?.agent ?? mock.agent;
   const benchSeries = usingMock ? mock.bench : live.telemetry.bench;
+  // When the benchmark only covers part of the window, say from when.
+  const benchStart = benchSeries ? benchSeries.findIndex((v) => v != null) : -1;
+  const benchSince = benchStart > 0 ? dates[benchStart] : null;
   const sharpeSeries = live?.telemetry?.sharpe ?? mock.sharpe;
   const m = live ? adaptMetrics(live.statusRaw, live.telemetry) : mock.metrics;
 
@@ -299,6 +312,7 @@ export default function App() {
               sub={
                 benchSeries
                   ? "Agent versus equal-weight buy & hold, net of 10 bps costs"
+                    + (benchSince ? ` · benchmark recorded from ${fmtShortDate(benchSince)}` : "")
                   : "Simulated by replaying the incumbent against real market data (CLAUDE.md §6)"
               }
               right={
@@ -363,6 +377,11 @@ export default function App() {
                 </div>
                 <div className="gauge-meta">
                   Training runs, last {m.windowDays} days
+                  {m.autonomous != null && (
+                    <> · <span className="num">{m.autonomous}</span> started by the CT loop
+                      {m.autonomous > 0 && <> (<span className="num">{m.autonomousPromoted}</span> promoted)</>}
+                    </>
+                  )}
                 </div>
               </div>
             </div>

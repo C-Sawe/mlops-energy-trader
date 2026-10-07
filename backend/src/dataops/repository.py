@@ -15,12 +15,13 @@ import logging
 from datetime import date, datetime, timezone
 
 import pandas as pd
-from sqlalchemy import create_engine, select, func
+from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, joinedload, sessionmaker
 
 from src.config import DATABASE
 from src.dataops.models import (
+    AUTONOMOUS_TRIGGERS,
     Base,
     MarketObservation,
     ModelRun,
@@ -67,6 +68,42 @@ class MarketRepository:
 
     def create_schema(self) -> None:
         Base.metadata.create_all(self.engine)
+        self._add_missing_columns()
+
+    def _add_missing_columns(self) -> None:
+        """Add nullable columns introduced after a table already existed.
+
+        `create_all()` creates missing tables but never alters an existing
+        one, so a column added to a model (e.g. `model_run.trigger_reason`)
+        would be absent from any database created before it — the local
+        Postgres holding the real 2015–2025 history included. Only nullable,
+        non-key columns are added, in place, with no data rewritten; rows
+        that predate the column read NULL ("unknown"). Anything else is
+        logged and left for a real migration rather than guessed at.
+        """
+        inspector = inspect(self.engine)
+        existing_tables = set(inspector.get_table_names())
+        preparer = self.engine.dialect.identifier_preparer
+        with self.engine.begin() as conn:
+            for table in Base.metadata.sorted_tables:
+                if table.name not in existing_tables:
+                    continue
+                present = {c["name"] for c in inspector.get_columns(table.name)}
+                for column in table.columns:
+                    if column.name in present:
+                        continue
+                    if not column.nullable or column.primary_key:
+                        logger.error(
+                            "schema: %s.%s is missing and is not nullable; needs a manual migration",
+                            table.name, column.name,
+                        )
+                        continue
+                    col_type = column.type.compile(dialect=self.engine.dialect)
+                    conn.execute(text(
+                        f"ALTER TABLE {preparer.quote(table.name)} "
+                        f"ADD COLUMN {preparer.quote(column.name)} {col_type}"
+                    ))
+                    logger.info("schema: added column %s.%s", table.name, column.name)
 
     def drop_schema(self) -> None:
         Base.metadata.drop_all(self.engine)
@@ -289,6 +326,7 @@ class MarketRepository:
         rolling_sharpe_30d: float | None = None,
         max_drawdown: float | None = None,
         cumulative_return: float | None = None,
+        benchmark_equity: float | None = None,
     ) -> None:
         """FR-13, FR-18: idempotent like `persist()` — the CT orchestrator
         recomputes today's snapshot on every scheduled pass, so re-writing
@@ -305,6 +343,7 @@ class MarketRepository:
                             rolling_sharpe_30d=rolling_sharpe_30d,
                             max_drawdown=max_drawdown,
                             cumulative_return=cumulative_return,
+                            benchmark_equity=benchmark_equity,
                         )
                     )
                 else:
@@ -312,6 +351,7 @@ class MarketRepository:
                     existing.rolling_sharpe_30d = rolling_sharpe_30d
                     existing.max_drawdown = max_drawdown
                     existing.cumulative_return = cumulative_return
+                    existing.benchmark_equity = benchmark_equity
 
     def list_snapshots(self, start: date | str, end: date | str) -> pd.DataFrame:
         """FR-18: the equity curve, rolling Sharpe and max drawdown series
@@ -332,6 +372,7 @@ class MarketRepository:
                     "rolling_sharpe_30d": float(r.rolling_sharpe_30d) if r.rolling_sharpe_30d is not None else None,
                     "max_drawdown": float(r.max_drawdown) if r.max_drawdown is not None else None,
                     "cumulative_return": float(r.cumulative_return) if r.cumulative_return is not None else None,
+                    "benchmark_equity": float(r.benchmark_equity) if r.benchmark_equity is not None else None,
                 }
                 for r in rows
             ]
@@ -405,11 +446,13 @@ class MarketRepository:
         """Training runs logged in the window, and how many were promoted
         vs rejected by the FR-17 acceptance gate.
 
-        Counts every logged run regardless of trigger — there is no field
-        distinguishing a `CTOrchestrator` retrain from a manual
-        `scripts/train_agent.py` sweep, so this is honestly "training
-        activity in the window", not specifically "autonomous retrains".
-        The dashboard labels it accordingly rather than overclaiming.
+        `total_runs` counts every logged run regardless of trigger
+        ("training activity in the window"). `autonomous_runs` counts only
+        runs whose `trigger_reason` says the CT loop started them
+        (`AUTONOMOUS_TRIGGERS`), and `autonomous_promoted` those of them
+        that passed the FR-17 gate. Runs logged before `trigger_reason`
+        existed are NULL and counted in neither autonomous figure — they
+        are unknown, not assumed autonomous.
         """
         since_ts = pd.Timestamp(since)
         with self.session() as session:
@@ -427,7 +470,28 @@ class MarketRepository:
                 .select_from(ModelRun)
                 .where(ModelRun.created_at >= since_ts, ModelRun.status == "REJECTED")
             ).scalar_one()
-        return {"total_runs": total, "promoted": promoted, "rejected": rejected}
+            autonomous = session.execute(
+                select(func.count())
+                .select_from(ModelRun)
+                .where(ModelRun.created_at >= since_ts, ModelRun.trigger_reason.in_(AUTONOMOUS_TRIGGERS))
+            ).scalar_one()
+            autonomous_promoted = session.execute(
+                select(func.count())
+                .select_from(ModelVersion)
+                .join(ModelRun, ModelVersion.run_id == ModelRun.run_id)
+                .where(
+                    ModelRun.created_at >= since_ts,
+                    ModelRun.trigger_reason.in_(AUTONOMOUS_TRIGGERS),
+                    ModelVersion.promoted_at.is_not(None),
+                )
+            ).scalar_one()
+        return {
+            "total_runs": total,
+            "promoted": promoted,
+            "rejected": rejected,
+            "autonomous_runs": autonomous,
+            "autonomous_promoted": autonomous_promoted,
+        }
 
     # ---------------------------------------------------------- ingest info
     def latest_ingest_info(self) -> dict | None:

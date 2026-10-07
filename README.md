@@ -169,11 +169,17 @@ cd mlops-energy-trader
 
 python3 -m venv mlops-env
 source mlops-env/bin/activate          # Windows: mlops-env\Scripts\activate
-pip install -r backend/requirements.txt -c backend/constraints.txt
+pip install -r backend/requirements.txt -c backend/constraints.txt   # constraints pin the tested versions
 
 cp .env.example .env                   # edit credentials if needed
 docker compose up -d postgres          # spin up PostgreSQL container
 ```
+
+`requirements.txt` lists minimum versions; `constraints.txt` pins the exact
+versions the test suite, CI and the Docker image run with. Always install
+with `-c backend/constraints.txt`. Without it pip takes the newest releases,
+and an unpinned MLflow upgrade is the leading suspect for the one time a
+tracking-database migration lost its run history (CLAUDE.md §13).
 
 Benchmarked on an M5 (`backend/scripts/benchmark_device.py`, CLAUDE.md §9): CPU beats MPS by ~12–13× for this policy network (14.7K parameters — small enough that CPU↔GPU transfer overhead dominates any arithmetic MPS would accelerate). Use `device="cpu"` on the PPO model in Sprint 3, not `device="mps"`.
 
@@ -232,10 +238,10 @@ CLAUDE.md §12).
 ### Running Tests
 
 ```bash
-# Backend pytest suite (138 tests, NFR-06 import contracts)
-python -m pytest
+# Backend pytest suite (176 tests, including the NFR-06 import contracts)
+cd backend && python -m pytest
 
-# Frontend Vitest suite (47 tests)
+# Frontend Vitest suite (78 tests: adapters, charts, and App.jsx rendering)
 cd frontend && npm test
 ```
 
@@ -245,6 +251,14 @@ database. The CT orchestrator's tests are the one exception — they use a
 temp-file-backed SQLite database instead, because `:memory:` isn't shared
 across the background thread the orchestrator actually spawns (see
 `CLAUDE.md` §7).
+
+### Deployment
+
+The whole stack (Postgres, the backend with its CT and ingestion schedulers,
+the dashboard behind Caddy, and a daily backup job) deploys to a single
+Linux VM with Docker Compose, through GitHub Actions on every push to
+`main`. Setup, secrets, the first bootstrap, and backup and restore steps
+are in [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md).
 
 ---
 
@@ -309,6 +323,14 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 | I5 | fail-safe lives in `InferenceService`, not the agent | `test_failsafe_does_not_trigger_below_threshold` |
 | NFR-08 | `PredictRequest` field validation | `test_predict_rejects_positions_missing_a_ticker` |
 | NFR-11 | fail-safe decisions logged with `vix_at_decision` | `test_failsafe_decision_is_logged_with_its_trigger_value` |
+| FR-01 (gaps) | `ingestion_scheduler._fetch_start` anchors the window to the last stored bar | `test_ingestion_tick_backfills_a_gap_longer_than_its_window` |
+| DR-02 | `ingestion._flatten_single_symbol` refuses a multi-symbol frame | `test_batched_multiindex_is_rejected_not_merged` |
+| NFR-07 (trigger) | `model_run.trigger_reason` + the Sharpe/VIX behind each CT retrain | `test_decay_retrain_records_the_sharpe_and_vix_that_caused_it`, `test_get_cycle_stats_counts_autonomous_runs_separately` |
+| FR-18 (benchmark) | buy-and-hold replayed in `CTOrchestrator.evaluate` → `portfolio_snapshot.benchmark_equity` | `test_evaluate_persists_a_buy_and_hold_benchmark_on_the_same_window` |
+| IR-07 | `App.jsx` mock and stale fallbacks | `App.render.test.jsx` |
+| NFR-04 | `restart: unless-stopped`; state only in the `pgdata`/`mlruns` volumes | measured locally (CLAUDE.md §5) |
+| NFR-10 | `deploy.yml` writes the VM's `.env` from GitHub secrets; never committed | — |
+| — (no FR/NFR: disaster recovery) | `deploy/backup.sh`, the `backup` compose service | restore rehearsed (`docs/DEPLOYMENT.md`) |
 
 ---
 
@@ -318,6 +340,7 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 - [x] **Sprint 2 — Trading Environment (Complete).** Gymnasium MDP, continuous action space, drawdown-incremented reward, baseline policies, evaluation metrics.
 - [x] **Sprint 3 — Training & Model Registry (Complete).** PPO on CPU (benchmarked ~12–13× faster than MPS), walk-forward cross-validation with a seed sweep, MLflow logging, `model_version` registration.
 - [x] **Sprint 4 — Serving & CT Loop (Complete).** FastAPI inference gateway with the VIX fail-safe checked before any model call, hot-reloadable model loading, a non-blocking CT orchestrator with a real out-of-sample acceptance gate (rejected candidates now logged, not just promoted ones), and a dashboard with a real IR-07 graceful-degradation path — verified running against a real trained model, screenshotted in light and dark mode, with the backend intentionally killed mid-session to confirm the mock fallback.
+- [x] **Sprint 5 — Hardening (#40–#46).** Daily backups with a rehearsed restore, automatic backfill of ingestion gaps longer than the trailing window, a recorded trigger on every training run (autonomous CT retrains now countable), a live buy-and-hold benchmark on the equity chart, rendering tests for the dashboard, a guard against yfinance's batched-download column collision, and config cleanup.
 
 ---
 

@@ -422,6 +422,70 @@ def test_get_cycle_stats_counts_promoted_and_rejected(repo):
     assert stats["rejected"] == 1
 
 
+def test_get_cycle_stats_counts_autonomous_runs_separately(repo):
+    """NFR-07: "the loop retrained itself N times" must be a query, not an
+    inference from total training activity. Runs with no recorded trigger
+    (logged before the column existed) are unknown, not autonomous."""
+    def add_run(trigger, status="COMPLETED"):
+        with repo.session() as session:
+            run = ModelRun(
+                train_start=pd.Timestamp("2020-01-01").date(),
+                train_end=pd.Timestamp("2022-12-31").date(),
+                eval_start=pd.Timestamp("2023-01-01").date(),
+                eval_end=pd.Timestamp("2023-12-31").date(),
+                status=status,
+                trigger_reason=trigger,
+            )
+            session.add(run)
+            session.commit()
+            return run.run_id
+
+    promoted_decay = add_run("ct_decay")
+    add_run("ct_decay", status="REJECTED")
+    add_run("ct_bootstrap", status="REJECTED")
+    add_run("manual_sweep")
+    add_run(None)
+    with repo.session() as session:
+        version = ModelVersion(run_id=promoted_decay, artifact_uri="uri", is_active=False)
+        session.add(version)
+        session.commit()
+        version_id = version.version_id
+    repo.promote_version(version_id)
+
+    stats = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())
+    assert stats["total_runs"] == 5
+    assert stats["autonomous_runs"] == 3
+    assert stats["autonomous_promoted"] == 1
+
+
+def test_create_schema_adds_a_column_missing_from_an_existing_table(tmp_path):
+    """create_all() never alters an existing table, so a column added to a
+    model after a real database was created (benchmark_equity here) would
+    otherwise be missing from it and every write would fail. Existing rows
+    must survive and read the new column as NULL — unknown, not guessed."""
+    from sqlalchemy import inspect, text
+
+    repo = MarketRepository(url=f"sqlite:///{tmp_path / 'old.db'}")
+    with repo.engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE portfolio_snapshot (snapshot_date DATE PRIMARY KEY, "
+            "equity_value NUMERIC(18, 6) NOT NULL, rolling_sharpe_30d NUMERIC(18, 6), "
+            "max_drawdown NUMERIC(18, 6), cumulative_return NUMERIC(18, 6))"
+        ))
+        conn.execute(text("INSERT INTO portfolio_snapshot VALUES ('2024-01-02', 100000, NULL, 0, 0)"))
+
+    repo.create_schema()
+    repo.create_schema()  # a second startup finds nothing to add and does not fail
+
+    assert "benchmark_equity" in {c["name"] for c in inspect(repo.engine).get_columns("portfolio_snapshot")}
+    snaps = repo.list_snapshots("2024-01-01", "2024-01-31")
+    assert snaps["equity_value"].tolist() == [100_000.0]
+    assert snaps["benchmark_equity"].isna().all()
+
+    repo.record_snapshot("2024-01-03", 100_500.0, benchmark_equity=100_200.0)
+    assert repo.list_snapshots("2024-01-03", "2024-01-03")["benchmark_equity"].tolist() == [100_200.0]
+
+
 def test_get_cycle_stats_excludes_runs_before_the_window(repo):
     _make_version(repo)  # created "now", inside any reasonable window
     stats = repo.get_cycle_stats(pd.Timestamp("2099-01-01").date())  # window starts in the future

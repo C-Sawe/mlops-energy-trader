@@ -141,6 +141,8 @@ jobs:
           INGESTION_INTERVAL_SECONDS: ${{ vars.INGESTION_INTERVAL_SECONDS }}
           PAPER_TRADING_ENABLED: ${{ vars.PAPER_TRADING_ENABLED }}
           PAPER_TRADE_TIME_UTC: ${{ vars.PAPER_TRADE_TIME_UTC }}
+          BACKUP_TIME_UTC: ${{ vars.BACKUP_TIME_UTC }}
+          BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
@@ -157,6 +159,8 @@ jobs:
             [ -n "$INGESTION_INTERVAL_SECONDS" ] && echo "INGESTION_INTERVAL_SECONDS=${INGESTION_INTERVAL_SECONDS}"
             [ -n "$PAPER_TRADING_ENABLED" ] && echo "PAPER_TRADING_ENABLED=${PAPER_TRADING_ENABLED}"
             [ -n "$PAPER_TRADE_TIME_UTC" ] && echo "PAPER_TRADE_TIME_UTC=${PAPER_TRADE_TIME_UTC}"
+            [ -n "$BACKUP_TIME_UTC" ] && echo "BACKUP_TIME_UTC=${BACKUP_TIME_UTC}"
+            [ -n "$BACKUP_RETENTION_DAYS" ] && echo "BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS}"
             [ -n "$ALPACA_API_KEY" ] && echo "ALPACA_API_KEY=${ALPACA_API_KEY}"
             [ -n "$ALPACA_SECRET_KEY" ] && echo "ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}"
             true
@@ -167,7 +171,11 @@ jobs:
           ssh target "mkdir -p ~/${DEPLOY_DIR}"
           scp deploy/docker-compose.prod.yml target:"~/${DEPLOY_DIR}/docker-compose.yml"
           scp deploy/Caddyfile target:"~/${DEPLOY_DIR}/Caddyfile"
+          scp deploy/backup.sh target:"~/${DEPLOY_DIR}/backup.sh"
           ssh target "umask 077; cat > ~/${DEPLOY_DIR}/.env" < deploy.env
+          # Backup files (#40) are owned by the deploy user, so they can be
+          # copied off the VM without sudo.
+          ssh target "echo BACKUP_UID=\$(id -u) >> ~/${DEPLOY_DIR}/.env && mkdir -p ~/${DEPLOY_DIR}/backups"
           rm -f deploy.env
 
       - name: Pull images and restart
@@ -208,6 +216,7 @@ jobs:
         run: |
           ssh target "cd ~/${DEPLOY_DIR} && docker compose exec -T frontend wget -qO- http://localhost/healthz"
           ssh target "cd ~/${DEPLOY_DIR} && test -n \"\$(docker compose ps --status running -q caddy)\""
+          ssh target "cd ~/${DEPLOY_DIR} && test -n \"\$(docker compose ps --status running -q backup)\""
 
       - name: Clean up SSH material
         if: always()
