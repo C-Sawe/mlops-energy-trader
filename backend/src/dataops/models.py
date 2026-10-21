@@ -287,3 +287,20 @@ class PaperAccountSnapshot(Base):
     cash: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
     positions: Mapped[list] = mapped_column(JSON, default=list)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DashboardUser(Base):
+    """An email-and-password account for the dashboard (FR-21/FR-22,
+    src/serving/auth.py).
+    Created by an operator with scripts/create_dashboard_user.py, never by
+    self-sign-up; whether it may sign in is still decided by ALLOWED_EMAILS.
+    Holds a salted scrypt hash, never the password (NFR-10)."""
+
+    __tablename__ = "dashboard_user"
+
+    email: Mapped[str] = mapped_column(String(320), primary_key=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    password_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

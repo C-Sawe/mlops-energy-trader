@@ -107,9 +107,21 @@ jobs:
           S_TOKEN: ${{ secrets.API_BEARER_TOKEN }}
           S_BAU: ${{ secrets.BASIC_AUTH_USER }}
           S_BAP: ${{ secrets.BASIC_AUTH_PASSWORD }}
+          S_SESSION: ${{ secrets.SESSION_SECRET }}
+          S_ALLOWED: ${{ secrets.ALLOWED_EMAILS }}
+          S_SITE: ${{ vars.SITE_ADDRESS }}
+          DASHBOARD_AUTH: ${{ vars.DASHBOARD_AUTH }}
         run: |
           missing=0
-          for v in S_HOST S_USER S_KEY S_KNOWN S_PG S_TOKEN S_BAU S_BAP; do
+          # basic (default): nginx basic auth. signin: the dashboard's own
+          # sign-in (PASSWORD_LOGIN and/or a provider's id + secret, which the
+          # backend checks at startup).
+          if [ "${DASHBOARD_AUTH:-basic}" = "signin" ]; then
+            auth_vars="S_SESSION S_ALLOWED S_SITE"  # S_SITE: the domain the callbacks are registered on
+          else
+            auth_vars="S_BAU S_BAP"
+          fi
+          for v in S_HOST S_USER S_KEY S_KNOWN S_PG S_TOKEN $auth_vars; do
             if [ -z "${!v}" ]; then echo "::error::missing secret for $v (see docs/DEPLOYMENT.md)"; missing=1; fi
           done
           exit $missing
@@ -145,6 +157,17 @@ jobs:
           BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          DASHBOARD_AUTH: ${{ vars.DASHBOARD_AUTH }}
+          PASSWORD_LOGIN: ${{ vars.PASSWORD_LOGIN }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+          ALLOWED_EMAILS: ${{ secrets.ALLOWED_EMAILS }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          MICROSOFT_CLIENT_ID: ${{ secrets.MICROSOFT_CLIENT_ID }}
+          MICROSOFT_CLIENT_SECRET: ${{ secrets.MICROSOFT_CLIENT_SECRET }}
+          MICROSOFT_TENANT: ${{ vars.MICROSOFT_TENANT }}
+          GITHUB_CLIENT_ID: ${{ secrets.OAUTH_GITHUB_CLIENT_ID }}
+          GITHUB_CLIENT_SECRET: ${{ secrets.OAUTH_GITHUB_CLIENT_SECRET }}
         run: |
           umask 077
           {
@@ -163,6 +186,18 @@ jobs:
             [ -n "$BACKUP_RETENTION_DAYS" ] && echo "BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS}"
             [ -n "$ALPACA_API_KEY" ] && echo "ALPACA_API_KEY=${ALPACA_API_KEY}"
             [ -n "$ALPACA_SECRET_KEY" ] && echo "ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}"
+            if [ "${DASHBOARD_AUTH:-basic}" = "signin" ]; then
+              # Callbacks and the post-sign-in redirect are built from the
+              # public domain; nginx serves the API under /api.
+              echo "DASHBOARD_AUTH=signin"
+              echo "PUBLIC_API_URL=https://${SITE_ADDRESS}/api"
+              echo "FRONTEND_URL=https://${SITE_ADDRESS}"
+              echo "SESSION_SECRET=${SESSION_SECRET}"
+              echo "ALLOWED_EMAILS=${ALLOWED_EMAILS}"
+              for v in PASSWORD_LOGIN GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET MICROSOFT_CLIENT_ID MICROSOFT_CLIENT_SECRET MICROSOFT_TENANT GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET; do
+                [ -n "${!v}" ] && echo "${v}=${!v}"
+              done
+            fi
             true
           } > deploy.env
 

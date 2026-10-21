@@ -15,14 +15,30 @@ function authHeaders() {
   return TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {};
 }
 
+/**
+ * A 401 means the sign-in session ended (signed out elsewhere, expired, or
+ * removed from the allowlist). AuthGate listens for this and shows the
+ * login page instead of leaving the dashboard silently stale.
+ */
+export const AUTH_REQUIRED_EVENT = "auth:required";
+
+function unauthorized() {
+  window.dispatchEvent(new Event(AUTH_REQUIRED_EVENT));
+  return { ok: false, reason: "unauthorized" };
+}
+
 async function get(path) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
     const res = await fetch(`${BASE}${path}`, {
       signal: ctrl.signal,
+      // The sign-in session is a cookie; "include" sends it in local dev,
+      // where the dashboard (:5173) and API (:8000) are different origins.
+      credentials: "include",
       headers: { Accept: "application/json", ...authHeaders() },
     });
+    if (res.status === 401) return unauthorized();
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     return { ok: true, data: await res.json() };
   } catch (err) {
@@ -42,9 +58,11 @@ async function post(path, body) {
     const res = await fetch(`${BASE}${path}`, {
       method: "POST",
       signal: ctrl.signal,
+      credentials: "include",
       headers: { "Content-Type": "application/json", Accept: "application/json", ...authHeaders() },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+    if (res.status === 401) return unauthorized();
     if (res.status === 422) {
       // NFR-08: the service rejects malformed payloads with a description
       // rather than failing, so surface that description rather than a
@@ -57,7 +75,47 @@ async function post(path, body) {
       return { ok: false, reason: "not_ready", detail };
     }
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (res.status === 204) return { ok: true, data: null };
     return { ok: true, data: await res.json() };
+  } catch (err) {
+    const reason = err.name === "AbortError" ? "timeout" : "unreachable";
+    return { ok: false, reason, error: String(err.message ?? err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Whether sign-in is on, which providers are configured, and who (if
+ * anyone) is signed in. Public, so it never triggers AUTH_REQUIRED_EVENT.
+ */
+export const fetchSession = () => get("/auth/session");
+
+/** Full-page navigation, not fetch: the provider's consent screen takes over the tab. */
+export const loginUrl = (provider) => `${BASE}/auth/login/${encodeURIComponent(provider)}`;
+
+export const signOut = () => post("/auth/logout");
+
+/**
+ * Email-and-password sign-in. Not `post()`: a 401 here means "wrong
+ * password", not "session ended", so it must not fire AUTH_REQUIRED_EVENT,
+ * and the server's message is what the form shows.
+ */
+export async function passwordLogin(email, password) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(`${BASE}/auth/password/login`, {
+      method: "POST",
+      signal: ctrl.signal,
+      credentials: "include",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const body = await res.json().catch(() => null);
+    if (res.ok) return { ok: true, data: body };
+    const detail = typeof body?.detail === "string" ? body.detail : null;
+    return { ok: false, reason: res.status === 429 ? "throttled" : "rejected", detail };
   } catch (err) {
     const reason = err.name === "AbortError" ? "timeout" : "unreachable";
     return { ok: false, reason, error: String(err.message ?? err) };

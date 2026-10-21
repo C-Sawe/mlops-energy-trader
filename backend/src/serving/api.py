@@ -1,7 +1,9 @@
-"""FastAPI inference gateway (FR-10, FR-18, FR-19, FR-20, IR-04, IR-05, NFR-08).
+"""FastAPI inference gateway (FR-10, FR-18, FR-19, FR-20, FR-21, IR-04, IR-05, NFR-08).
 
-Single-user local operation (CLAUDE.md §12's Sprint 4 note): no user table,
-one optional bearer token guarding the exposed surface. `/ct/evaluate` and
+Access: dashboard sign-in for allowlisted people (FR-21/FR-22,
+src/serving/auth.py), and one optional bearer token for scripts and
+server-to-server calls. There are no roles: everyone admitted can do
+everything, as in the original single-user design. `/ct/evaluate` and
 the background scheduler both call the same `CTOrchestrator.evaluate()` —
 the scheduler is FR-13's "on a schedule" satisfied automatically; the
 endpoint exists so the dashboard can also trigger one on demand rather than
@@ -12,19 +14,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 
-from src.config import DATA, PAPER, RISK, SERVING
+from src.config import AUTH, DATA, PAPER, RISK, SERVING
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator
 from src.execution.alpaca_broker import AlpacaBroker, BrokerError
 from src.orchestration.ingestion_scheduler import DEFAULT_TRAILING_WINDOW_DAYS, IngestionState
 from src.orchestration.paper_trader import PaperTrader, next_run_at
 from src.rlops.registry import ModelRegistry
+from src.serving import auth
 from src.serving.inference import InferenceService, NoActiveModelError
 from src.serving.schemas import (
     CandlesResponse,
@@ -137,12 +142,30 @@ async def _run_paper_sync() -> None:
             logging.getLogger(__name__).exception("paper account sync failed")
 
 
+def _check_auth_config() -> None:
+    """CLAUDE.md §11, explicit failure: sign-in configured without a session
+    secret would sign cookies with a key that changes on every restart, and
+    without an allowlist would lock everyone out with no hint why."""
+    if not AUTH.enabled:
+        return
+    missing = [
+        name
+        for name, value in (("SESSION_SECRET", AUTH.session_secret), ("ALLOWED_EMAILS", AUTH.allowed_emails))
+        if not value
+    ]
+    if missing:
+        methods = [*AUTH.enabled_providers, *(["password"] if AUTH.password_login else [])]
+        raise RuntimeError(f"sign-in is enabled ({', '.join(methods)}) but {', '.join(missing)} is not set")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global repo, service, registry, orchestrator, ingestion, paper
     global _scheduler_task, _ingestion_task, _paper_tasks
+    _check_auth_config()
     repo = MarketRepository()
     repo.create_schema()
+    _app.state.repo = repo  # password sign-in reads accounts through it (src/serving/auth.py)
     service = InferenceService(repo=repo)
     registry = ModelRegistry(repo=repo)
     orchestrator = CTOrchestrator(service, repo=repo, registry=registry)
@@ -164,20 +187,58 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="MLOps Trading Inference API", lifespan=lifespan)
+# Always installed: auth.current_user() reads request.session on every
+# guarded request. The secret is read at import, i.e. at process start in
+# any real run; the random fallback only signs cookies while sign-in is off
+# (_check_auth_config refuses to start without SESSION_SECRET otherwise).
+# SameSite=Lax keeps the cookie off cross-site POSTs, which is the CSRF
+# guard for the state-changing endpoints.
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # single-user local operation; no cross-origin secrets are at risk
-    allow_methods=["*"],
-    allow_headers=["*"],
+    SessionMiddleware,
+    secret_key=AUTH.session_secret or secrets.token_urlsafe(32),
+    session_cookie="mlops_session",
+    max_age=7 * 24 * 3600,
+    same_site="lax",
+    https_only=AUTH.public_api_url.startswith("https://"),
 )
+if AUTH.enabled:
+    # Cookies need credentialed CORS, and that needs an explicit origin:
+    # "*" with credentials would let any site call the API as the signed-in
+    # user. Only local dev (Vite on :5173, API on :8000) is cross-origin;
+    # production serves both through nginx under one origin.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[AUTH.frontend_url],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # single-user local operation; no cross-origin secrets are at risk
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+app.include_router(auth.router)
 
 
-def _verify_token(authorization: str | None = Header(default=None)) -> None:
-    """IR-05/NFR-08 boundary check, not a users table (see module docstring)."""
-    if SERVING.bearer_token is None:
+def _verify_token(request: Request, authorization: str | None = Header(default=None)) -> None:
+    """IR-05/NFR-08 boundary check and FR-21's gate. Accepts either
+    credential that is configured: the bearer token (scripts,
+    server-to-server) or a signed-in, allowlisted session (the dashboard).
+    With neither configured the API is open, as in local dev and tests."""
+    token = SERVING.bearer_token
+    if token is None and not AUTH.enabled:
         return
-    if authorization != f"Bearer {SERVING.bearer_token}":
-        raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+    if token is not None and authorization == f"Bearer {token}":
+        return
+    if AUTH.enabled and auth.current_user(request) is not None:
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="sign in or supply a valid bearer token" if AUTH.enabled else "invalid or missing bearer token",
+    )
 
 
 @app.get("/health", response_model=HealthResponse)

@@ -14,8 +14,8 @@ cannot detect decay.
 ## What runs where
 
 ```
-Internet ──▶ caddy (:80/:443, auto-TLS) ──▶ frontend (nginx: static + basic auth)
-                                               │  /api/* (bearer token injected server-side)
+Internet ──▶ caddy (:80/:443, auto-TLS) ──▶ frontend (nginx: static + basic auth, or sign-in)
+                                               │  /api/* (bearer token injected server-side in basic mode)
                                                ▼
                                             backend (uvicorn :8000, not published)
                                                │
@@ -84,8 +84,8 @@ Go to Repo → Settings → Secrets and variables → Actions.
 | `DEPLOY_KNOWN_HOSTS` | the `ssh-keyscan` line from step 2 |
 | `POSTGRES_PASSWORD` | `openssl rand -hex 24`. Use hex: the password goes straight into a connection URL, so `@`, `/` and `:` would break it |
 | `API_BEARER_TOKEN` | `openssl rand -hex 32` |
-| `BASIC_AUTH_USER` | dashboard login name |
-| `BASIC_AUTH_PASSWORD` | dashboard login password |
+| `BASIC_AUTH_USER` | dashboard login name (basic mode only; see [Sign-in](#sign-in)) |
+| `BASIC_AUTH_PASSWORD` | dashboard login password (basic mode only) |
 
 **Variables** (all optional):
 
@@ -99,6 +99,9 @@ Go to Repo → Settings → Secrets and variables → Actions.
 | `PAPER_TRADE_TIME_UTC` | `22:00` | Weekday run time. 22:00 UTC is after the US close in both EDT and EST. |
 | `BACKUP_TIME_UTC` | `03:00` | Daily backup time (see [Backups](#backups)). |
 | `BACKUP_RETENTION_DAYS` | `14` | Backups older than this are deleted after each new one. |
+| `DASHBOARD_AUTH` | `basic` | `signin` replaces basic auth with the dashboard's own sign-in: email and password and/or Google, Microsoft or GitHub. See [Sign-in](#sign-in). |
+| `PASSWORD_LOGIN` | `false` | `true` shows the email-and-password form on the login page (with `DASHBOARD_AUTH=signin`). |
+| `MICROSOFT_TENANT` | `common` | `common` accepts personal and work/school Microsoft accounts. A tenant ID restricts sign-in to one organisation. |
 
 **Paper-trading secrets** (only if `PAPER_TRADING_ENABLED=true`): `ALPACA_API_KEY`
 and `ALPACA_SECRET_KEY` from a free Alpaca **paper** account. The backend's
@@ -232,6 +235,86 @@ double-trade):
 
 ```bash
 curl -X POST -u "$BASIC_AUTH_USER:$BASIC_AUTH_PASSWORD" https://<site>/api/paper/run   # nginx swaps basic auth for the bearer token
+```
+
+## Sign-in
+
+`DASHBOARD_AUTH=signin` replaces the shared basic-auth password with
+per-person sign-in (`backend/src/serving/auth.py`): email and password,
+Google, Microsoft, GitHub, or any mix. Only addresses in
+`ALLOWED_EMAILS` get in, and the list is re-checked on every request, so
+removing an address takes effect at once. nginx then stops injecting the
+bearer token: the browser's session cookie decides. Scripts can still call
+the backend with the bearer token directly.
+
+Sign-in needs HTTPS, so `SITE_ADDRESS` must be a domain, not `:80`. In
+everything below, `<site>` is that domain.
+
+### Email and password
+
+Set the variable `PASSWORD_LOGIN=true`. Accounts are created from the VM,
+not by signing up: self-sign-up would let anyone claim an allowlisted
+address, since nothing emails them to check it's theirs.
+
+```bash
+docker compose exec backend python scripts/create_dashboard_user.py --email you@gmail.com
+```
+
+It asks for the password twice, at a hidden prompt (at least 12
+characters). Run it again to change a password, or add `--delete` to remove
+the account. The email must also be in `ALLOWED_EMAILS`. Passwords are
+stored as salted scrypt hashes. After 10 wrong attempts for one email in 15
+minutes, that email is blocked until the 15 minutes pass. Note that this
+means someone guessing at your address can lock you out for that long; you
+can still sign in with a provider meanwhile.
+
+### Google, Microsoft and GitHub
+
+A provider appears on the login page once both its client ID and secret are
+set. You only need the ones you want.
+
+| Provider | Where to register | Redirect URI to register |
+|---|---|---|
+| Google | [Google Cloud Console](https://console.cloud.google.com/apis/credentials) → Create credentials → OAuth client ID → *Web application*. Set up the consent screen first (External, scopes `openid`, `email`, `profile`). | `https://<site>/api/auth/callback/google` |
+| Microsoft | [Microsoft Entra admin center](https://entra.microsoft.com) → App registrations → New registration. Supported account types: *any organisational directory and personal Microsoft accounts*. Platform *Web*. Then Certificates & secrets → New client secret (note its expiry date). | `https://<site>/api/auth/callback/microsoft` |
+| GitHub | GitHub → Settings → Developer settings → OAuth Apps → New OAuth App. Homepage URL `https://<site>`. | `https://<site>/api/auth/callback/github` |
+
+GitHub only allows one callback URL per OAuth app, so register a second app
+for local development.
+
+**Secrets** (signin mode):
+
+| Secret | Value |
+|---|---|
+| `SESSION_SECRET` | `openssl rand -hex 32`. Signs the session cookie; changing it signs everyone out. |
+| `ALLOWED_EMAILS` | Comma-separated, e.g. `you@gmail.com,supervisor@strathmore.edu` |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | from Google |
+| `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET` | Application (client) ID and the secret's *value* |
+| `OAUTH_GITHUB_CLIENT_ID`, `OAUTH_GITHUB_CLIENT_SECRET` | from GitHub. The `OAUTH_` prefix is required: GitHub doesn't allow secret names that start with `GITHUB_`. |
+
+Then set the variable `DASHBOARD_AUTH=signin` and deploy. The backend
+refuses to start if sign-in is on without `SESSION_SECRET` or
+`ALLOWED_EMAILS`.
+
+**Which email is checked.** Google: the account email, only if Google has
+verified it. GitHub: the account's primary *verified* email, not the public
+profile email. Microsoft: personal accounts use their email. Work and school
+accounts use the sign-in name (UPN), because their `email` field is set by
+the organisation's admin and isn't verified. So list
+`name@strathmore.edu` as the user signs in, not an alias.
+
+**Locally**, without Docker: register `http://localhost:8000/auth/callback/<provider>`
+with each provider (Google and Microsoft accept `http://localhost`), put the
+same variables in the backend's environment, leave `PUBLIC_API_URL` and
+`FRONTEND_URL` at their defaults, and open the dashboard at
+`http://localhost:5173`. Use `localhost`, not `127.0.0.1`: the session cookie
+belongs to `localhost`, and the browser treats the two as different sites.
+
+With `DASHBOARD_AUTH=signin`, trigger the paper cycle (above) with the bearer
+token from the VM instead, since nginx no longer swaps in credentials:
+
+```bash
+docker compose exec backend python -c "import os, urllib.request as u; print(u.urlopen(u.Request('http://localhost:8000/paper/run', method='POST', headers={'Authorization': 'Bearer ' + os.environ['API_BEARER_TOKEN']})).read().decode())"
 ```
 
 ## What this deployment does not change

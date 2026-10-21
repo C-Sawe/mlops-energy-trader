@@ -224,6 +224,72 @@ class PaperTradingConfig:
         return float(os.environ.get("PAPER_MIN_ORDER_NOTIONAL", "1.0"))
 
 
+AUTH_PROVIDERS: tuple[str, ...] = ("google", "microsoft", "github")
+
+
+@dataclass(frozen=True)
+class AuthConfig:
+    """Dashboard sign-in (src/serving/auth.py), FR-21/FR-22/NFR-12 —
+    Google, Microsoft and GitHub via OAuth, and/or email and password,
+    gated by an email allowlist. It replaces the deployment's shared
+    basic-auth password with per-person identities. NFR-10: client secrets
+    and the session secret come from the environment only.
+
+    A provider is enabled when both its `<PROVIDER>_CLIENT_ID` and
+    `<PROVIDER>_CLIENT_SECRET` are set; email-and-password sign-in when
+    `PASSWORD_LOGIN` is true. With neither, sign-in is off and the API
+    behaves exactly as before (bearer token or open), which is what local
+    dev and the test suite rely on.
+
+    Properties for the same reason as `ServingConfig.bearer_token`.
+    """
+
+    @property
+    def session_secret(self) -> str | None:
+        return os.environ.get("SESSION_SECRET")
+
+    @property
+    def allowed_emails(self) -> frozenset[str]:
+        raw = os.environ.get("ALLOWED_EMAILS", "")
+        return frozenset(e.strip().lower() for e in raw.split(",") if e.strip())
+
+    @property
+    def public_api_url(self) -> str:
+        """Where the browser reaches this API — OAuth callbacks are built
+        from it, so it must match each provider's registered redirect URI
+        (behind nginx in production that includes the /api prefix)."""
+        return os.environ.get("PUBLIC_API_URL", "http://localhost:8000").rstrip("/")
+
+    @property
+    def frontend_url(self) -> str:
+        """Where to send the browser after sign-in; also the one origin
+        allowed to make credentialed cross-origin calls in local dev."""
+        return os.environ.get("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+
+    @property
+    def microsoft_tenant(self) -> str:
+        """"common" accepts personal and work/school accounts."""
+        return os.environ.get("MICROSOFT_TENANT", "common")
+
+    def credentials(self, provider: str) -> tuple[str, str] | None:
+        prefix = provider.upper()
+        client_id = os.environ.get(f"{prefix}_CLIENT_ID")
+        client_secret = os.environ.get(f"{prefix}_CLIENT_SECRET")
+        return (client_id, client_secret) if client_id and client_secret else None
+
+    @property
+    def enabled_providers(self) -> tuple[str, ...]:
+        return tuple(p for p in AUTH_PROVIDERS if self.credentials(p))
+
+    @property
+    def password_login(self) -> bool:
+        return os.environ.get("PASSWORD_LOGIN", "false").lower() in ("1", "true", "yes")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.enabled_providers) or self.password_login
+
+
 DATA = DataConfig()
 DATABASE = DatabaseConfig()
 INGESTION = IngestionConfig()
@@ -232,3 +298,4 @@ ENVIRONMENT = EnvironmentConfig()
 BROKER = BrokerConfig()
 SERVING = ServingConfig()
 PAPER = PaperTradingConfig()
+AUTH = AuthConfig()
