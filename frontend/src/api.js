@@ -177,6 +177,12 @@ export const fetchCandles = (ticker, days = 120) =>
  */
 export const fetchPaper = () => get("/paper/status");
 
+/**
+ * FR-20 as a history: what the pipeline did, newest first (the activity
+ * timeline). 100 events covers several hours of 5-minute checks.
+ */
+export const fetchEvents = (limit = 100) => get(`/events?limit=${limit}`);
+
 /** On-demand counterpart to the backend's scheduled CT evaluation (FR-13/14). */
 export const triggerEvaluation = () => post("/ct/evaluate");
 

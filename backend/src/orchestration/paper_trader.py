@@ -33,6 +33,7 @@ from src.config import DATA, PAPER
 from src.dataops.repository import MarketRepository
 from src.execution.alpaca_broker import AlpacaBroker
 from src.execution.rebalance import OrderIntent, liquidate_all, plan_rebalance
+from src.orchestration.events import emit
 from src.serving.inference import InferenceService
 
 logger = logging.getLogger(__name__)
@@ -156,10 +157,11 @@ class PaperTrader:
         return snapshot
 
     # ----------------------------------------------------------------- cycle
-    def run_cycle(self, broker: AlpacaBroker, now: datetime | None = None) -> str:
+    def run_cycle(self, broker: AlpacaBroker, now: datetime | None = None, source: str = "scheduled") -> str:
         """One daily cycle. Returns (and records) a short outcome string.
         Skips, rather than trades, when today's bar hasn't arrived (weekend,
-        holiday, or yfinance lag) or when this signal date already traded."""
+        holiday, or yfinance lag) or when this signal date already traded.
+        `source` ("scheduled" or "manual") goes on the pipeline event."""
         with self._lock:
             if self._status == PaperStatus.TRADING:
                 return "skipped: a cycle is already running"
@@ -176,6 +178,8 @@ class PaperTrader:
                 self._status = PaperStatus.IDLE
                 self._last_run_at = datetime.now(timezone.utc)
                 self._last_outcome = outcome
+            emit(self.repo, "paper_cycle", f"Paper-trading cycle: {outcome}", source=source,
+                 detail={"outcome": outcome})
 
     def _cycle(self, broker: AlpacaBroker, now: datetime | None) -> str:
         today = market_today(now)

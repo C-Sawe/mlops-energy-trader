@@ -20,6 +20,7 @@ from src.config import DATA
 from src.dataops.ingestion import fetch_market_data
 from src.dataops.processing import build_feature_frame
 from src.dataops.repository import MarketRepository
+from src.orchestration.events import emit
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +198,11 @@ class IngestionState:
         tickers: tuple[str, ...] | None = None,
         window_days: int = DEFAULT_TRAILING_WINDOW_DAYS,
         end: date | None = None,
+        source: str = "scheduled",
     ) -> int:
+        """`source` is "scheduled" or "manual" (`/ingest/run`), recorded on
+        the pipeline event this writes."""
+        repo = repo or MarketRepository()
         with self._lock:
             self._status = IngestionStatus.INGESTING
         try:
@@ -206,11 +211,24 @@ class IngestionState:
                 self._last_ok = True
                 self._last_error = None
                 self._last_rows = rows
+            latest = repo.latest_ingest_info()
+            through = f" through {latest['date']}" if latest else ""
+            emit(
+                repo, "ingestion_ok", f"Fetched market data: {rows} rows stored{through}",
+                source=source,
+                detail={"rows": rows, "latest_date": str(latest["date"]) if latest else None},
+            )
             return rows
         except Exception as exc:  # noqa: BLE001 - recorded, then re-raised for the caller to log
             with self._lock:
                 self._last_ok = False
                 self._last_error = str(exc)
+            # IR-02: a failed tick writes nothing, so the stored data is unchanged.
+            emit(
+                repo, "ingestion_failed",
+                f"Market data fetch failed ({type(exc).__name__}); stored data unchanged, next tick retries",
+                source=source, detail={"error_type": type(exc).__name__},
+            )
             raise
         finally:
             with self._lock:

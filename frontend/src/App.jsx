@@ -14,12 +14,13 @@
  * so every field read here is null-guarded rather than assumed present.
  */
 import { useEffect, useState } from "react";
+import { ActivityCard } from "./components/Activity.jsx";
 import { CandleChart, EquityChart, SharpeChart, Gauge } from "./components/Charts.jsx";
 import {
   GlassCard, CardHead, Pill, StatusStrip, Sheet, Button,
 } from "./components/Primitives.jsx";
 import {
-  fetchCandles, fetchDecisions, fetchPaper, fetchStatus, fetchTelemetry, poll, triggerEvaluation,
+  fetchCandles, fetchDecisions, fetchEvents, fetchPaper, fetchStatus, fetchTelemetry, poll, triggerEvaluation,
 } from "./api.js";
 import * as mock from "./mock.js";
 
@@ -103,6 +104,20 @@ export function adaptMetrics(statusRaw, telemetryAdapted) {
   };
 }
 
+/** /events -> timeline events. */
+export function adaptEvents(raw) {
+  return (raw.items ?? []).map((e) => ({
+    id: e.event_id,
+    at: new Date(e.occurred_at),
+    kind: e.kind,
+    source: e.source,
+    summary: e.summary,
+    detail: e.detail ?? {},
+    runId: e.run_id,
+    versionId: e.version_id,
+  }));
+}
+
 export const TICKERS = ["XOM", "CVX", "SHEL", "BP", "NEE"];
 
 const money = (v) =>
@@ -165,6 +180,7 @@ export default function App({ user = null, onSignOut } = {}) {
   const [ticker, setTicker] = useState("XOM");
   const [paperLive, setPaperLive] = useState(null);
   const [candlesLive, setCandlesLive] = useState(null);
+  const [eventsLive, setEventsLive] = useState(null);
 
   // Polled separately from the main loop: a paper or candle failure (e.g.
   // an older backend without these endpoints) must not mark the whole
@@ -173,6 +189,8 @@ export default function App({ user = null, onSignOut } = {}) {
     () => poll(fetchPaper, 60000, (r) => { if (r.ok) setPaperLive(adaptPaper(r.data)); }),
     []
   );
+  const loadEvents = (r) => { if (r.ok) setEventsLive(adaptEvents(r.data)); };
+  useEffect(() => poll(fetchEvents, 15000, loadEvents), []);
   useEffect(() => {
     setCandlesLive(null);
     return poll(() => fetchCandles(ticker, 120), 60000, (r) => {
@@ -255,6 +273,7 @@ export default function App({ user = null, onSignOut } = {}) {
       const result = await triggerEvaluation();
       if (result.ok) {
         setLive((prev) => (prev ? { ...prev, statusRaw: result.data, status: adaptStatus(result.data) } : prev));
+        loadEvents(await fetchEvents());
       }
     } finally {
       setChecking(false);
@@ -398,6 +417,8 @@ export default function App({ user = null, onSignOut } = {}) {
               <Pill tone="warn">{m.heldBack} held back</Pill>
             </div>
           </GlassCard>
+
+          <ActivityCard events={usingMock ? mock.events : eventsLive} />
         </div>
       </div>
 

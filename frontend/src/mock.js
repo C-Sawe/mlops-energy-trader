@@ -152,3 +152,32 @@ export const paper = {
     };
   }),
 };
+
+/** Example pipeline activity, newest first, timed relative to page load. */
+export const events = (() => {
+  const now = Date.now();
+  const at = (minutesAgo) => new Date(now - minutesAgo * 60000);
+  const check = (id, minutesAgo, sharpe) => ({
+    id, at: at(minutesAgo), kind: "evaluation", source: "scheduled",
+    summary: `Rolling Sharpe ${sharpe.toFixed(2)} meets the 1.00 target: model kept serving`,
+    detail: { rolling_sharpe: sharpe, target: 1.0 },
+  });
+  return [
+    check(14, 2, 1.18), check(13, 7, 1.18), check(12, 12, 1.16), check(11, 17, 1.16),
+    { id: 10, at: at(21), kind: "candidate_promoted", source: "scheduled", detail: {},
+      summary: "Candidate beat the current model out of sample (Sharpe 1.21 vs 0.64): promoted and hot-swapped with no restart" },
+    { id: 9, at: at(26), kind: "retrain_started", source: "scheduled", detail: {},
+      summary: "Rolling Sharpe 0.64 fell below the 1.00 target: retraining a candidate in the background while the current model keeps serving" },
+    { id: 8, at: at(31), kind: "candidate_rejected", source: "scheduled", detail: {},
+      summary: "Candidate did not beat the current model out of sample (Sharpe 0.41 vs 0.64): current model kept" },
+    { id: 7, at: at(36), kind: "retrain_started", source: "scheduled", detail: {},
+      summary: "Rolling Sharpe 0.64 fell below the 1.00 target: retraining a candidate in the background while the current model keeps serving" },
+    { id: 6, at: at(41), kind: "evaluation", source: "manual", detail: { rolling_sharpe: 1.02, target: 1.0 },
+      summary: "Rolling Sharpe 1.02 meets the 1.00 target: model kept serving" },
+    { id: 5, at: at(95), kind: "ingestion_ok", source: "scheduled", detail: { rows: 600 },
+      summary: "Fetched market data: 600 rows stored through the latest close" },
+    check(4, 100, 1.05), check(3, 105, 1.05), check(2, 110, 1.04),
+    { id: 1, at: at(300), kind: "retrain_deferred", source: "scheduled", detail: {},
+      summary: "Rolling Sharpe 0.82 is below the 1.00 target, but VIX 36.4 is at or above 35.0: retrain deferred until volatility subsides" },
+  ];
+})();

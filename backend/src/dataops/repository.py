@@ -30,6 +30,7 @@ from src.dataops.models import (
     PaperAccountSnapshot,
     PaperCycle,
     PaperOrder,
+    PipelineEvent,
     PortfolioSnapshot,
     TradingDecision,
 )
@@ -703,3 +704,53 @@ class MarketRepository:
                     return False
                 session.delete(user)
                 return True
+
+    def record_event(
+        self,
+        kind: str,
+        summary: str,
+        source: str = "scheduled",
+        detail: dict | None = None,
+        run_id: str | None = None,
+        version_id: str | None = None,
+    ) -> int:
+        """Appends one pipeline event (FR-20 history). The orchestration
+        layer calls this through `src/orchestration/events.emit`, which keeps
+        a failed write from interrupting the pipeline itself."""
+        with self.session() as session:
+            with session.begin():
+                event = PipelineEvent(
+                    occurred_at=datetime.now(timezone.utc),
+                    kind=kind,
+                    source=source,
+                    summary=summary[:300],
+                    detail=detail or {},
+                    run_id=run_id,
+                    version_id=version_id,
+                )
+                session.add(event)
+                session.flush()
+                return event.event_id
+
+    def list_events(self, limit: int = 50, before_id: int | None = None) -> tuple[list[dict], bool]:
+        """Newest first. `before_id` pages back through older events; the
+        bool says whether any remain beyond this page."""
+        stmt = select(PipelineEvent).order_by(PipelineEvent.event_id.desc()).limit(limit + 1)
+        if before_id is not None:
+            stmt = stmt.where(PipelineEvent.event_id < before_id)
+        with self.session() as session:
+            rows = session.execute(stmt).scalars().all()
+            items = [
+                {
+                    "event_id": r.event_id,
+                    "occurred_at": r.occurred_at,
+                    "kind": r.kind,
+                    "source": r.source,
+                    "summary": r.summary,
+                    "detail": dict(r.detail or {}),
+                    "run_id": r.run_id,
+                    "version_id": r.version_id,
+                }
+                for r in rows[:limit]
+            ]
+        return items, len(rows) > limit
