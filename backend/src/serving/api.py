@@ -37,8 +37,10 @@ from src.serving.schemas import (
     DecisionLogEntry,
     DecisionLogResponse,
     EquityPoint,
+    EventsResponse,
     HealthResponse,
     PaperStatusResponse,
+    PipelineEventOut,
     PredictRequest,
     PredictResponse,
     TelemetryResponse,
@@ -98,18 +100,18 @@ async def _run_ingestion_scheduler() -> None:
             logging.getLogger(__name__).exception("scheduled ingestion tick failed")
 
 
-def _paper_cycle_job() -> str:
+def _paper_cycle_job(source: str = "scheduled") -> str:
     """Ingest today's bar first, so the cycle decides on the close that
     just happened rather than on whatever the interval-based ingestion
     scheduler last fetched. An ingestion failure is logged, not fatal: the
     cycle's own "no bar for today" check then skips trading."""
     try:
-        ingestion.run(repo)
+        ingestion.run(repo, source=source)
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("paper cycle: pre-trade ingestion failed")
     broker = _broker_factory()
     try:
-        return paper.run_cycle(broker)
+        return paper.run_cycle(broker, source=source)
     finally:
         broker.close()
 
@@ -364,7 +366,7 @@ def trigger_evaluation(as_of: date | None = Query(default=None)) -> CTStatusResp
     reach all the way to the literal current date) instead of always
     defaulting to `date.today()`.
     """
-    orchestrator.evaluate(as_of=as_of)
+    orchestrator.evaluate(as_of=as_of, source="manual")
     return ct_status()
 
 
@@ -384,8 +386,19 @@ def trigger_ingestion(
     takes `as_of`: forcing a specific range for backfill or a demo, rather
     than always defaulting to `date.today()`.
     """
-    ingestion.run(repo, window_days=window_days, end=end)
+    ingestion.run(repo, window_days=window_days, end=end, source="manual")
     return ct_status()
+
+
+@app.get("/events", response_model=EventsResponse, dependencies=[Depends(_verify_token)])
+def events(
+    limit: int = Query(default=50, ge=1, le=200),
+    before: int | None = Query(default=None, ge=1),
+) -> EventsResponse:
+    """FR-20 as a history: what the pipeline did, newest first. `before` is
+    the oldest `event_id` already shown, to page further back."""
+    items, has_more = repo.list_events(limit=limit, before_id=before)
+    return EventsResponse(items=[PipelineEventOut(**i) for i in items], has_more=has_more)
 
 
 @app.get("/market/candles", response_model=CandlesResponse, dependencies=[Depends(_verify_token)])
@@ -448,7 +461,7 @@ def trigger_paper_cycle() -> PaperStatusResponse:
     not already traded — so pressing it twice cannot double-trade."""
     _require_paper_enabled()
     try:
-        _paper_cycle_job()
+        _paper_cycle_job(source="manual")
     except BrokerError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except NoActiveModelError as exc:

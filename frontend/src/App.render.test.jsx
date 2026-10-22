@@ -21,6 +21,7 @@ vi.mock("./api.js", async (importOriginal) => {
     fetchDecisions: vi.fn(),
     fetchPaper: vi.fn(),
     fetchCandles: vi.fn(),
+    fetchEvents: vi.fn(),
     triggerEvaluation: vi.fn(),
   };
 });
@@ -122,6 +123,7 @@ beforeEach(() => {
   // Paper and candles poll on their own; their failure must not affect the rest.
   api.fetchPaper.mockResolvedValue(DOWN);
   api.fetchCandles.mockResolvedValue(DOWN);
+  api.fetchEvents.mockResolvedValue(DOWN);
 });
 
 afterEach(() => {
@@ -288,5 +290,35 @@ describe("signed-in account", () => {
     backendUp();
     await renderApp();
     expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
+  });
+});
+
+describe("pipeline activity", () => {
+  it("shows the backend's events, with a manual Force Check marked as such", async () => {
+    backendUp();
+    api.fetchEvents.mockResolvedValue(ok({
+      items: [
+        { event_id: 2, occurred_at: "2026-10-06T12:05:00Z", kind: "candidate_rejected", source: "scheduled",
+          summary: "Candidate did not beat the current model out of sample (Sharpe 0.41 vs 0.64): current model kept",
+          detail: {}, run_id: "r1", version_id: null },
+        { event_id: 1, occurred_at: "2026-10-06T12:00:00Z", kind: "evaluation", source: "manual",
+          summary: "Rolling Sharpe 1.02 meets the 1.00 target: model kept serving",
+          detail: { rolling_sharpe: 1.02, target: 1.0 }, run_id: null, version_id: "v1" },
+      ],
+      has_more: false,
+    }));
+    await renderApp();
+
+    const list = screen.getByRole("list", { name: /pipeline activity/i });
+    expect(within(list).getByText("Candidate rejected")).toBeTruthy();
+    expect(within(list).getByText("by operator")).toBeTruthy();
+  });
+
+  it("says it is waiting rather than showing an empty timeline while the backend is down", async () => {
+    backendUp();
+    await renderApp();
+    // Scoped: the paper card has the same waiting message.
+    const card = screen.getByRole("heading", { name: "Pipeline activity" }).closest("section");
+    expect(within(card).getByText("Waiting for the backend…")).toBeTruthy();
   });
 });

@@ -23,6 +23,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     BigInteger,
@@ -304,3 +305,54 @@ class DashboardUser(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     password_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+PIPELINE_EVENT_KINDS = (
+    "ingestion_ok",
+    "ingestion_failed",
+    "evaluation",
+    "evaluation_skipped",
+    "retrain_started",
+    "retrain_deferred",
+    "candidate_promoted",
+    "candidate_rejected",
+    "retrain_failed",
+    "paper_cycle",
+)
+EVENT_SOURCES = ("scheduled", "manual")
+
+
+class PipelineEvent(Base):
+    """One thing the pipeline did, recorded by the code path that did it at
+    the moment it happened (FR-20's status, kept as a history; NFR-07).
+    Never reconstructed afterwards from other tables, the same rule the live
+    benchmark follows, so the dashboard's activity timeline shows only what
+    actually ran. `source` says whether a scheduler or an operator started
+    it. `run_id`/`version_id` link a retrain's outcome to the model it
+    produced; plain columns rather than foreign keys, since this is an audit
+    log and must not block deleting a run."""
+
+    __tablename__ = "pipeline_event"
+
+    event_id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer(), "sqlite"), primary_key=True, autoincrement=True
+    )
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="scheduled")
+    summary: Mapped[str] = mapped_column(String(300), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN (" + ", ".join(f"'{k}'" for k in PIPELINE_EVENT_KINDS) + ")",
+            name="ck_pipeline_event_kind",
+        ),
+        CheckConstraint(
+            "source IN (" + ", ".join(f"'{s}'" for s in EVENT_SOURCES) + ")",
+            name="ck_pipeline_event_source",
+        ),
+        Index("ix_pipeline_event_occurred_at", "occurred_at"),
+    )

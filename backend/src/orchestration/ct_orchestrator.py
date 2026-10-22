@@ -27,6 +27,7 @@ from src.config import DATA, RISK
 from src.dataops.processing import normalize_rolling, partition_chronological
 from src.dataops.repository import MarketRepository
 from src.orchestration.evaluator import max_drawdown, sharpe_ratio
+from src.orchestration.events import emit, finite_or_none, fmt
 from src.rlops.agent import PPOAgent
 from src.rlops.baselines import buy_and_hold, run_policy
 from src.rlops.environment import TradingEnvironment
@@ -122,7 +123,7 @@ class CTOrchestrator:
         ingest = self.repo.latest_ingest_info()
         return ingest["vix"] if ingest else None
 
-    def evaluate(self, as_of: date | None = None) -> CTStatus:
+    def evaluate(self, as_of: date | None = None, source: str = "scheduled") -> CTStatus:
         """FR-13: replay the incumbent over the most recent evaluation
         window, persist a fresh snapshot per day (FR-18 reads these back),
         and trigger a retrain (FR-14) if the resulting rolling Sharpe has
@@ -131,6 +132,8 @@ class CTOrchestrator:
         `as_of` defaults to today; tests pin it to a fixed date so synthetic
         fixture data (which does not span up to whatever "today" happens to
         be when the suite runs) is actually found by the lookback queries.
+        `source` is "scheduled" or "manual" (the dashboard's Force Check),
+        recorded on the pipeline event each outcome writes.
         """
         with self._lock:
             if self._status != CTStatus.SERVING:
@@ -141,7 +144,7 @@ class CTOrchestrator:
             agent = self.inference_service.get_agent()
             if agent is None:
                 logger.info("no incumbent model; triggering an initial training run")
-                self._trigger_retrain(as_of, "ct_bootstrap", vix=self._current_vix())
+                self._trigger_retrain(as_of, "ct_bootstrap", vix=self._current_vix(), source=source)
                 return self.status
 
             # Fetch far more than the evaluation window itself: normalize_rolling's
@@ -165,6 +168,11 @@ class CTOrchestrator:
                 # triggered this evaluation.
                 logger.warning(
                     "no market data in [%s, %s]; skipping this evaluation", lookback_start.date(), end.date()
+                )
+                emit(
+                    self.repo, "evaluation_skipped",
+                    f"No market data up to {end.date()}: evaluation skipped until ingestion catches up",
+                    source=source, detail={"window_end": str(end.date())},
                 )
                 with self._lock:
                     self._status = CTStatus.SERVING
@@ -209,12 +217,30 @@ class CTOrchestrator:
                     with self._lock:
                         self._last_retrain_deferred_at = datetime.now(timezone.utc)
                         self._status = CTStatus.SERVING
+                    emit(
+                        self.repo, "retrain_deferred",
+                        f"Rolling Sharpe {fmt(rolling)} is below the {fmt(RISK.target_sharpe_threshold)} target, "
+                        f"but VIX {fmt(current_vix, 1)} is at or above {fmt(RISK.vix_critical_threshold, 1)}: "
+                        "retrain deferred until volatility subsides",
+                        source=source,
+                        detail={"rolling_sharpe": finite_or_none(rolling), "vix": current_vix,
+                                "target": RISK.target_sharpe_threshold},
+                    )
                     return self.status
                 logger.info("rolling Sharpe %.3f below target %.3f; retraining", rolling, RISK.target_sharpe_threshold)
-                self._trigger_retrain(as_of, "ct_decay", rolling_sharpe=rolling, vix=current_vix)
+                self._trigger_retrain(as_of, "ct_decay", rolling_sharpe=rolling, vix=current_vix, source=source)
             else:
                 with self._lock:
                     self._status = CTStatus.SERVING
+                emit(
+                    self.repo, "evaluation",
+                    f"Rolling Sharpe {fmt(rolling)} meets the {fmt(RISK.target_sharpe_threshold)} target: "
+                    "model kept serving",
+                    source=source,
+                    detail={"rolling_sharpe": finite_or_none(rolling), "target": RISK.target_sharpe_threshold,
+                            "window_end": str(end.date())},
+                    version_id=self.inference_service.active_version_id,
+                )
         except Exception:
             with self._lock:
                 self._status = CTStatus.SERVING
@@ -257,6 +283,7 @@ class CTOrchestrator:
         reason: str,
         rolling_sharpe: float | None = None,
         vix: float | None = None,
+        source: str = "scheduled",
     ) -> None:
         """`reason` is "ct_bootstrap" or "ct_decay" from `evaluate()`
         ("analysis" from measurement scripts that force a retrain) —
@@ -267,9 +294,22 @@ class CTOrchestrator:
             if self._status == CTStatus.RETRAINING:
                 return
             self._status = CTStatus.RETRAINING
+        if reason == "ct_bootstrap":
+            summary = "No model is serving yet: training the first one"
+        elif reason == "ct_decay":
+            summary = (
+                f"Rolling Sharpe {fmt(rolling_sharpe)} fell below the {fmt(RISK.target_sharpe_threshold)} "
+                "target: retraining a candidate in the background while the current model keeps serving"
+            )
+        else:
+            summary = f"Retrain started ({reason})"
+        emit(
+            self.repo, "retrain_started", summary, source=source,
+            detail={"reason": reason, "rolling_sharpe": finite_or_none(rolling_sharpe), "vix": vix},
+        )
         thread = threading.Thread(
             target=self._retrain_and_maybe_promote,
-            args=(as_of, reason, rolling_sharpe, vix),
+            args=(as_of, reason, rolling_sharpe, vix, source),
             daemon=True,
         )
         self._retrain_thread = thread
@@ -281,6 +321,7 @@ class CTOrchestrator:
         reason: str | None = None,
         rolling_sharpe: float | None = None,
         vix: float | None = None,
+        source: str = "scheduled",
     ) -> None:
         """FR-15: runs in its own thread — `InferenceService.predict()` is
         untouched while this executes, since it only ever reads the
@@ -347,6 +388,34 @@ class CTOrchestrator:
             else:
                 # FR-17: the incumbent is retained; promotion is aborted.
                 logger.info("candidate did not beat incumbent; incumbent retained")
+
+            outcome = {
+                "candidate_sharpe": finite_or_none(candidate_sharpe),
+                "incumbent_sharpe": finite_or_none(incumbent_sharpe),
+                "eval_start": str(eval_start.date()),
+                "eval_end": str(eval_end.date()),
+                "reason": reason,
+            }
+            if accepted and not np.isfinite(incumbent_sharpe):
+                emit(
+                    self.repo, "candidate_promoted",
+                    f"First model trained (out-of-sample Sharpe {fmt(candidate_sharpe)}): promoted and serving",
+                    source=source, detail=outcome, run_id=run_id, version_id=version_id,
+                )
+            elif accepted:
+                emit(
+                    self.repo, "candidate_promoted",
+                    f"Candidate beat the current model out of sample (Sharpe {fmt(candidate_sharpe)} vs "
+                    f"{fmt(incumbent_sharpe)}): promoted and hot-swapped with no restart",
+                    source=source, detail=outcome, run_id=run_id, version_id=version_id,
+                )
+            else:
+                emit(
+                    self.repo, "candidate_rejected",
+                    f"Candidate did not beat the current model out of sample (Sharpe {fmt(candidate_sharpe)} vs "
+                    f"{fmt(incumbent_sharpe)}): current model kept",
+                    source=source, detail=outcome, run_id=run_id,
+                )
         except Exception as exc:  # noqa: BLE001 - NFR-05: a crashed retrain must not crash the process
             # A genuine crash (bad data, an OOM, a training exception) is
             # different from FR-17's "candidate lost the comparison" — that
@@ -364,6 +433,12 @@ class CTOrchestrator:
             with self._lock:
                 self._last_retrain_failed_at = datetime.now(timezone.utc)
                 self._last_retrain_error = str(exc)
+            # The exception text stays in the server log, as on /ct-status.
+            emit(
+                self.repo, "retrain_failed",
+                "Retraining failed; the current model kept serving (details in the server log)",
+                source=source, detail={"reason": reason},
+            )
         finally:
             with self._lock:
                 self._status = CTStatus.SERVING

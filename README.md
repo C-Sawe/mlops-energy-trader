@@ -320,6 +320,7 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 | FR-19 | `MarketRepository.list_decisions` → `/decisions` | `test_decisions_endpoint_paginates` |
 | NFR-07 (dashboard) | `list_decisions` joins to `model_run` for run_id + both partitions | `test_list_decisions_includes_run_and_partition` |
 | FR-20 | `CTOrchestrator.status` → `/ct-status` | `test_ct_status_reflects_active_version` |
+| FR-20 (history), NFR-07 | `pipeline_event` written by each step via `orchestration/events.emit` → `/events` → `components/Activity.jsx` timeline | `test_pipeline_events.py`, `Activity.test.jsx` |
 | I5 | fail-safe lives in `InferenceService`, not the agent | `test_failsafe_does_not_trigger_below_threshold` |
 | NFR-08 | `PredictRequest` field validation | `test_predict_rejects_positions_missing_a_ticker` |
 | NFR-11 | fail-safe decisions logged with `vix_at_decision` | `test_failsafe_decision_is_logged_with_its_trigger_value` |

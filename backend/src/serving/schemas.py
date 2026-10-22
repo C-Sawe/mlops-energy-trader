@@ -233,3 +233,21 @@ class PasswordLoginRequest(BaseModel):
 
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=1024)
+
+
+class PipelineEventOut(BaseModel):
+    """One entry on the dashboard's activity timeline (FR-20, NFR-07)."""
+
+    event_id: int
+    occurred_at: datetime
+    kind: str
+    source: str
+    summary: str
+    detail: dict
+    run_id: str | None
+    version_id: str | None
+
+
+class EventsResponse(BaseModel):
+    items: list[PipelineEventOut]
+    has_more: bool
