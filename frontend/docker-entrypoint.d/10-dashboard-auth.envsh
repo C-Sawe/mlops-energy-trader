@@ -1,0 +1,34 @@
+#!/bin/sh
+# Chooses how the dashboard is protected. DASHBOARD_AUTH:
+#   basic (default) - nginx basic auth in front of everything, and nginx
+#                     injects the API bearer token so the browser never sees it.
+#   signin          - no basic auth and no injected token: the backend's own
+#                     sign-in (Google / Microsoft / GitHub and/or email and
+#                     password, src/serving/auth.py) decides. Injecting the token here would let every
+#                     request through without signing in.
+#
+# Sourced (.envsh), not executed, so the variables exported here reach the
+# template step that follows (20-envsubst-on-templates.sh). Being sourced,
+# it must not `set -e`; `exit 1` still stops the container from starting
+# (CLAUDE.md §11: prefer explicit failure to serving an open dashboard).
+
+case "${DASHBOARD_AUTH:-basic}" in
+    signin)
+        export NGINX_AUTH_BASIC="off"
+        export PROXY_AUTHORIZATION=""
+        ;;
+    basic)
+        if [ -z "${BASIC_AUTH_USER:-}" ] || [ -z "${BASIC_AUTH_PASSWORD:-}" ]; then
+            echo "10-dashboard-auth.envsh: BASIC_AUTH_USER and BASIC_AUTH_PASSWORD must be set" >&2
+            exit 1
+        fi
+        # -i reads the password from stdin so it never appears in a process listing.
+        printf '%s' "$BASIC_AUTH_PASSWORD" | htpasswd -ciB /etc/nginx/.htpasswd "$BASIC_AUTH_USER"
+        export NGINX_AUTH_BASIC='"MLOps Energy Trader"'
+        export PROXY_AUTHORIZATION="Bearer ${API_BEARER_TOKEN}"
+        ;;
+    *)
+        echo "10-dashboard-auth.envsh: DASHBOARD_AUTH must be 'basic' or 'signin', not '${DASHBOARD_AUTH}'" >&2
+        exit 1
+        ;;
+esac

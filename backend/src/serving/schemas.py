@@ -204,3 +204,32 @@ class PaperStatusResponse(BaseModel):
     positions: list[PaperPosition]
     equity_curve: list[PaperEquityPoint]
     fills: list[PaperFill]
+
+
+class AuthProvider(BaseModel):
+    id: str
+    label: str
+
+
+class AuthUser(BaseModel):
+    email: str
+    name: str | None
+    provider: str
+
+
+class AuthSessionResponse(BaseModel):
+    """`auth_enabled` false means no sign-in method is configured and the
+    dashboard should load directly (src/serving/auth.py)."""
+
+    auth_enabled: bool
+    providers: list[AuthProvider]
+    password_login: bool
+    user: AuthUser | None
+
+
+class PasswordLoginRequest(BaseModel):
+    """NFR-08. The password's upper bound keeps one request from making the
+    hash arbitrarily expensive."""
+
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=1024)

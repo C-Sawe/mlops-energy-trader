@@ -4,7 +4,10 @@
  * convention of no network required.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchDecisions, fetchTelemetry, poll, predict, triggerEvaluation } from "./api.js";
+import {
+  AUTH_REQUIRED_EVENT, fetchDecisions, fetchStatus, fetchTelemetry, passwordLogin, poll, predict, signOut,
+  triggerEvaluation,
+} from "./api.js";
 
 function jsonResponse(status, body) {
   return {
@@ -106,6 +109,50 @@ describe("predict/triggerEvaluation (NFR-08: malformed input and not-ready are d
     fetch.mockResolvedValue(jsonResponse(200, { decisions: [] }));
     const result = await predict({ XOM: 0.0 }, 1.0);
     expect(result.ok).toBe(true);
+  });
+});
+
+describe("sign-in session", () => {
+  it("sends the session cookie with every call", async () => {
+    fetch.mockResolvedValue(jsonResponse(200, {}));
+    await fetchStatus();
+    await triggerEvaluation();
+    expect(fetch.mock.calls.map(([, init]) => init.credentials)).toEqual(["include", "include"]);
+  });
+
+  it("reports a 401 as 'unauthorized' and tells the sign-in gate", async () => {
+    const listener = vi.fn();
+    window.addEventListener(AUTH_REQUIRED_EVENT, listener);
+    fetch.mockResolvedValue(jsonResponse(401, { detail: "sign in" }));
+
+    expect((await fetchStatus()).reason).toBe("unauthorized");
+    expect((await triggerEvaluation()).reason).toBe("unauthorized");
+    expect(listener).toHaveBeenCalledTimes(2);
+    window.removeEventListener(AUTH_REQUIRED_EVENT, listener);
+  });
+
+  it("password login returns the server's message on 401 and 429 without ending the session", async () => {
+    const listener = vi.fn();
+    window.addEventListener(AUTH_REQUIRED_EVENT, listener);
+
+    fetch.mockResolvedValue(jsonResponse(401, { detail: "Incorrect email or password." }));
+    expect(await passwordLogin("a@b.c", "x")).toEqual({
+      ok: false, reason: "rejected", detail: "Incorrect email or password.",
+    });
+    fetch.mockResolvedValue(jsonResponse(429, { detail: "Too many failed attempts." }));
+    expect((await passwordLogin("a@b.c", "x")).reason).toBe("throttled");
+
+    expect(listener).not.toHaveBeenCalled();
+    window.removeEventListener(AUTH_REQUIRED_EVENT, listener);
+    const [url, init] = fetch.mock.calls[0];
+    expect(url).toMatch(/\/auth\/password\/login$/);
+    expect(init.credentials).toBe("include");
+    expect(JSON.parse(init.body)).toEqual({ email: "a@b.c", password: "x" });
+  });
+
+  it("treats sign-out's empty 204 as success", async () => {
+    fetch.mockResolvedValue({ ok: true, status: 204, statusText: "", json: async () => { throw new SyntaxError("empty"); } });
+    expect(await signOut()).toEqual({ ok: true, data: null });
   });
 });
 

@@ -3,11 +3,16 @@
 #
 # Only Caddy publishes ports. Postgres and the backend are reachable only on
 # the internal compose network, so the API is never exposed without the
-# dashboard's basic auth in front of it.
+# dashboard's basic auth or sign-in in front of it.
 #
 # Required in the host's .env (written by the deploy workflow from GitHub
 # secrets — NFR-10, never committed): IMAGE_PREFIX, IMAGE_TAG,
-# POSTGRES_PASSWORD, API_BEARER_TOKEN, BASIC_AUTH_USER, BASIC_AUTH_PASSWORD.
+# POSTGRES_PASSWORD, API_BEARER_TOKEN, and either BASIC_AUTH_USER +
+# BASIC_AUTH_PASSWORD (DASHBOARD_AUTH=basic, the default) or, for the
+# dashboard's own sign-in (DASHBOARD_AUTH=signin), SESSION_SECRET,
+# ALLOWED_EMAILS, PUBLIC_API_URL, FRONTEND_URL and PASSWORD_LOGIN=true and/or
+# a provider's <PROVIDER>_CLIENT_ID + <PROVIDER>_CLIENT_SECRET
+# (docs/DEPLOYMENT.md, "Sign-in").
 # Optional: SITE_ADDRESS (a domain name enables automatic HTTPS),
 # BACKUP_TIME_UTC, BACKUP_RETENTION_DAYS. BACKUP_UID is appended on the host
 # by the deploy workflow so backup files belong to the deploy user.
@@ -58,6 +63,21 @@ services:
       PAPER_SYNC_INTERVAL_SECONDS: ${PAPER_SYNC_INTERVAL_SECONDS:-900}
       ALPACA_API_KEY: ${ALPACA_API_KEY:-}
       ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY:-}
+      # Dashboard sign-in (src/serving/auth.py). Off unless PASSWORD_LOGIN is
+      # true or a provider has both a client id and secret; the backend then
+      # refuses to start without SESSION_SECRET and ALLOWED_EMAILS.
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      PASSWORD_LOGIN: ${PASSWORD_LOGIN:-false}
+      ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-}
+      FRONTEND_URL: ${FRONTEND_URL:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
+      MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
+      MICROSOFT_TENANT: ${MICROSOFT_TENANT:-common}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
     volumes:
       - mlruns:/app/mlruns
 
@@ -70,9 +90,13 @@ services:
     depends_on:
       - backend
     environment:
+      # basic: nginx basic auth + injected bearer token. signin: the backend's
+      # sign-in decides (frontend/docker-entrypoint.d/10-dashboard-auth.envsh,
+      # which also refuses to start in basic mode without the credentials).
+      DASHBOARD_AUTH: ${DASHBOARD_AUTH:-basic}
       API_BEARER_TOKEN: ${API_BEARER_TOKEN}
-      BASIC_AUTH_USER: ${BASIC_AUTH_USER:?set BASIC_AUTH_USER}
-      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:?set BASIC_AUTH_PASSWORD}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:-}
+      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:-}
 
   caddy:
     image: caddy:2-alpine

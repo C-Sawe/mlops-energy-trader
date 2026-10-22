@@ -153,7 +153,9 @@ export function adaptPaper(raw) {
   };
 }
 
-export default function App() {
+/** `user`/`onSignOut` come from AuthGate (Auth.jsx) when sign-in is on;
+ * without them the masthead shows no account, as before sign-in existed. */
+export default function App({ user = null, onSignOut } = {}) {
   const [live, setLive] = useState(null); // null until the backend answers
   const [stale, setStale] = useState(false);
   const [selected, setSelected] = useState(null);
@@ -288,6 +290,12 @@ export default function App() {
           )}
           <button className="icon-btn" onClick={toggleTheme}
                   aria-label="Switch theme" title="Switch theme">◐</button>
+          {user && (
+            <span className="account">
+              <span className="account-id" title={`Signed in with ${user.provider}`}>{user.email}</span>
+              <button className="text-btn" onClick={onSignOut}>Sign out</button>
+            </span>
+          )}
         </div>
       </header>
 

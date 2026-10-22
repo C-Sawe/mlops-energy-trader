@@ -5,10 +5,10 @@ server {
     listen 80;
     server_name _;
 
-    # Single-user deployment (CLAUDE.md §12: no users table). Basic auth
-    # gates the whole dashboard and API; the password file is written by
-    # docker-entrypoint.d/10-basic-auth.sh from BASIC_AUTH_* env vars.
-    auth_basic "MLOps Energy Trader";
+    # DASHBOARD_AUTH=basic: basic auth gates the whole dashboard and API;
+    # the password file is written by docker-entrypoint.d/10-dashboard-auth.envsh.
+    # DASHBOARD_AUTH=signin: "off", and the backend's sign-in decides.
+    auth_basic ${NGINX_AUTH_BASIC};
     auth_basic_user_file /etc/nginx/.htpasswd;
 
     location = /healthz {
@@ -19,10 +19,11 @@ server {
 
     location /api/ {
         proxy_pass http://backend:8000/;
-        # NFR-10: the API bearer token stays server-side; the browser never
-        # sees it. The browser's own Authorization header (basic auth) is
-        # replaced here, not forwarded.
-        proxy_set_header Authorization "Bearer ${API_BEARER_TOKEN}";
+        # NFR-10: in basic mode the API bearer token stays server-side; the
+        # browser never sees it. The browser's own Authorization header
+        # (basic auth) is replaced here, not forwarded. In signin mode this is
+        # empty, so nothing is injected and the session cookie decides.
+        proxy_set_header Authorization "${PROXY_AUTHORIZATION}";
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;

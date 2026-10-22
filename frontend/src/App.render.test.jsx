@@ -271,3 +271,22 @@ describe("live equity benchmark and cycle history", () => {
     expect(meta.textContent).toMatch(/last 90 days · 5 started by the CT loop \(1 promoted\)/);
   });
 });
+
+describe("signed-in account", () => {
+  it("shows the account in the masthead and signs out from there", async () => {
+    backendUp();
+    const onSignOut = vi.fn();
+    render(<App user={{ email: "caleb@example.com", name: "Caleb", provider: "google" }} onSignOut={onSignOut} />);
+    await advance();
+
+    expect(screen.getByText("caleb@example.com")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    expect(onSignOut).toHaveBeenCalledOnce();
+  });
+
+  it("shows no account without sign-in", async () => {
+    backendUp();
+    await renderApp();
+    expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
+  });
+});

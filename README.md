@@ -331,6 +331,9 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 | NFR-04 | `restart: unless-stopped`; state only in the `pgdata`/`mlruns` volumes | measured locally (CLAUDE.md §5) |
 | NFR-10 | `deploy.yml` writes the VM's `.env` from GitHub secrets; never committed | — |
 | — (no FR/NFR: disaster recovery) | `deploy/backup.sh`, the `backup` compose service | restore rehearsed (`docs/DEPLOYMENT.md`) |
+| FR-21 | `src/serving/auth.py` (email + password; Google / Microsoft / GitHub), `api._verify_token`, `frontend/src/Auth.jsx` | `test_allowlisted_sign_in_opens_the_api_until_sign_out`, `test_correct_password_signs_in_until_sign_out`, `Auth.test.jsx` |
+| FR-22 | `AuthConfig.allowed_emails` re-checked per request (`auth.current_user`); accounts only via `scripts/create_dashboard_user.py` | `test_removing_an_email_from_the_allowlist_revokes_its_session`, `test_an_account_not_on_the_allowlist_cannot_sign_in`, `test_create_dashboard_user_script` |
+| NFR-12 | scrypt hashes (`auth.hash_password`), decoy check and one message for every failure, per-email throttle, `SessionMiddleware` cookie flags | `test_password_hash_is_salted_and_verifies_only_the_right_password`, `test_failed_password_logins_look_the_same`, `test_repeated_failures_are_throttled_even_for_the_right_password` |
 
 ---
 

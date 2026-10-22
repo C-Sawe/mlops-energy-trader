@@ -23,6 +23,7 @@ from src.config import DATABASE
 from src.dataops.models import (
     AUTONOMOUS_TRIGGERS,
     Base,
+    DashboardUser,
     MarketObservation,
     ModelRun,
     ModelVersion,
@@ -673,3 +674,32 @@ class MarketRepository:
                 }
                 for r in session.execute(stmt).scalars().all()
             ]
+
+    def set_dashboard_password(self, email: str, password_hash: str) -> bool:
+        """Creates the account or replaces its password. Returns True if it
+        was created. `email` is stored lowercased, as the allowlist is."""
+        email = email.strip().lower()
+        with self.session() as session:
+            with session.begin():
+                user = session.get(DashboardUser, email)
+                now = datetime.now(timezone.utc)
+                if user is None:
+                    session.add(DashboardUser(email=email, password_hash=password_hash, password_changed_at=now))
+                    return True
+                user.password_hash = password_hash
+                user.password_changed_at = now
+                return False
+
+    def get_dashboard_password_hash(self, email: str) -> str | None:
+        with self.session() as session:
+            user = session.get(DashboardUser, email.strip().lower())
+            return user.password_hash if user else None
+
+    def delete_dashboard_user(self, email: str) -> bool:
+        with self.session() as session:
+            with session.begin():
+                user = session.get(DashboardUser, email.strip().lower())
+                if user is None:
+                    return False
+                session.delete(user)
+                return True
