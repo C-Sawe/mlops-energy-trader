@@ -34,6 +34,7 @@ from src.dataops.repository import MarketRepository
 from src.execution.alpaca_broker import AlpacaBroker
 from src.execution.rebalance import OrderIntent, liquidate_all, plan_rebalance
 from src.orchestration.events import emit
+from src.orchestration.schedule import next_run_at  # noqa: F401 - re-exported for api.py and tests
 from src.serving.inference import InferenceService
 
 logger = logging.getLogger(__name__)
@@ -48,21 +49,6 @@ def market_today(now: datetime | None = None) -> date:
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     return ts.tz_convert(MARKET_TZ).date()
-
-
-def next_run_at(now: datetime, run_time_utc: str) -> datetime:
-    """The next weekday at `run_time_utc` (HH:MM) strictly after `now`.
-    A fixed wall-clock time, unlike the interval-based ingestion scheduler,
-    which drifts with whenever the process happened to start. Weekend days
-    are skipped here; market holidays are caught later by the "no bar for
-    today" check in `run_cycle`."""
-    hour, minute = (int(x) for x in run_time_utc.split(":"))
-    candidate = now.astimezone(timezone.utc).replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if candidate <= now:
-        candidate += pd.Timedelta(days=1).to_pytimedelta()
-    while candidate.weekday() >= 5:
-        candidate += pd.Timedelta(days=1).to_pytimedelta()
-    return candidate
 
 
 def _parse_ts(value: str | None) -> datetime | None:

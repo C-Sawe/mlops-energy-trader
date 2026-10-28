@@ -21,6 +21,7 @@ from src.dataops.ingestion import fetch_market_data
 from src.dataops.processing import build_feature_frame
 from src.dataops.repository import MarketRepository
 from src.orchestration.events import emit
+from src.orchestration.schedule import previous_run_at
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,18 @@ class IngestionStatus(str, Enum):
 
     IDLE = "IDLE"
     INGESTING = "INGESTING"
+
+
+def ingestion_is_behind(repo: MarketRepository, now: datetime, run_time_utc: str) -> bool:
+    """True when the newest stored bar is older than the date of the last
+    scheduled run: that run should have stored its day's bar, so it was
+    missed (the process was down or restarting). The run at 21:30 UTC on
+    day D fetches New York's day D. An empty database is not "behind":
+    it needs the full bootstrap backfill, not a 120-day tick."""
+    latest = repo.latest_ingest_info()
+    if latest is None:
+        return False
+    return latest["date"] < previous_run_at(now, run_time_utc).date()
 
 
 class IngestionState:

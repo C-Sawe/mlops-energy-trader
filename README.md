@@ -146,15 +146,9 @@ mlops-energy-trader/
 │   ├── docker-compose.prod.yml
 │   └── Caddyfile
 │
-├── docs/                     # System Specifications & Diagrams
-│   ├── DEPLOYMENT.md
-│   ├── diagrams/
-│   └── proposal/
-│
-└── research/                 # Research Artifacts & Offline Experiments
-    ├── thesis/               # Chapter writeups & drafts
-    ├── results/              # Walk-forward split benchmarks & analysis
-    └── THESIS_HANDOFF.md
+└── docs/                     # System Specifications & Diagrams
+    ├── DEPLOYMENT.md
+    └── diagrams/
 ```
 
 ---
@@ -316,11 +310,14 @@ The most consequential failure mode in financial ML is silent look-ahead leakage
 | FR-15 | `CTOrchestrator._retrain_and_maybe_promote` (own thread) | `test_evaluate_is_non_blocking` |
 | FR-16 | `InferenceService.reload` | `test_reload_picks_up_a_newly_promoted_version` |
 | FR-17 | promote-vs-retain comparison in `_retrain_and_maybe_promote`; every candidate logged, win or lose | `test_retrain_retains_incumbent_when_candidate_does_not_beat_it` |
+| — (evaluation protocol: model selection, I1) | best seed per split (`train_agent.py`); validation-only ensemble choice, Wilcoxon vs PPO, deflated Sharpe over all trials (`algorithm_comparison.py`) | `test_model_selection.py` |
 | FR-18 | `MarketRepository.list_snapshots` → `/telemetry` | `test_telemetry_returns_recorded_snapshots` |
 | FR-19 | `MarketRepository.list_decisions` → `/decisions` | `test_decisions_endpoint_paginates` |
 | NFR-07 (dashboard) | `list_decisions` joins to `model_run` for run_id + both partitions | `test_list_decisions_includes_run_and_partition` |
 | FR-20 | `CTOrchestrator.status` → `/ct-status` | `test_ct_status_reflects_active_version` |
 | FR-20 (history), NFR-07 | `pipeline_event` written by each step via `orchestration/events.emit` → `/events` → `components/Activity.jsx` timeline | `test_pipeline_events.py`, `Activity.test.jsx` |
+| — (no FR yet: pipeline assistant, a design addition; builds on NFR-07, NFR-11) | `src/serving/assistant.py` (read-only tools, streaming `/assistant/chat`), `components/Assistant.jsx`, `AssistantVisuals.jsx` | `test_assistant.py`, `Assistant.test.jsx` |
+| — (no FR yet: market news, context only; a design addition) | `src/dataops/news.py`, `GET /news`, the assistant's `get_news`, `components/News.jsx`; `.importlinter` forbids decision code from importing it | `test_news.py`, `test_architecture.py`, `News.test.jsx` |
 | I5 | fail-safe lives in `InferenceService`, not the agent | `test_failsafe_does_not_trigger_below_threshold` |
 | NFR-08 | `PredictRequest` field validation | `test_predict_rejects_positions_missing_a_ticker` |
 | NFR-11 | fail-safe decisions logged with `vix_at_decision` | `test_failsafe_decision_is_logged_with_its_trigger_value` |
@@ -368,7 +365,6 @@ All system analysis and design diagrams are documented in [`docs/diagrams/`](./d
 - **Supervisor:** Mr. Allan Vikiru
 - **Student:** Caleb Kipchirchir (Admission No. 169391)
 - **Contact:** caleb.Kipchirchir@strathmore.edu
-- **Proposal Document:** [`docs/proposal/Kipchirchir_169391_Proposal_Vikiru.pdf`](./docs/proposal/Kipchirchir_169391_Proposal_Vikiru.pdf)
 
 ---
 

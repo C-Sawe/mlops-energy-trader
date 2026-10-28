@@ -22,6 +22,8 @@ vi.mock("./api.js", async (importOriginal) => {
     fetchPaper: vi.fn(),
     fetchCandles: vi.fn(),
     fetchEvents: vi.fn(),
+    fetchAssistantStatus: vi.fn(),
+    fetchNews: vi.fn(),
     triggerEvaluation: vi.fn(),
   };
 });
@@ -108,12 +110,21 @@ function backendDown() {
 /** Advance the clock and let every resolved fetch settle inside act(). */
 const advance = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
 
-async function renderApp() {
+/** Render, then (optionally) open a section from the navigation as a user would. */
+async function renderApp(section) {
   render(<App />);
+  await advance();
+  if (section) await openSection(section);
+}
+
+async function openSection(name) {
+  const nav = screen.getByRole("navigation", { name: "Sections" });
+  fireEvent.click(within(nav).getByRole("link", { name: new RegExp(`^${name}`) }));
   await advance();
 }
 
 beforeEach(() => {
+  window.location.hash = ""; // every test starts on the Overview
   vi.useFakeTimers();
   // jsdom has no matchMedia. Reduced motion makes the sheet's spring settle
   // immediately, so open/close is observable without animation frames.
@@ -124,6 +135,8 @@ beforeEach(() => {
   api.fetchPaper.mockResolvedValue(DOWN);
   api.fetchCandles.mockResolvedValue(DOWN);
   api.fetchEvents.mockResolvedValue(DOWN);
+  api.fetchAssistantStatus.mockResolvedValue(DOWN);
+  api.fetchNews.mockResolvedValue(DOWN);
 });
 
 afterEach(() => {
@@ -185,7 +198,7 @@ describe("IR-07: graceful degradation", () => {
 describe("decision-detail sheet", () => {
   it("shows the decision → version → run → partition chain (NFR-07) and closes on Escape", async () => {
     backendUp();
-    await renderApp();
+    await renderApp("Decisions");
 
     fireEvent.click(screen.getByText("XOM", { selector: "td.tick" }));
     const sheet = screen.getByRole("dialog", { name: "Decision detail" });
@@ -203,7 +216,7 @@ describe("decision-detail sheet", () => {
 
   it("explains a fail-safe decision by the VIX value that triggered it (NFR-11)", async () => {
     backendUp();
-    await renderApp();
+    await renderApp("Decisions");
 
     fireEvent.click(screen.getByText("CVX", { selector: "td.tick" }));
     const sheet = screen.getByRole("dialog", { name: "Decision detail" });
@@ -214,7 +227,7 @@ describe("decision-detail sheet", () => {
 
   it("opens from the keyboard as well as the mouse", async () => {
     backendUp();
-    await renderApp();
+    await renderApp("Decisions");
 
     const row = screen.getByText("XOM", { selector: "td.tick" }).closest("tr");
     fireEvent.keyDown(row, { key: "Enter" });
@@ -267,7 +280,7 @@ describe("live equity benchmark and cycle history", () => {
 
   it("separates runs the CT loop started itself from all training runs", async () => {
     backendUp();
-    await renderApp();
+    await renderApp("Pipeline");
 
     const meta = screen.getByText(/started by the CT loop/);
     expect(meta.textContent).toMatch(/last 90 days · 5 started by the CT loop \(1 promoted\)/);
@@ -320,5 +333,62 @@ describe("pipeline activity", () => {
     // Scoped: the paper card has the same waiting message.
     const card = screen.getByRole("heading", { name: "Pipeline activity" }).closest("section");
     expect(within(card).getByText("Waiting for the backend…")).toBeTruthy();
+  });
+});
+
+describe("sections (sidebar on wide screens, tab bar on narrow)", () => {
+  const nav = () => screen.getByRole("navigation", { name: "Sections" });
+
+  it("starts on the Overview and lists four sections, marking the current one", async () => {
+    backendUp();
+    await renderApp();
+    const links = within(nav()).getAllByRole("link");
+    expect(links.map((l) => l.textContent)).toEqual(["Overview", "Pipeline", "Decisions", "Trading"]);
+    expect(within(nav()).getByRole("link", { name: "Overview" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Overview");
+    expect(screen.getByText("Portfolio equity")).toBeTruthy();
+    expect(screen.queryByText("Autonomous decision log")).toBeNull(); // one section at a time
+  });
+
+  it("opens a section, updates the address, and moves focus to its title", async () => {
+    backendUp();
+    await renderApp("Decisions");
+    expect(window.location.hash).toBe("#decisions");
+    const title = screen.getByRole("heading", { level: 1 });
+    expect(title).toHaveTextContent("Decisions");
+    expect(document.activeElement).toBe(title);
+    expect(screen.getByText("Autonomous decision log")).toBeTruthy();
+    expect(screen.queryByText("Portfolio equity")).toBeNull();
+  });
+
+  it("opens the section named in the address on load, and follows the back button", async () => {
+    window.location.hash = "#trading";
+    backendUp();
+    await renderApp();
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Trading");
+    expect(screen.getByText("Price & entries")).toBeTruthy();
+
+    window.location.hash = "#pipeline";
+    await act(async () => { window.dispatchEvent(new HashChangeEvent("hashchange")); });
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Pipeline");
+  });
+
+  it("links from the Overview's short activity list to the full timeline", async () => {
+    backendUp();
+    api.fetchEvents.mockResolvedValue(ok({ items: [
+      { event_id: 1, occurred_at: "2026-10-22T10:00:00Z", kind: "ingestion_ok", source: "scheduled",
+        summary: "Fetched market data", detail: null, run_id: null, version_id: null },
+    ] }));
+    await renderApp();
+    fireEvent.click(screen.getByRole("button", { name: "See all in Pipeline" }));
+    await advance();
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Pipeline");
+  });
+
+  it("badges Pipeline while the loop is retraining", async () => {
+    backendUp();
+    api.fetchStatus.mockResolvedValue(ok(statusRaw({ status: "RETRAINING" })));
+    await renderApp();
+    expect(within(nav()).getByRole("link", { name: /Pipeline/ })).toHaveTextContent("(Retraining)");
   });
 });

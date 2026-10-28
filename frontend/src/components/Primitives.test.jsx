@@ -57,6 +57,7 @@ describe("StatusStrip", () => {
     ingestionStatus: "IDLE",
     ingestionCheckedAt: "20/09/2026 19:09:07",
     ingestionOk: true,
+    ingestionNextAt: "Thu 00:30",
     vix: 14.81,
     failSafeThreshold: 35.0,
   };
@@ -74,6 +75,11 @@ describe("StatusStrip", () => {
   it("shows the fail-safe as triggered when VIX exceeds the critical threshold (I5/FR-12)", () => {
     render(<StatusStrip {...baseProps} vix={40.0} />);
     expect(screen.getByText(/Triggered/)).toBeInTheDocument();
+  });
+
+  it("shows when the next scheduled fetch is (FR-01)", () => {
+    render(<StatusStrip {...baseProps} />);
+    expect(screen.getByText("Next fetch Thu 00:30")).toBeInTheDocument();
   });
 
   it("shows the ingestion checked-at timestamp when one exists", () => {

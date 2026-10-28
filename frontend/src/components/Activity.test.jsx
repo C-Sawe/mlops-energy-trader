@@ -83,3 +83,10 @@ describe("ActivityCard", () => {
     expect(screen.getByText(/^Recorded since/)).toBeTruthy();
   });
 });
+
+describe("groupEvents wording", () => {
+  it("says the Sharpe was steady rather than 'between x and x'", () => {
+    const rows = groupEvents([check(0, 2.45), check(5, 2.45)]);
+    expect(rows[0].summary).toBe("Checked 2 times: rolling Sharpe steady at 2.45, at or above the 1.00 target. Model kept serving.");
+  });
+});

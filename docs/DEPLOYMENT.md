@@ -93,7 +93,7 @@ Go to Repo → Settings → Secrets and variables → Actions.
 |---|---|---|
 | `SITE_ADDRESS` | `:80` | Set a domain (e.g. `trader.example.com`) whose DNS A record points at the VM. Caddy then serves HTTPS automatically. **Do this before sharing the URL**: basic auth over plain HTTP sends the password in the clear. |
 | `CT_EVALUATION_INTERVAL_SECONDS` | `300` | FR-13 cadence |
-| `INGESTION_INTERVAL_SECONDS` | `86400` | FR-01 cadence. Lower it for a live demo. |
+| `INGESTION_TIME_UTC` | `21:30` | FR-01: data is fetched every weekday at this UTC time, after the US close. A restart that misses it fetches once at startup. For a live demo, use `POST /api/ingest/run` instead of waiting. |
 | `IMAGE_PLATFORMS` | `linux/amd64,linux/arm64` | CPU architectures to build. Run `uname -m` on the VM: `aarch64` → set `linux/arm64`, `x86_64` → `linux/amd64`. Building only the one you need roughly halves build time. |
 | `PAPER_TRADING_ENABLED` | `false` | `true` turns on the daily forward paper-trading cycle (see below). Needs the two Alpaca secrets. |
 | `PAPER_TRADE_TIME_UTC` | `22:00` | Weekday run time. 22:00 UTC is after the US close in both EDT and EST. |
@@ -316,6 +316,52 @@ token from the VM instead, since nginx no longer swaps in credentials:
 ```bash
 docker compose exec backend python -c "import os, urllib.request as u; print(u.urlopen(u.Request('http://localhost:8000/paper/run', method='POST', headers={'Authorization': 'Bearer ' + os.environ['API_BEARER_TOKEN']})).read().decode())"
 ```
+
+## Market news
+
+The dashboard's **Market news** card and the assistant's news tool show
+recent headlines for the five stocks, from Alpaca's news feed (Benzinga and
+other publishers). They use the same `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` as
+paper trading, so they appear once those are set; `NEWS_ENABLED=false` hides
+them.
+
+- **Context only.** Nothing that trains, decides or trades reads news.
+  `.importlinter` enforces this: the build fails if `src.rlops`,
+  `src.orchestration`, `src.serving.inference` or `src.execution` imports
+  `src.dataops.news`.
+- Headlines are cached for 10 minutes (`NEWS_CACHE_SECONDS`), well inside
+  Alpaca's 200 requests a minute. If the feed is down, the card says so and
+  the rest of the dashboard is unaffected.
+- Text is reduced to plain text on the server, and only `http(s)` links reach
+  the browser.
+
+## Pipeline assistant
+
+The dashboard's **Ask the pipeline** panel (`backend/src/serving/assistant.py`)
+answers questions about the system's own records: status, the activity log,
+decisions and their provenance, model history, training counts, performance
+and prices. It shows the records it read as charts while it explains them.
+
+- **Turning it on:** add the secret `GROQ_API_KEY`, from a key created at
+  console.groq.com, and redeploy. Without it the panel doesn't appear.
+- **What it can do:** only read, through nine fixed queries (eight on the
+  pipeline's records, one on recent news headlines). It can't start
+  retrains, trades or ingestion.
+- **What it sends to Groq:** the question, earlier turns of the
+  conversation, and the records it reads. These are market data and pipeline
+  records, with no personal data beyond the question itself.
+- **Model and cost:** `ASSISTANT_MODEL` (variable, default `qwen/qwen3.8-27b`,
+  Qwen3.8 27B on Groq). Any Groq model with tool calling works; list the ones
+  your key can use with `GET https://api.groq.com/openai/v1/models`. A typical
+  question reads 1-3 records, about 2,000-4,000 input tokens. Groq's free
+  plan allows 7,000 input tokens a minute, so two questions back to back can
+  hit it. When Groq asks for a wait of 20 s or less, the panel says "Waiting
+  N s for Groq's rate limit" and carries on; a longer wait, or Groq being over
+  capacity after two short retries, ends with a message to try again. A paid
+  plan removes most of this.
+- **Limits:** 20 questions per signed-in user per 10 minutes
+  (`ASSISTANT_RATE_LIMIT`). It needs the same sign-in as the rest of the API.
+  Set a spend limit in the Groq console as well.
 
 ## What this deployment does not change
 

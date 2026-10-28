@@ -49,9 +49,12 @@ function single(e) {
 function evaluationRun(run) {
   const values = run.map((e) => e.detail?.rolling_sharpe).filter((v) => typeof v === "number");
   const target = run[0].detail?.target;
-  const range = values.length
-    ? `rolling Sharpe between ${Math.min(...values).toFixed(2)} and ${Math.max(...values).toFixed(2)}`
-    : "rolling Sharpe";
+  const [lo, hi] = [Math.min(...values), Math.max(...values)];
+  const range = !values.length
+    ? "rolling Sharpe"
+    : lo.toFixed(2) === hi.toFixed(2)
+      ? `rolling Sharpe steady at ${lo.toFixed(2)}`
+      : `rolling Sharpe between ${lo.toFixed(2)} and ${hi.toFixed(2)}`;
   const vsTarget = typeof target === "number" ? `, at or above the ${target.toFixed(2)} target` : "";
   return {
     ...kindInfo("evaluation"),
@@ -137,10 +140,12 @@ function when(row, now) {
 
 const VISIBLE = 6;
 
-export function ActivityCard({ events, now = new Date() }) {
+/** `limit` rows at first. With `onSeeAll` (the Overview's short version),
+ * the footer links to the full timeline instead of expanding in place. */
+export function ActivityCard({ events, now = new Date(), limit = VISIBLE, onSeeAll }) {
   const [expanded, setExpanded] = useState(false);
   const rows = events ? groupEvents(events) : [];
-  const shown = expanded ? rows : rows.slice(0, VISIBLE);
+  const shown = expanded ? rows : rows.slice(0, limit);
   const oldest = events?.length ? events[events.length - 1].at : null;
 
   return (
@@ -176,7 +181,9 @@ export function ActivityCard({ events, now = new Date() }) {
           </ol>
           <div className="act-foot">
             {oldest && <span>Recorded since {dayMonth(oldest)} {clock(oldest)}</span>}
-            {rows.length > VISIBLE && (
+            {onSeeAll ? (
+              <button className="text-btn" onClick={onSeeAll}>See all in Pipeline</button>
+            ) : rows.length > limit && (
               <button className="text-btn" aria-expanded={expanded} onClick={() => setExpanded((v) => !v)}>
                 {expanded ? "Show less" : `Show all ${rows.length}`}
               </button>

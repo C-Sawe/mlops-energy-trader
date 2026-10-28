@@ -71,11 +71,29 @@ class DatabaseConfig:
 
 @dataclass(frozen=True)
 class IngestionConfig:
-    """IR-01: bounded retry with backoff."""
+    """IR-01: bounded retry with backoff. FR-01: when the scheduler runs.
+
+    `run_time_utc` is a fixed weekday time after the US close: 16:00 New
+    York is 20:00 UTC in summer and 21:00 UTC in winter, so 21:30 is after
+    the close all year, with time for the day's bar to be published. Paper
+    trading (22:00) runs after it. Properties for the same reason as
+    `ServingConfig.bearer_token`.
+    """
 
     max_retries: int = 3
     backoff_seconds: float = 2.0
     request_timeout: int = 30
+
+    @property
+    def run_time_utc(self) -> str:
+        return os.environ.get("INGESTION_TIME_UTC", "21:30")
+
+    @property
+    def catch_up_on_startup(self) -> bool:
+        """Fetch once at startup if the newest stored bar is older than the
+        last scheduled run should have produced. The test suite turns this
+        off (tests/conftest.py): tests never reach the network."""
+        return os.environ.get("INGESTION_CATCH_UP", "true").lower() in ("1", "true", "yes")
 
 
 @dataclass(frozen=True)
@@ -290,6 +308,65 @@ class AuthConfig:
         return bool(self.enabled_providers) or self.password_login
 
 
+@dataclass(frozen=True)
+class AssistantConfig:
+    """The dashboard's pipeline assistant (src/serving/assistant.py). No
+    requirement covers it yet: it is an addition to the approved design,
+    to be agreed with the supervisor and recorded in Chapter 5.
+
+    Runs on Groq. Off unless GROQ_API_KEY is set (NFR-10: the key stays
+    server-side and is never sent to the browser). Properties for the same
+    reason as `ServingConfig.bearer_token`.
+    """
+
+    @property
+    def enabled(self) -> bool:
+        return bool(os.environ.get("GROQ_API_KEY"))
+
+    @property
+    def model(self) -> str:
+        """A Groq model with tool calling. Default: Qwen3.8 27B (128K context)."""
+        return os.environ.get("ASSISTANT_MODEL", "qwen/qwen3.8-27b")
+
+    @property
+    def requests_per_window(self) -> int:
+        """Per signed-in user (or client address), per window: a cost guard."""
+        return int(os.environ.get("ASSISTANT_RATE_LIMIT", "20"))
+
+    @property
+    def window_seconds(self) -> int:
+        return int(os.environ.get("ASSISTANT_RATE_WINDOW_SECONDS", "600"))
+
+
+@dataclass(frozen=True)
+class NewsConfig:
+    """Market headlines for the dashboard and the assistant
+    (src/dataops/news.py). **Context only:** nothing in training, inference
+    or paper trading reads news, so it cannot change a decision. No
+    requirement covers it yet; like the assistant, it is an addition to be
+    agreed with the supervisor and recorded in Chapter 5.
+
+    Uses Alpaca's market-data news API with the same paper keys as
+    `BrokerConfig`, so it is on whenever those are set, unless
+    NEWS_ENABLED=false. `data_url` is fixed for the same reason as
+    `BrokerConfig.base_url`.
+    """
+
+    data_url: str = "https://data.alpaca.markets"
+
+    @property
+    def enabled(self) -> bool:
+        if os.environ.get("NEWS_ENABLED", "true").lower() not in ("1", "true", "yes"):
+            return False
+        return bool(os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_SECRET_KEY"))
+
+    @property
+    def cache_seconds(self) -> int:
+        """Headlines change slowly; this keeps a busy dashboard well inside
+        Alpaca's 200 requests a minute."""
+        return int(os.environ.get("NEWS_CACHE_SECONDS", "600"))
+
+
 DATA = DataConfig()
 DATABASE = DatabaseConfig()
 INGESTION = IngestionConfig()
@@ -299,3 +376,5 @@ BROKER = BrokerConfig()
 SERVING = ServingConfig()
 PAPER = PaperTradingConfig()
 AUTH = AuthConfig()
+ASSISTANT = AssistantConfig()
+NEWS = NewsConfig()

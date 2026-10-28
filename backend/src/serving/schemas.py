@@ -7,6 +7,7 @@ hand-rolling its own checks.
 from __future__ import annotations
 
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -138,6 +139,7 @@ class CTStatusResponse(BaseModel):
     ingestion_status: str  # IDLE | INGESTING
     last_ingestion_attempted_at: datetime | None
     last_ingestion_ok: bool | None
+    next_ingestion_at: datetime | None = None
 
 
 class HealthResponse(BaseModel):
@@ -251,3 +253,46 @@ class PipelineEventOut(BaseModel):
 class EventsResponse(BaseModel):
     items: list[PipelineEventOut]
     has_more: bool
+
+
+class AssistantMessage(BaseModel):
+    """One turn of the conversation, as text (NFR-08: bounded, validated)."""
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class AssistantChatRequest(BaseModel):
+    messages: list[AssistantMessage] = Field(min_length=1, max_length=20)
+
+    @field_validator("messages")
+    @classmethod
+    def ends_with_a_question(cls, messages: list[AssistantMessage]) -> list[AssistantMessage]:
+        if messages[-1].role != "user":
+            raise ValueError("the last message must be the user's question")
+        return messages
+
+
+class NewsItem(BaseModel):
+    id: str
+    published_at: datetime
+    headline: str
+    summary: str | None
+    source: str | None
+    url: str | None
+    tickers: list[str]
+    other_symbols: int
+
+
+class NewsResponse(BaseModel):
+    """Recent headlines (src/dataops/news.py). Context only: the agent never
+    reads news, so nothing here changed a decision."""
+
+    enabled: bool
+    ticker: str | None
+    items: list[NewsItem]
+
+
+class AssistantStatusResponse(BaseModel):
+    enabled: bool
+    model: str | None

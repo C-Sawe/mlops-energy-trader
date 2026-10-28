@@ -102,7 +102,7 @@ export function ingestionToneAndLabel(ingestionStatus, ingestionOk) {
 
 export function StatusStrip({
   pipeline, model, modelLabel, modelId, lastIngest,
-  ingestionStatus, ingestionCheckedAt, ingestionOk, vix, failSafeThreshold,
+  ingestionStatus, ingestionCheckedAt, ingestionOk, ingestionNextAt, vix, failSafeThreshold,
 }) {
   const tripped = vix != null && failSafeThreshold != null && vix > failSafeThreshold;
   const { tone, label } = pipelineToneAndLabel(pipeline);
@@ -126,6 +126,7 @@ export function StatusStrip({
         <span className="strip-k">Ingestion</span>
         <Pill tone={ingestTone}>{ingestLabel}</Pill>
         {ingestionCheckedAt && <span className="strip-sub">Checked {ingestionCheckedAt}</span>}
+        {ingestionNextAt && <span className="strip-sub">Next fetch {ingestionNextAt}</span>}
       </div>
       <div className="strip-cell">
         <span className="strip-k">Volatility fail-safe</span>

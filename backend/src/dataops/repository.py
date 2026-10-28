@@ -320,6 +320,67 @@ class MarketRepository:
             ]
         return items, total
 
+    def get_decision(self, decision_id: str) -> dict | None:
+        """One decision with its whole NFR-07 chain: decision -> version ->
+        run -> data partitions and hyperparameters. None if it doesn't exist."""
+        stmt = (
+            select(TradingDecision)
+            .options(joinedload(TradingDecision.version).joinedload(ModelVersion.run))
+            .where(TradingDecision.decision_id == decision_id)
+        )
+        with self.session() as session:
+            r = session.execute(stmt).scalars().first()
+            if r is None:
+                return None
+            run = r.version.run
+            return {
+                "decision_id": r.decision_id,
+                "decided_at": r.decided_at,
+                "ticker": r.ticker,
+                "raw_weight": float(r.raw_weight) if r.raw_weight is not None else None,
+                "discrete_action": r.discrete_action,
+                "vix_at_decision": float(r.vix_at_decision) if r.vix_at_decision is not None else None,
+                "failsafe_triggered": r.failsafe_triggered,
+                "version_id": r.version_id,
+                "version_promoted_at": r.version.promoted_at,
+                "version_is_active": r.version.is_active,
+                "run_id": run.run_id,
+                "train_start": run.train_start,
+                "train_end": run.train_end,
+                "eval_start": run.eval_start,
+                "eval_end": run.eval_end,
+                "hyperparameters": dict(run.hyperparameters or {}),
+                "sharpe_ratio": float(run.sharpe_ratio) if run.sharpe_ratio is not None else None,
+                "trigger_reason": run.trigger_reason,
+            }
+
+    def list_model_versions(self, limit: int = 10) -> list[dict]:
+        """Registered versions, most recently promoted first (never-promoted
+        ones after), with the run that produced each (FR-09, NFR-07)."""
+        stmt = (
+            select(ModelVersion)
+            .options(joinedload(ModelVersion.run))
+            .order_by(ModelVersion.promoted_at.is_(None), ModelVersion.promoted_at.desc())
+            .limit(limit)
+        )
+        with self.session() as session:
+            return [
+                {
+                    "version_id": v.version_id,
+                    "promoted_at": v.promoted_at,
+                    "is_active": v.is_active,
+                    "run_id": v.run_id,
+                    "train_start": v.run.train_start,
+                    "train_end": v.run.train_end,
+                    "eval_start": v.run.eval_start,
+                    "eval_end": v.run.eval_end,
+                    "sharpe_ratio": float(v.run.sharpe_ratio) if v.run.sharpe_ratio is not None else None,
+                    "trigger_reason": v.run.trigger_reason,
+                    "created_at": v.run.created_at,
+                }
+                for v in session.execute(stmt).scalars().all()
+            ]
+
     # ----------------------------------------------------------- snapshots
     def record_snapshot(
         self,

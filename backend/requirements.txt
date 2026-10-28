@@ -29,6 +29,7 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 authlib>=1.9  # dashboard sign-in: OAuth/OIDC with Google, Microsoft, GitHub (src/serving/auth.py)
 itsdangerous>=2.1  # Starlette's SessionMiddleware signs the session cookie with it
+groq>=1.7  # the dashboard's pipeline assistant on Groq (src/serving/assistant.py), off unless GROQ_API_KEY is set
 httpx>=0.27  # TestClient for the FastAPI test suite, and the Alpaca paper-trading client (src/execution)
 
 # Development

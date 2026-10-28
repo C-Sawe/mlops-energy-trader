@@ -40,3 +40,17 @@ source_modules =
 forbidden_modules =
     src.serving
     src.orchestration
+
+# Market news (src/dataops/news.py) is context for the person reading the
+# dashboard, never an input to a decision. This makes that claim checkable:
+# nothing that trains, serves, evaluates or trades may import it.
+[importlinter:contract:news-is-context-only]
+name = No decision-making code reads news
+type = forbidden
+source_modules =
+    src.rlops
+    src.orchestration
+    src.serving.inference
+    src.execution
+forbidden_modules =
+    src.dataops.news

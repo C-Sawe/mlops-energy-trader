@@ -48,6 +48,7 @@ describe("adaptStatus", () => {
       ingestion_status: "IDLE",
       last_ingestion_attempted_at: "2026-09-20T19:09:07.252312Z",
       last_ingestion_ok: true,
+      next_ingestion_at: "2026-09-21T21:30:00Z",
     };
     const status = adaptStatus(raw);
 
@@ -60,6 +61,7 @@ describe("adaptStatus", () => {
     expect(status.ingestionStatus).toBe("IDLE");
     expect(status.ingestionOk).toBe(true);
     expect(status.ingestionCheckedAt).toBeTruthy();
+    expect(status.ingestionNextAt).toMatch(/^[A-Z][a-z]{2} \d{2}:\d{2}$/);
   });
 
   it("falls back to the short ID when no friendly label exists yet", () => {
