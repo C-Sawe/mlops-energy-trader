@@ -16,9 +16,16 @@ frontend/dist/
 frontend/*.tsbuildinfo
 frontend/.vite/
 
-research/thesis/*.docx
-research/thesis/*.pdf
+# Thesis material stays on this machine and is never committed: chapter
+# drafts, figures and their build scripts, the saved evidence behind them,
+# the handoff notes, the proposal, and the thesis-only issue drafts.
+research/
+docs/proposal/
+.github/issue-drafts/0[1-5]-*.md
 
 # Database/model backups written by deploy/backup.sh (#40); never commit them
 deploy/backups/
 backups/
+
+# Project notes for Claude Code; kept on this machine only, never pushed.
+CLAUDE.md

@@ -13,13 +13,17 @@
  * mock never is — no CT evaluation has run yet, no snapshots exist yet —
  * so every field read here is null-guarded rather than assumed present.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { ActivityCard } from "./components/Activity.jsx";
+import Assistant from "./components/Assistant.jsx";
+import { NewsCard } from "./components/News.jsx";
+import { SECTIONS, SectionNav, useSection } from "./components/Nav.jsx";
 import { CandleChart, EquityChart, SharpeChart, Gauge } from "./components/Charts.jsx";
 import {
   GlassCard, CardHead, Pill, StatusStrip, Sheet, Button,
 } from "./components/Primitives.jsx";
 import {
-  fetchCandles, fetchDecisions, fetchPaper, fetchStatus, fetchTelemetry, poll, triggerEvaluation,
+  fetchCandles, fetchDecisions, fetchEvents, fetchPaper, fetchStatus, fetchTelemetry, poll, triggerEvaluation,
 } from "./api.js";
 import * as mock from "./mock.js";
 
@@ -33,6 +37,9 @@ export const fmtDateTime = (d) =>
     year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
   }).replace(",", "");
+
+export const fmtNextRun = (d) =>
+  d.toLocaleString("en-GB", { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }).replace(",", "");
 
 export function adaptStatus(raw) {
   return {
@@ -49,6 +56,8 @@ export function adaptStatus(raw) {
       ? fmtDateTime(new Date(raw.last_ingestion_attempted_at))
       : null,
     ingestionOk: raw.last_ingestion_ok,
+    // Viewer's local time: the fetch is scheduled in UTC after the US close.
+    ingestionNextAt: raw.next_ingestion_at ? fmtNextRun(new Date(raw.next_ingestion_at)) : null,
   };
 }
 
@@ -101,6 +110,20 @@ export function adaptMetrics(statusRaw, telemetryAdapted) {
     autonomous: statusRaw.autonomous_retrains ?? null,
     autonomousPromoted: statusRaw.autonomous_promoted ?? null,
   };
+}
+
+/** /events -> timeline events. */
+export function adaptEvents(raw) {
+  return (raw.items ?? []).map((e) => ({
+    id: e.event_id,
+    at: new Date(e.occurred_at),
+    kind: e.kind,
+    source: e.source,
+    summary: e.summary,
+    detail: e.detail ?? {},
+    runId: e.run_id,
+    versionId: e.version_id,
+  }));
 }
 
 export const TICKERS = ["XOM", "CVX", "SHEL", "BP", "NEE"];
@@ -165,6 +188,22 @@ export default function App({ user = null, onSignOut } = {}) {
   const [ticker, setTicker] = useState("XOM");
   const [paperLive, setPaperLive] = useState(null);
   const [candlesLive, setCandlesLive] = useState(null);
+  const [eventsLive, setEventsLive] = useState(null);
+  const [section, go] = useSection();
+  const current = SECTIONS.find((s) => s.id === section);
+  const titleRef = useRef(null);
+  const firstRender = useRef(true);
+
+  // A new section is a new page: start at its top and move focus to its
+  // title, so screen readers announce it (not on first load).
+  useEffect(() => {
+    if (firstRender.current) {
+      firstRender.current = false;
+      return;
+    }
+    window.scrollTo?.(0, 0);
+    titleRef.current?.focus({ preventScroll: true });
+  }, [section]);
 
   // Polled separately from the main loop: a paper or candle failure (e.g.
   // an older backend without these endpoints) must not mark the whole
@@ -173,6 +212,8 @@ export default function App({ user = null, onSignOut } = {}) {
     () => poll(fetchPaper, 60000, (r) => { if (r.ok) setPaperLive(adaptPaper(r.data)); }),
     []
   );
+  const loadEvents = (r) => { if (r.ok) setEventsLive(adaptEvents(r.data)); };
+  useEffect(() => poll(fetchEvents, 15000, loadEvents), []);
   useEffect(() => {
     setCandlesLive(null);
     return poll(() => fetchCandles(ticker, 120), 60000, (r) => {
@@ -255,6 +296,7 @@ export default function App({ user = null, onSignOut } = {}) {
       const result = await triggerEvaluation();
       if (result.ok) {
         setLive((prev) => (prev ? { ...prev, statusRaw: result.data, status: adaptStatus(result.data) } : prev));
+        loadEvents(await fetchEvents());
       }
     } finally {
       setChecking(false);
@@ -263,42 +305,9 @@ export default function App({ user = null, onSignOut } = {}) {
 
   const totalPages = Math.max(1, Math.ceil((decisionsView.total ?? decisions.length) / pageSize));
 
-  return (
-    <div className="wrap">
-      <header className="masthead">
-        <div>
-          <h1>Energy Agent Telemetry</h1>
-          <p>PPO trading agent · continuous training pipeline · XOM · CVX · SHEL · BP · NEE</p>
-        </div>
-        <div className="mast-right">
-          {usingMock && (
-            <span className="demo-chip">Example data — not live results</span>
-          )}
-          {!usingMock && stale && (
-            <span className="stale">● Backend unreachable — showing last known</span>
-          )}
-          {!usingMock && (
-            <button
-              className="icon-btn"
-              onClick={forceCheck}
-              disabled={checking || status.pipeline !== "SERVING"}
-              aria-label="Force a CT evaluation now"
-              title="Force a CT evaluation now"
-            >
-              ⟳
-            </button>
-          )}
-          <button className="icon-btn" onClick={toggleTheme}
-                  aria-label="Switch theme" title="Switch theme">◐</button>
-          {user && (
-            <span className="account">
-              <span className="account-id" title={`Signed in with ${user.provider}`}>{user.email}</span>
-              <button className="text-btn" onClick={onSignOut}>Sign out</button>
-            </span>
-          )}
-        </div>
-      </header>
-
+  // Each card is defined once, then placed by section below. The cards
+  // themselves are unchanged; only where they appear depends on the section.
+  const statusStrip = (
       <StatusStrip
         pipeline={status.pipeline}
         model={status.model}
@@ -308,12 +317,12 @@ export default function App({ user = null, onSignOut } = {}) {
         ingestionStatus={status.ingestionStatus}
         ingestionCheckedAt={status.ingestionCheckedAt}
         ingestionOk={status.ingestionOk}
+        ingestionNextAt={status.ingestionNextAt}
         vix={status.vix}
         failSafeThreshold={status.failSafeThreshold}
       />
-
-      <div className="panel">
-        <div className="col">
+  );
+  const equityCard = (
           <GlassCard>
             <CardHead
               title="Portfolio equity"
@@ -339,7 +348,8 @@ export default function App({ user = null, onSignOut } = {}) {
             />
             <EquityChart dates={dates} agent={agentSeries} bench={benchSeries} />
           </GlassCard>
-
+  );
+  const sharpeChartCard = (
           <GlassCard>
             <CardHead
               title="Rolling Sharpe"
@@ -347,9 +357,8 @@ export default function App({ user = null, onSignOut } = {}) {
             />
             <SharpeChart dates={dates} values={sharpeSeries} threshold={status.targetSharpe} />
           </GlassCard>
-        </div>
-
-        <div className="col">
+  );
+  const sharpeGauge = (
           <GlassCard className="gauge-card">
             <h2 className="card-title">Rolling Sharpe</h2>
             <div className="gauge-wrap">
@@ -364,7 +373,8 @@ export default function App({ user = null, onSignOut } = {}) {
               </div>
             </div>
           </GlassCard>
-
+  );
+  const drawdownGauge = (
           <GlassCard className="gauge-card">
             <h2 className="card-title">Maximum drawdown</h2>
             <div className="gauge-wrap">
@@ -375,7 +385,8 @@ export default function App({ user = null, onSignOut } = {}) {
               </div>
             </div>
           </GlassCard>
-
+  );
+  const cycleCard = (
           <GlassCard className="gauge-card">
             <h2 className="card-title">Cycle history</h2>
             <div className="gauge-wrap">
@@ -398,11 +409,9 @@ export default function App({ user = null, onSignOut } = {}) {
               <Pill tone="warn">{m.heldBack} held back</Pill>
             </div>
           </GlassCard>
-        </div>
-      </div>
-
-      <div className="panel" style={{ marginTop: 14 }}>
-        <div className="col">
+  );
+  const activityEvents = usingMock ? mock.events : eventsLive;
+  const priceCard = (
           <GlassCard>
             <CardHead
               title="Price & entries"
@@ -426,8 +435,8 @@ export default function App({ user = null, onSignOut } = {}) {
                              entryPrice={entryPrice} lastPrice={lastPrice} />
               : <div className="chart-empty">Loading {ticker}…</div>}
           </GlassCard>
-
-          {paperView?.enabled && (
+  );
+  const paperEquityCard = paperView?.enabled && (
             <GlassCard>
               <CardHead
                 title="Paper account equity"
@@ -435,10 +444,8 @@ export default function App({ user = null, onSignOut } = {}) {
               />
               <EquityChart dates={paperView.dates} agent={paperView.equityCurve} label="Paper" />
             </GlassCard>
-          )}
-        </div>
-
-        <div className="col">
+          );
+  const paperAccountCard = (
           <GlassCard className="gauge-card">
             <h2 className="card-title">Paper account</h2>
             {!paperView ? (
@@ -475,8 +482,8 @@ export default function App({ user = null, onSignOut } = {}) {
               </>
             )}
           </GlassCard>
-
-          {paperView?.enabled && (
+  );
+  const positionsCard = paperView?.enabled && (
             <GlassCard>
               <CardHead title="Open positions" sub="Average entry versus the last synced price" />
               <div className="tablewrap">
@@ -511,11 +518,9 @@ export default function App({ user = null, onSignOut } = {}) {
                 </table>
               </div>
             </GlassCard>
-          )}
-        </div>
-      </div>
-
-      <GlassCard style={{ marginTop: 14 }}>
+          );
+  const decisionLog = (
+      <GlassCard>
         <CardHead
           title="Autonomous decision log"
           sub="Every action traced to the model version, run and data partition that produced it"
@@ -584,6 +589,88 @@ export default function App({ user = null, onSignOut } = {}) {
           )}
         </div>
       </GlassCard>
+  );
+
+  return (
+    <div className="shell">
+      <SectionNav current={section} onSelect={go} pipeline={status.pipeline} />
+      <main className="wrap">
+      <header className="masthead">
+        <div>
+          <p className="mast-brand">Energy Agent Telemetry</p>
+          <h1 ref={titleRef} tabIndex={-1}>{current.label}</h1>
+          <p>{current.sub}</p>
+        </div>
+        <div className="mast-right">
+          {usingMock && (
+            <span className="demo-chip">Example data — not live results</span>
+          )}
+          {!usingMock && stale && (
+            <span className="stale">● Backend unreachable — showing last known</span>
+          )}
+          {!usingMock && (
+            <button
+              className="icon-btn"
+              onClick={forceCheck}
+              disabled={checking || status.pipeline !== "SERVING"}
+              aria-label="Force a CT evaluation now"
+              title="Force a CT evaluation now"
+            >
+              ⟳
+            </button>
+          )}
+          <button className="icon-btn" onClick={toggleTheme}
+                  aria-label="Switch theme" title="Switch theme">◐</button>
+          {user && (
+            <span className="account">
+              <span className="account-id" title={`Signed in with ${user.provider}`}>{user.email}</span>
+              <button className="text-btn" onClick={onSignOut}>Sign out</button>
+            </span>
+          )}
+        </div>
+      </header>
+
+      {section === "overview" && (
+        <>
+          {statusStrip}
+          <div className="panel">
+            <div className="col">
+              {equityCard}
+              <ActivityCard events={activityEvents} limit={3} onSeeAll={() => go("pipeline")} />
+            </div>
+            <div className="col">
+              {sharpeGauge}
+              {drawdownGauge}
+            </div>
+          </div>
+        </>
+      )}
+
+      {section === "pipeline" && (
+        <>
+          <div className="panel">
+            <div className="col">{sharpeChartCard}</div>
+            <div className="col">{cycleCard}</div>
+          </div>
+          <div className="section-gap"><ActivityCard events={activityEvents} limit={10} /></div>
+        </>
+      )}
+
+      {section === "decisions" && decisionLog}
+
+      {section === "trading" && (
+        <div className="panel">
+          <div className="col">
+            {priceCard}
+            {!usingMock && <NewsCard ticker={ticker} />}
+            {paperEquityCard}
+          </div>
+          <div className="col">
+            {paperAccountCard}
+            {positionsCard}
+          </div>
+        </div>
+      )}
 
       {usingMock && (
         <p className="note">
@@ -605,6 +692,9 @@ export default function App({ user = null, onSignOut } = {}) {
       >
         {selected !== null && <DecisionDetail row={decisions[selected]} />}
       </Sheet>
+      </main>
+
+      <Assistant />
     </div>
   );
 }

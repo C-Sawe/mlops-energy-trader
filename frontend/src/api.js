@@ -171,11 +171,91 @@ export const fetchCandles = (ticker, days = 120) =>
   get(`/market/candles?ticker=${encodeURIComponent(ticker)}&days=${days}`);
 
 /**
+ * Recent headlines, for one ticker or (no ticker) all five. Context only:
+ * the agent never reads news. `enabled: false` when the server has no
+ * Alpaca keys.
+ */
+export const fetchNews = (ticker, days = 7, limit = 12) =>
+  get(`/news?${new URLSearchParams({ ...(ticker ? { ticker } : {}), days, limit })}`);
+
+/**
  * The forward paper account (Alpaca paper venue): equity curve, positions
  * with entry prices, and filled orders. Read from the backend's database,
  * never from Alpaca directly.
  */
 export const fetchPaper = () => get("/paper/status");
+
+/**
+ * FR-20 as a history: what the pipeline did, newest first (the activity
+ * timeline). 100 events covers several hours of 5-minute checks.
+ */
+export const fetchEvents = (limit = 100) => get(`/events?limit=${limit}`);
+
+/** Whether the server offers the pipeline assistant (an API key is set). */
+export const fetchAssistantStatus = () => get("/assistant/status");
+
+/**
+ * Splits buffered server-sent-event text into complete events, calls
+ * `onEvent` with each parsed `data:` payload, and returns the incomplete
+ * remainder to prepend to the next chunk.
+ */
+export function drainEvents(buffer, onEvent) {
+  const parts = buffer.split("\n\n");
+  const rest = parts.pop();
+  for (const part of parts) {
+    for (const line of part.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        onEvent(JSON.parse(line.slice(6)));
+      } catch {
+        // A malformed event is skipped rather than ending the answer.
+      }
+    }
+  }
+  return rest;
+}
+
+/**
+ * Asks the pipeline assistant. `messages` is the conversation so far (text
+ * only, ending with the question). Calls `onEvent` for each streamed event
+ * (step, step_done, visual, text, follow_ups, error, done) and resolves when
+ * the stream ends. No timeout: answers stream for as long as they take, and
+ * `signal` lets the user stop one.
+ */
+export async function streamAssistant(messages, onEvent, signal) {
+  let res;
+  try {
+    res = await fetch(`${BASE}/assistant/chat`, {
+      method: "POST",
+      signal,
+      credentials: "include",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...authHeaders() },
+      body: JSON.stringify({ messages }),
+    });
+  } catch (err) {
+    return { ok: false, reason: err.name === "AbortError" ? "cancelled" : "unreachable" };
+  }
+  if (res.status === 401) return unauthorized();
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    const reason = { 429: "throttled", 503: "not_configured", 422: "invalid" }[res.status] ?? "failed";
+    return { ok: false, reason, detail: typeof body?.detail === "string" ? body.detail : null };
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer = drainEvents(buffer + decoder.decode(value, { stream: true }), onEvent);
+    }
+    drainEvents(buffer + decoder.decode() + "\n\n", onEvent);
+  } catch (err) {
+    return { ok: false, reason: err.name === "AbortError" ? "cancelled" : "interrupted" };
+  }
+  return { ok: true };
+}
 
 /** On-demand counterpart to the backend's scheduled CT evaluation (FR-13/14). */
 export const triggerEvaluation = () => post("/ct/evaluate");

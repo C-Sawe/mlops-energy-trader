@@ -12,6 +12,7 @@ only ever waiting for the timer.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets
@@ -20,25 +21,36 @@ from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-from src.config import AUTH, DATA, PAPER, RISK, SERVING
+from src.config import ASSISTANT, AUTH, DATA, INGESTION, NEWS, PAPER, RISK, SERVING
+from src.dataops.news import NewsFeed, NewsUnavailable
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator
 from src.execution.alpaca_broker import AlpacaBroker, BrokerError
-from src.orchestration.ingestion_scheduler import DEFAULT_TRAILING_WINDOW_DAYS, IngestionState
+from src.orchestration.ingestion_scheduler import (
+    DEFAULT_TRAILING_WINDOW_DAYS,
+    IngestionState,
+    ingestion_is_behind,
+)
 from src.orchestration.paper_trader import PaperTrader, next_run_at
 from src.rlops.registry import ModelRegistry
-from src.serving import auth
+from src.serving import assistant, auth
 from src.serving.inference import InferenceService, NoActiveModelError
 from src.serving.schemas import (
+    AssistantChatRequest,
+    AssistantStatusResponse,
     CandlesResponse,
     CTStatusResponse,
     DecisionLogEntry,
     DecisionLogResponse,
     EquityPoint,
+    EventsResponse,
     HealthResponse,
+    NewsResponse,
     PaperStatusResponse,
+    PipelineEventOut,
     PredictRequest,
     PredictResponse,
     TelemetryResponse,
@@ -46,11 +58,6 @@ from src.serving.schemas import (
 )
 
 CT_EVALUATION_INTERVAL_SECONDS = int(os.environ.get("CT_EVALUATION_INTERVAL_SECONDS", "300"))
-# Daily by default: yfinance's OHLCV bars only change once per trading day
-# (§9), so anything more frequent just re-fetches the same values. Set
-# lower for a live demo of FR-01 actually landing new rows without a human
-# re-running scripts/run_ingestion.py.
-INGESTION_INTERVAL_SECONDS = int(os.environ.get("INGESTION_INTERVAL_SECONDS", "86400"))
 
 # Constructed in `lifespan`, not here: `InferenceService.__init__` queries
 # the database immediately (it loads whatever model_version is active), so
@@ -89,27 +96,46 @@ async def _run_ingestion_scheduler() -> None:
     applies here too, not just during a retrain). Goes through `ingestion`
     (not the bare `run_ingestion_tick`) so `/ct-status` can show this tick
     actually happening — the same reasoning FR-20 already applies to the CT
-    loop's own status."""
+    loop's own status.
+
+    Runs every weekday at INGESTION_TIME_UTC, after the US close, not every
+    N seconds from process start: an interval timer restarts with every
+    deploy, crash recovery or reload, and on 2026-10-21 repeated restarts
+    kept postponing it until two trading days were missed. A restart can
+    still miss a scheduled time, so startup fetches once if the newest
+    stored bar is older than the last scheduled run should have produced."""
+    log = logging.getLogger(__name__)
+    if INGESTION.catch_up_on_startup:
+        try:
+            behind = await asyncio.to_thread(
+                ingestion_is_behind, repo, datetime.now(timezone.utc), INGESTION.run_time_utc
+            )
+            if behind:
+                log.info("stored market data is behind the last scheduled run; catching up now")
+                await asyncio.to_thread(ingestion.run, repo)
+        except Exception:  # noqa: BLE001 - the scheduler must survive a bad catch-up
+            log.exception("startup ingestion catch-up failed")
     while True:
-        await asyncio.sleep(INGESTION_INTERVAL_SECONDS)
+        now = datetime.now(timezone.utc)
+        await asyncio.sleep((next_run_at(now, INGESTION.run_time_utc) - now).total_seconds())
         try:
             await asyncio.to_thread(ingestion.run, repo)
         except Exception:  # noqa: BLE001 - the scheduler must survive a bad tick
-            logging.getLogger(__name__).exception("scheduled ingestion tick failed")
+            log.exception("scheduled ingestion tick failed")
 
 
-def _paper_cycle_job() -> str:
+def _paper_cycle_job(source: str = "scheduled") -> str:
     """Ingest today's bar first, so the cycle decides on the close that
     just happened rather than on whatever the interval-based ingestion
     scheduler last fetched. An ingestion failure is logged, not fatal: the
     cycle's own "no bar for today" check then skips trading."""
     try:
-        ingestion.run(repo)
+        ingestion.run(repo, source=source)
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("paper cycle: pre-trade ingestion failed")
     broker = _broker_factory()
     try:
-        return paper.run_cycle(broker)
+        return paper.run_cycle(broker, source=source)
     finally:
         broker.close()
 
@@ -348,6 +374,7 @@ def ct_status() -> CTStatusResponse:
         ingestion_status=ingestion.status.value,
         last_ingestion_attempted_at=ingestion.last_attempted_at,
         last_ingestion_ok=ingestion.last_ok,
+        next_ingestion_at=next_run_at(datetime.now(timezone.utc), INGESTION.run_time_utc),
     )
 
 
@@ -364,7 +391,7 @@ def trigger_evaluation(as_of: date | None = Query(default=None)) -> CTStatusResp
     reach all the way to the literal current date) instead of always
     defaulting to `date.today()`.
     """
-    orchestrator.evaluate(as_of=as_of)
+    orchestrator.evaluate(as_of=as_of, source="manual")
     return ct_status()
 
 
@@ -374,8 +401,8 @@ def trigger_ingestion(
     window_days: int = Query(default=DEFAULT_TRAILING_WINDOW_DAYS, ge=1),
 ) -> CTStatusResponse:
     """FR-01, on-demand counterpart to the background ingestion scheduler:
-    pulls fresh data immediately instead of waiting for
-    INGESTION_INTERVAL_SECONDS. Runs synchronously — a sync route function
+    pulls fresh data immediately instead of waiting for the next
+    INGESTION_TIME_UTC. Runs synchronously — a sync route function
     already executes in Starlette's threadpool, so the blocking network
     call inside `run_ingestion_tick` does not stall the event loop or any
     concurrent `/predict` call.
@@ -384,8 +411,19 @@ def trigger_ingestion(
     takes `as_of`: forcing a specific range for backfill or a demo, rather
     than always defaulting to `date.today()`.
     """
-    ingestion.run(repo, window_days=window_days, end=end)
+    ingestion.run(repo, window_days=window_days, end=end, source="manual")
     return ct_status()
+
+
+@app.get("/events", response_model=EventsResponse, dependencies=[Depends(_verify_token)])
+def events(
+    limit: int = Query(default=50, ge=1, le=200),
+    before: int | None = Query(default=None, ge=1),
+) -> EventsResponse:
+    """FR-20 as a history: what the pipeline did, newest first. `before` is
+    the oldest `event_id` already shown, to page further back."""
+    items, has_more = repo.list_events(limit=limit, before_id=before)
+    return EventsResponse(items=[PipelineEventOut(**i) for i in items], has_more=has_more)
 
 
 @app.get("/market/candles", response_model=CandlesResponse, dependencies=[Depends(_verify_token)])
@@ -403,6 +441,29 @@ def candles(
     return CandlesResponse(
         ticker=ticker, candles=repo.load_candles(ticker, end - timedelta(days=days), end)
     )
+
+
+# ----------------------------------------------------------------- news
+news_feed = NewsFeed()
+
+
+@app.get("/news", response_model=NewsResponse, dependencies=[Depends(_verify_token)])
+def news(
+    ticker: str | None = Query(default=None),
+    days: int = Query(default=7, ge=1, le=30),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> NewsResponse:
+    """Recent headlines for one ticker, or the whole universe. Context for
+    the reader only (src/dataops/news.py): no decision reads news."""
+    if ticker is not None and ticker not in DATA.tickers:
+        raise HTTPException(status_code=422, detail=f"ticker must be one of {list(DATA.tickers)}")
+    if not NEWS.enabled:
+        return NewsResponse(enabled=False, ticker=ticker, items=[])
+    try:
+        items = news_feed.headlines(ticker, days=days, limit=limit)
+    except NewsUnavailable as exc:
+        raise HTTPException(status_code=503, detail="News is unavailable right now.") from exc
+    return NewsResponse(enabled=True, ticker=ticker, items=items)
 
 
 PAPER_HISTORY_DAYS = 365
@@ -448,7 +509,7 @@ def trigger_paper_cycle() -> PaperStatusResponse:
     not already traded — so pressing it twice cannot double-trade."""
     _require_paper_enabled()
     try:
-        _paper_cycle_job()
+        _paper_cycle_job(source="manual")
     except BrokerError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except NoActiveModelError as exc:
@@ -464,3 +525,42 @@ def trigger_paper_sync() -> PaperStatusResponse:
     except BrokerError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return paper_status()
+
+
+# ----------------------------------------------------------------- assistant
+_assistant_limiter = assistant.RateLimiter()
+
+
+@app.get("/assistant/status", response_model=AssistantStatusResponse, dependencies=[Depends(_verify_token)])
+def assistant_status() -> AssistantStatusResponse:
+    """Whether the dashboard should offer the assistant (src/serving/assistant.py)."""
+    return AssistantStatusResponse(enabled=ASSISTANT.enabled, model=ASSISTANT.model if ASSISTANT.enabled else None)
+
+
+@app.post("/assistant/chat", dependencies=[Depends(_verify_token)])
+async def assistant_chat(body: AssistantChatRequest, request: Request) -> StreamingResponse:
+    """Streams one answer as server-sent events (see assistant.run_chat).
+    Behind the same sign-in as the rest of the API, and rate-limited per
+    signed-in user (or client address) because every question costs money."""
+    if not ASSISTANT.enabled:
+        raise HTTPException(status_code=503, detail="The assistant is not configured on this server.")
+    user = auth.current_user(request) if AUTH.enabled else None
+    caller = user["email"] if user else (request.client.host if request.client else "unknown")
+    if not _assistant_limiter.allow(caller):
+        raise HTTPException(status_code=429, detail="Too many questions. Try again in a few minutes.")
+
+    tools = assistant.PipelineTools(repo, lambda: ct_status().model_dump(), news=news_feed if NEWS.enabled else None)
+    messages = [m.model_dump() for m in body.messages]
+
+    async def events():
+        try:
+            async for event in assistant.run_chat(messages, tools):
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+        except Exception:  # noqa: BLE001 - end the stream with a message, never a half-open connection
+            logging.getLogger(__name__).exception("assistant chat failed")
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Something went wrong. Please ask again.'})}\n\n"
+
+    # X-Accel-Buffering: nginx (the deployment's proxy) would otherwise hold
+    # the stream back until the answer finished.
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

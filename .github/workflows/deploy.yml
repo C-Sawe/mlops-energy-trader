@@ -150,13 +150,15 @@ jobs:
           BASIC_AUTH_PASSWORD: ${{ secrets.BASIC_AUTH_PASSWORD }}
           SITE_ADDRESS: ${{ vars.SITE_ADDRESS }}
           CT_EVALUATION_INTERVAL_SECONDS: ${{ vars.CT_EVALUATION_INTERVAL_SECONDS }}
-          INGESTION_INTERVAL_SECONDS: ${{ vars.INGESTION_INTERVAL_SECONDS }}
+          INGESTION_TIME_UTC: ${{ vars.INGESTION_TIME_UTC }}
           PAPER_TRADING_ENABLED: ${{ vars.PAPER_TRADING_ENABLED }}
           PAPER_TRADE_TIME_UTC: ${{ vars.PAPER_TRADE_TIME_UTC }}
           BACKUP_TIME_UTC: ${{ vars.BACKUP_TIME_UTC }}
           BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ASSISTANT_MODEL: ${{ vars.ASSISTANT_MODEL }}
           DASHBOARD_AUTH: ${{ vars.DASHBOARD_AUTH }}
           PASSWORD_LOGIN: ${{ vars.PASSWORD_LOGIN }}
           SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
@@ -179,13 +181,15 @@ jobs:
             echo "BASIC_AUTH_PASSWORD=${BASIC_AUTH_PASSWORD}"
             [ -n "$SITE_ADDRESS" ] && echo "SITE_ADDRESS=${SITE_ADDRESS}"
             [ -n "$CT_EVALUATION_INTERVAL_SECONDS" ] && echo "CT_EVALUATION_INTERVAL_SECONDS=${CT_EVALUATION_INTERVAL_SECONDS}"
-            [ -n "$INGESTION_INTERVAL_SECONDS" ] && echo "INGESTION_INTERVAL_SECONDS=${INGESTION_INTERVAL_SECONDS}"
+            [ -n "$INGESTION_TIME_UTC" ] && echo "INGESTION_TIME_UTC=${INGESTION_TIME_UTC}"
             [ -n "$PAPER_TRADING_ENABLED" ] && echo "PAPER_TRADING_ENABLED=${PAPER_TRADING_ENABLED}"
             [ -n "$PAPER_TRADE_TIME_UTC" ] && echo "PAPER_TRADE_TIME_UTC=${PAPER_TRADE_TIME_UTC}"
             [ -n "$BACKUP_TIME_UTC" ] && echo "BACKUP_TIME_UTC=${BACKUP_TIME_UTC}"
             [ -n "$BACKUP_RETENTION_DAYS" ] && echo "BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS}"
             [ -n "$ALPACA_API_KEY" ] && echo "ALPACA_API_KEY=${ALPACA_API_KEY}"
             [ -n "$ALPACA_SECRET_KEY" ] && echo "ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}"
+            [ -n "$GROQ_API_KEY" ] && echo "GROQ_API_KEY=${GROQ_API_KEY}"
+            [ -n "$ASSISTANT_MODEL" ] && echo "ASSISTANT_MODEL=${ASSISTANT_MODEL}"
             if [ "${DASHBOARD_AUTH:-basic}" = "signin" ]; then
               # Callbacks and the post-sign-in redirect are built from the
               # public domain; nginx serves the API under /api.
@@ -247,9 +251,19 @@ jobs:
           print(urllib.request.urlopen(req, timeout=120).read().decode())
           \""
 
+      # 127.0.0.1, not localhost: busybox wget in the Alpine image tries IPv6
+      # (::1) first and nginx listens on IPv4 only, so "localhost" was refused
+      # on every deploy even though the site was up. Retried because nginx can
+      # still be starting right after the rollout.
       - name: Smoke test dashboard and edge proxy
         run: |
-          ssh target "cd ~/${DEPLOY_DIR} && docker compose exec -T frontend wget -qO- http://localhost/healthz"
+          for i in $(seq 1 12); do
+            if ssh target "cd ~/${DEPLOY_DIR} && docker compose exec -T frontend wget -qO- http://127.0.0.1/healthz" >/dev/null; then
+              echo "dashboard healthy after ${i} attempt(s)"; break
+            fi
+            [ "$i" = 12 ] && { echo "::error::dashboard did not answer /healthz"; exit 1; }
+            sleep 5
+          done
           ssh target "cd ~/${DEPLOY_DIR} && test -n \"\$(docker compose ps --status running -q caddy)\""
           ssh target "cd ~/${DEPLOY_DIR} && test -n \"\$(docker compose ps --status running -q backup)\""
 

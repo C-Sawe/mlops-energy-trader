@@ -5,6 +5,16 @@ Usage:
     python scripts/run_ingestion.py --start 2015-01-01 --end 2025-12-31
     python scripts/run_ingestion.py --start 2024-01-01 --end 2024-03-01 --dry-run
 
+Fetches `--warmup-days` (default 120) of extra history before `--start` so
+SMA_20/RSI_14 are already warm on the first requested day, then persists
+only rows from `--start` onward. Without this, the first 19 rows of every
+run were NaN by construction, and because persist() upserts, a backfill
+that started inside already-stored history overwrote 19 correct trading
+days with NaN. The 60-day z-score then spread each hole to ~78 unusable
+days. That happened twice for real (2025-09-02.. and 2026-04-01..), found
+while preparing Chapter 5. Same reasoning as the ingestion scheduler's
+trailing window (src/orchestration/ingestion_scheduler.py).
+
 Exit codes:
     0  success
     1  ingestion failed (IR-02: nothing was written)
@@ -15,7 +25,10 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import timedelta
 from pathlib import Path
+
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -31,6 +44,29 @@ logging.basicConfig(
 )
 log = logging.getLogger("ingestion")
 
+DEFAULT_WARMUP_DAYS = 120  # calendar days; ~83 trading rows, as in the scheduler
+
+
+def build_window(
+    start: str,
+    end: str,
+    tickers: tuple[str, ...],
+    warmup_days: int = DEFAULT_WARMUP_DAYS,
+    strict: bool = True,
+    fetch=fetch_market_data,
+):
+    """Fetch [start - warmup_days, end], enrich, and keep only rows >= start.
+
+    Returns (frame, result). Rows before `start` exist only so indicators
+    are converged on `start`; they are never persisted, so a backfill can
+    never overwrite stored history outside the range it was asked for.
+    """
+    fetch_start = (pd.Timestamp(start) - timedelta(days=warmup_days)).date()
+    result = fetch(str(fetch_start), str(end), tickers=tickers, strict=strict)
+    frame = build_feature_frame(result.equities, result.vix)
+    frame = frame[frame["date"] >= pd.Timestamp(start)].reset_index(drop=True)
+    return frame, result
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest and enrich market data")
@@ -41,6 +77,10 @@ def main() -> int:
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="fetch and transform but do not persist"
+    )
+    parser.add_argument(
+        "--warmup-days", type=int, default=DEFAULT_WARMUP_DAYS,
+        help="extra calendar days fetched before --start so indicators are warm (not persisted)",
     )
     parser.add_argument(
         "--lenient",
@@ -54,10 +94,10 @@ def main() -> int:
     log.info("range: %s to %s", args.start, args.end)
     log.info("target: %r", DATABASE)
 
-    # --- fetch (FR-01, IR-01, IR-02) ------------------------------------
+    # --- fetch + transform (FR-01..FR-04, IR-01, IR-02) -----------------
     try:
-        result = fetch_market_data(
-            args.start, args.end, tickers=tickers, strict=not args.lenient
+        frame, result = build_window(
+            args.start, args.end, tickers, args.warmup_days, strict=not args.lenient
         )
     except IngestionError as exc:
         log.error("ingestion aborted, nothing written: %s", exc)
@@ -65,10 +105,14 @@ def main() -> int:
 
     if result.failed_tickers:
         log.warning("failed tickers: %s", ", ".join(result.failed_tickers))
-    log.info("fetched %d raw equity rows", len(result.equities))
+    log.info(
+        "fetched %d raw equity rows (incl. %d warm-up days before %s, not persisted)",
+        len(result.equities), args.warmup_days, args.start,
+    )
+    indicator_gaps = int(frame[["sma_20", "rsi_14"]].isna().any(axis=1).sum())
+    if indicator_gaps:
+        log.warning("%d rows still lack an indicator value (history shorter than warm-up?)", indicator_gaps)
 
-    # --- transform (FR-02, FR-03, FR-04) --------------------------------
-    frame = build_feature_frame(result.equities, result.vix)
     imputed = int(frame["is_imputed"].sum())
     log.info(
         "enriched to %d rows across %d tickers (%d imputed)",

@@ -55,7 +55,8 @@ services:
       TARGET_SHARPE_THRESHOLD: ${TARGET_SHARPE_THRESHOLD:-1.0}
       SHARPE_EVALUATION_WINDOW: ${SHARPE_EVALUATION_WINDOW:-30}
       CT_EVALUATION_INTERVAL_SECONDS: ${CT_EVALUATION_INTERVAL_SECONDS:-300}
-      INGESTION_INTERVAL_SECONDS: ${INGESTION_INTERVAL_SECONDS:-86400}
+      # FR-01: weekdays at this UTC time, after the US close (src/orchestration/schedule.py).
+      INGESTION_TIME_UTC: ${INGESTION_TIME_UTC:-21:30}
       # Forward paper trading (Alpaca *paper* endpoint only; there is no
       # live-trading URL anywhere in the code). Off unless explicitly set.
       PAPER_TRADING_ENABLED: ${PAPER_TRADING_ENABLED:-false}
@@ -63,6 +64,8 @@ services:
       PAPER_SYNC_INTERVAL_SECONDS: ${PAPER_SYNC_INTERVAL_SECONDS:-900}
       ALPACA_API_KEY: ${ALPACA_API_KEY:-}
       ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY:-}
+      # Market news (src/dataops/news.py) uses the same keys; context only.
+      NEWS_ENABLED: ${NEWS_ENABLED:-true}
       # Dashboard sign-in (src/serving/auth.py). Off unless PASSWORD_LOGIN is
       # true or a provider has both a client id and secret; the backend then
       # refuses to start without SESSION_SECRET and ALLOWED_EMAILS.
@@ -78,6 +81,10 @@ services:
       MICROSOFT_TENANT: ${MICROSOFT_TENANT:-common}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      # Pipeline assistant on Groq (src/serving/assistant.py): off unless the key is set.
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      ASSISTANT_MODEL: ${ASSISTANT_MODEL:-qwen/qwen3.8-27b}
+      ASSISTANT_RATE_LIMIT: ${ASSISTANT_RATE_LIMIT:-20}
     volumes:
       - mlruns:/app/mlruns
 

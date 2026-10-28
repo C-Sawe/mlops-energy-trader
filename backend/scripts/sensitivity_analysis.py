@@ -50,7 +50,7 @@ from src.rlops.baselines import equal_weight_rebalanced, run_policy  # noqa: E40
 from src.rlops.environment import TradingEnvironment  # noqa: E402
 
 
-def vix_threshold_sensitivity(repo: MarketRepository) -> None:
+def vix_threshold_sensitivity(repo: MarketRepository) -> dict | None:
     print("\n" + "=" * 70)
     print("1. VIX critical threshold (FR-12 / the retrain-deferral gate)")
     print("=" * 70)
@@ -58,13 +58,15 @@ def vix_threshold_sensitivity(repo: MarketRepository) -> None:
     raw = repo.load_partition(DATA.train_start, DATA.eval_end, tickers=(DATA.tickers[0],))
     if raw.empty:
         print("no data in the store; run scripts/run_ingestion.py first", file=sys.stderr)
-        return
+        return None
     vix = raw["vix"].dropna()
+    rows = []
     n = len(vix)
     print(f"real trading days with a VIX reading: {n} ({raw['date'].min().date()} to {raw['date'].max().date()})")
     print(f"{'threshold':>10} | {'days >= threshold':>18} | {'% of history':>13}")
     for threshold in (20.0, 25.0, 28.0, 30.0, 32.0, 35.0, 38.0, 40.0, 45.0, 50.0):
         hit = int((vix >= threshold).sum())
+        rows.append({"threshold": threshold, "days_at_or_above": hit, "pct_of_history": 100 * hit / n})
         marker = "  <- current default" if threshold == RISK.vix_critical_threshold else ""
         print(f"{threshold:>10.1f} | {hit:>18} | {100 * hit / n:>12.2f}%{marker}")
     print(
@@ -73,9 +75,13 @@ def vix_threshold_sensitivity(repo: MarketRepository) -> None:
         "days in this checkout's history — rare enough to be a genuine circuit "
         "breaker, not a threshold the system spends its life near."
     )
+    return {
+        "first_date": str(raw["date"].min().date()), "last_date": str(raw["date"].max().date()),
+        "trading_days": n, "default": RISK.vix_critical_threshold, "rows": rows,
+    }
 
 
-def target_sharpe_sensitivity(dsr_report_path: str) -> None:
+def target_sharpe_sensitivity(dsr_report_path: str) -> dict | None:
     print("\n" + "=" * 70)
     print("2. target_sharpe_threshold (FR-14)")
     print("=" * 70)
@@ -88,7 +94,7 @@ def target_sharpe_sensitivity(dsr_report_path: str) -> None:
             "(a real ~11-minute training pass; not something this script silently repeats)",
             file=sys.stderr,
         )
-        return
+        return None
 
     report = json.loads(path.read_text())
     all_seeds = np.array([s for split in report["per_split"] for s in split["seed_sharpes"]])
@@ -97,9 +103,11 @@ def target_sharpe_sensitivity(dsr_report_path: str) -> None:
 
     print(f"using {path} — {report['seeds']} seeds x {n_splits} splits = {n_all} real training runs")
     print(f"{'threshold':>10} | {'% of all seeds below':>21} | {'% of best-per-split below':>26}")
+    rows = []
     for threshold in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
         below_all = 100 * (all_seeds < threshold).sum() / n_all
         below_best = 100 * (best_per_split < threshold).sum() / n_splits
+        rows.append({"threshold": threshold, "pct_all_seeds_below": float(below_all), "pct_best_per_split_below": float(below_best)})
         marker = "  <- current default" if threshold == RISK.target_sharpe_threshold else ""
         print(f"{threshold:>10.1f} | {below_all:>20.1f}% | {below_best:>25.1f}%{marker}")
     print(
@@ -113,9 +121,10 @@ def target_sharpe_sensitivity(dsr_report_path: str) -> None:
         "already be flagged, which matches this project's own measured seed "
         "sensitivity (CLAUDE.md §10.2), not a threshold tuned to look lenient."
     )
+    return {"runs": n_all, "splits": n_splits, "default": RISK.target_sharpe_threshold, "rows": rows}
 
 
-def transaction_cost_sensitivity(repo: MarketRepository) -> None:
+def transaction_cost_sensitivity(repo: MarketRepository) -> dict | None:
     print("\n" + "=" * 70)
     print("3. transaction_cost_pct (FR-07)")
     print("=" * 70)
@@ -123,8 +132,9 @@ def transaction_cost_sensitivity(repo: MarketRepository) -> None:
     raw = repo.load_partition(DATA.eval_start, DATA.eval_end, tickers=DATA.tickers)
     if raw.empty:
         print("no data in the store for the configured eval window", file=sys.stderr)
-        return
+        return None
     frame = normalize_rolling(raw)
+    rows = []
 
     print(f"eval window: {DATA.eval_start} to {DATA.eval_end}, real data, equal-weight-rebalanced baseline")
     print(f"{'cost (bps)':>10} | {'Sharpe':>8} | {'cumulative return':>18}")
@@ -133,6 +143,7 @@ def transaction_cost_sensitivity(repo: MarketRepository) -> None:
         result = run_policy(env, equal_weight_rebalanced, seed=0)
         sr = sharpe_ratio(result["returns"])
         cum_return = result["equity_curve"][-1] / result["equity_curve"][0] - 1.0
+        rows.append({"cost_bps": cost_pct * 10_000, "sharpe": float(sr), "cumulative_return": float(cum_return), "steps": len(result["returns"])})
         marker = "  <- current default" if cost_pct == ENVIRONMENT.transaction_cost_pct else ""
         print(f"{cost_pct * 10_000:>10.1f} | {sr:>8.3f} | {cum_return:>17.2%}{marker}")
     print(
@@ -141,17 +152,28 @@ def transaction_cost_sensitivity(repo: MarketRepository) -> None:
         "the current default quantifies how much of any policy's apparent edge a "
         "frictionless simulation would have flattered away (CLAUDE.md §10.4)."
     )
+    return {
+        "window": [str(DATA.eval_start), str(DATA.eval_end)],
+        "policy": "equal_weight_rebalanced",
+        "default_bps": ENVIRONMENT.transaction_cost_pct * 10_000,
+        "rows": rows,
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sensitivity analysis over configurable thresholds")
     parser.add_argument("--dsr-report", default="/tmp/dsr_report_real.json")
+    parser.add_argument("--out", default=None, help="also write all three results as JSON here")
     args = parser.parse_args()
 
     repo = MarketRepository()
-    vix_threshold_sensitivity(repo)
-    target_sharpe_sensitivity(args.dsr_report)
-    transaction_cost_sensitivity(repo)
+    results = {
+        "vix_threshold": vix_threshold_sensitivity(repo),
+        "target_sharpe": target_sharpe_sensitivity(args.dsr_report),
+        "transaction_cost": transaction_cost_sensitivity(repo),
+    }
+    if args.out:
+        Path(args.out).write_text(json.dumps(results, indent=2))
     return 0
 
 

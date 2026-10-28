@@ -30,6 +30,7 @@ from src.dataops.models import (
     PaperAccountSnapshot,
     PaperCycle,
     PaperOrder,
+    PipelineEvent,
     PortfolioSnapshot,
     TradingDecision,
 )
@@ -318,6 +319,67 @@ class MarketRepository:
                 for r in rows
             ]
         return items, total
+
+    def get_decision(self, decision_id: str) -> dict | None:
+        """One decision with its whole NFR-07 chain: decision -> version ->
+        run -> data partitions and hyperparameters. None if it doesn't exist."""
+        stmt = (
+            select(TradingDecision)
+            .options(joinedload(TradingDecision.version).joinedload(ModelVersion.run))
+            .where(TradingDecision.decision_id == decision_id)
+        )
+        with self.session() as session:
+            r = session.execute(stmt).scalars().first()
+            if r is None:
+                return None
+            run = r.version.run
+            return {
+                "decision_id": r.decision_id,
+                "decided_at": r.decided_at,
+                "ticker": r.ticker,
+                "raw_weight": float(r.raw_weight) if r.raw_weight is not None else None,
+                "discrete_action": r.discrete_action,
+                "vix_at_decision": float(r.vix_at_decision) if r.vix_at_decision is not None else None,
+                "failsafe_triggered": r.failsafe_triggered,
+                "version_id": r.version_id,
+                "version_promoted_at": r.version.promoted_at,
+                "version_is_active": r.version.is_active,
+                "run_id": run.run_id,
+                "train_start": run.train_start,
+                "train_end": run.train_end,
+                "eval_start": run.eval_start,
+                "eval_end": run.eval_end,
+                "hyperparameters": dict(run.hyperparameters or {}),
+                "sharpe_ratio": float(run.sharpe_ratio) if run.sharpe_ratio is not None else None,
+                "trigger_reason": run.trigger_reason,
+            }
+
+    def list_model_versions(self, limit: int = 10) -> list[dict]:
+        """Registered versions, most recently promoted first (never-promoted
+        ones after), with the run that produced each (FR-09, NFR-07)."""
+        stmt = (
+            select(ModelVersion)
+            .options(joinedload(ModelVersion.run))
+            .order_by(ModelVersion.promoted_at.is_(None), ModelVersion.promoted_at.desc())
+            .limit(limit)
+        )
+        with self.session() as session:
+            return [
+                {
+                    "version_id": v.version_id,
+                    "promoted_at": v.promoted_at,
+                    "is_active": v.is_active,
+                    "run_id": v.run_id,
+                    "train_start": v.run.train_start,
+                    "train_end": v.run.train_end,
+                    "eval_start": v.run.eval_start,
+                    "eval_end": v.run.eval_end,
+                    "sharpe_ratio": float(v.run.sharpe_ratio) if v.run.sharpe_ratio is not None else None,
+                    "trigger_reason": v.run.trigger_reason,
+                    "created_at": v.run.created_at,
+                }
+                for v in session.execute(stmt).scalars().all()
+            ]
 
     # ----------------------------------------------------------- snapshots
     def record_snapshot(
@@ -703,3 +765,53 @@ class MarketRepository:
                     return False
                 session.delete(user)
                 return True
+
+    def record_event(
+        self,
+        kind: str,
+        summary: str,
+        source: str = "scheduled",
+        detail: dict | None = None,
+        run_id: str | None = None,
+        version_id: str | None = None,
+    ) -> int:
+        """Appends one pipeline event (FR-20 history). The orchestration
+        layer calls this through `src/orchestration/events.emit`, which keeps
+        a failed write from interrupting the pipeline itself."""
+        with self.session() as session:
+            with session.begin():
+                event = PipelineEvent(
+                    occurred_at=datetime.now(timezone.utc),
+                    kind=kind,
+                    source=source,
+                    summary=summary[:300],
+                    detail=detail or {},
+                    run_id=run_id,
+                    version_id=version_id,
+                )
+                session.add(event)
+                session.flush()
+                return event.event_id
+
+    def list_events(self, limit: int = 50, before_id: int | None = None) -> tuple[list[dict], bool]:
+        """Newest first. `before_id` pages back through older events; the
+        bool says whether any remain beyond this page."""
+        stmt = select(PipelineEvent).order_by(PipelineEvent.event_id.desc()).limit(limit + 1)
+        if before_id is not None:
+            stmt = stmt.where(PipelineEvent.event_id < before_id)
+        with self.session() as session:
+            rows = session.execute(stmt).scalars().all()
+            items = [
+                {
+                    "event_id": r.event_id,
+                    "occurred_at": r.occurred_at,
+                    "kind": r.kind,
+                    "source": r.source,
+                    "summary": r.summary,
+                    "detail": dict(r.detail or {}),
+                    "run_id": r.run_id,
+                    "version_id": r.version_id,
+                }
+                for r in rows[:limit]
+            ]
+        return items, len(rows) > limit

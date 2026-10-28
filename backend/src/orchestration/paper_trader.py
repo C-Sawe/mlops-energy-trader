@@ -33,6 +33,8 @@ from src.config import DATA, PAPER
 from src.dataops.repository import MarketRepository
 from src.execution.alpaca_broker import AlpacaBroker
 from src.execution.rebalance import OrderIntent, liquidate_all, plan_rebalance
+from src.orchestration.events import emit
+from src.orchestration.schedule import next_run_at  # noqa: F401 - re-exported for api.py and tests
 from src.serving.inference import InferenceService
 
 logger = logging.getLogger(__name__)
@@ -47,21 +49,6 @@ def market_today(now: datetime | None = None) -> date:
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     return ts.tz_convert(MARKET_TZ).date()
-
-
-def next_run_at(now: datetime, run_time_utc: str) -> datetime:
-    """The next weekday at `run_time_utc` (HH:MM) strictly after `now`.
-    A fixed wall-clock time, unlike the interval-based ingestion scheduler,
-    which drifts with whenever the process happened to start. Weekend days
-    are skipped here; market holidays are caught later by the "no bar for
-    today" check in `run_cycle`."""
-    hour, minute = (int(x) for x in run_time_utc.split(":"))
-    candidate = now.astimezone(timezone.utc).replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if candidate <= now:
-        candidate += pd.Timedelta(days=1).to_pytimedelta()
-    while candidate.weekday() >= 5:
-        candidate += pd.Timedelta(days=1).to_pytimedelta()
-    return candidate
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -156,10 +143,11 @@ class PaperTrader:
         return snapshot
 
     # ----------------------------------------------------------------- cycle
-    def run_cycle(self, broker: AlpacaBroker, now: datetime | None = None) -> str:
+    def run_cycle(self, broker: AlpacaBroker, now: datetime | None = None, source: str = "scheduled") -> str:
         """One daily cycle. Returns (and records) a short outcome string.
         Skips, rather than trades, when today's bar hasn't arrived (weekend,
-        holiday, or yfinance lag) or when this signal date already traded."""
+        holiday, or yfinance lag) or when this signal date already traded.
+        `source` ("scheduled" or "manual") goes on the pipeline event."""
         with self._lock:
             if self._status == PaperStatus.TRADING:
                 return "skipped: a cycle is already running"
@@ -176,6 +164,8 @@ class PaperTrader:
                 self._status = PaperStatus.IDLE
                 self._last_run_at = datetime.now(timezone.utc)
                 self._last_outcome = outcome
+            emit(self.repo, "paper_cycle", f"Paper-trading cycle: {outcome}", source=source,
+                 detail={"outcome": outcome})
 
     def _cycle(self, broker: AlpacaBroker, now: datetime | None) -> str:
         today = market_today(now)

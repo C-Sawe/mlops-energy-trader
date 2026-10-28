@@ -20,6 +20,8 @@ from src.config import DATA
 from src.dataops.ingestion import fetch_market_data
 from src.dataops.processing import build_feature_frame
 from src.dataops.repository import MarketRepository
+from src.orchestration.events import emit
+from src.orchestration.schedule import previous_run_at
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +162,18 @@ class IngestionStatus(str, Enum):
     INGESTING = "INGESTING"
 
 
+def ingestion_is_behind(repo: MarketRepository, now: datetime, run_time_utc: str) -> bool:
+    """True when the newest stored bar is older than the date of the last
+    scheduled run: that run should have stored its day's bar, so it was
+    missed (the process was down or restarting). The run at 21:30 UTC on
+    day D fetches New York's day D. An empty database is not "behind":
+    it needs the full bootstrap backfill, not a 120-day tick."""
+    latest = repo.latest_ingest_info()
+    if latest is None:
+        return False
+    return latest["date"] < previous_run_at(now, run_time_utc).date()
+
+
 class IngestionState:
     """Thread-safe tracker for the last ingestion tick, shared by the
     background scheduler and the on-demand `/ingest/run` endpoint in
@@ -197,7 +211,11 @@ class IngestionState:
         tickers: tuple[str, ...] | None = None,
         window_days: int = DEFAULT_TRAILING_WINDOW_DAYS,
         end: date | None = None,
+        source: str = "scheduled",
     ) -> int:
+        """`source` is "scheduled" or "manual" (`/ingest/run`), recorded on
+        the pipeline event this writes."""
+        repo = repo or MarketRepository()
         with self._lock:
             self._status = IngestionStatus.INGESTING
         try:
@@ -206,11 +224,24 @@ class IngestionState:
                 self._last_ok = True
                 self._last_error = None
                 self._last_rows = rows
+            latest = repo.latest_ingest_info()
+            through = f" through {latest['date']}" if latest else ""
+            emit(
+                repo, "ingestion_ok", f"Fetched market data: {rows} rows stored{through}",
+                source=source,
+                detail={"rows": rows, "latest_date": str(latest["date"]) if latest else None},
+            )
             return rows
         except Exception as exc:  # noqa: BLE001 - recorded, then re-raised for the caller to log
             with self._lock:
                 self._last_ok = False
                 self._last_error = str(exc)
+            # IR-02: a failed tick writes nothing, so the stored data is unchanged.
+            emit(
+                repo, "ingestion_failed",
+                f"Market data fetch failed ({type(exc).__name__}); stored data unchanged, next tick retries",
+                source=source, detail={"error_type": type(exc).__name__},
+            )
             raise
         finally:
             with self._lock:
