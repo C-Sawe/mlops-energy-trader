@@ -262,7 +262,22 @@ docker compose exec backend python scripts/create_dashboard_user.py --email you@
 
 It asks for the password twice, at a hidden prompt (at least 12
 characters). Run it again to change a password, or add `--delete` to remove
-the account. The email must also be in `ALLOWED_EMAILS`. Passwords are
+the account.
+
+**Without SSH**, let the deploy create the account. On your own machine,
+hash the password and store only the hash as a secret, then set the email
+secret and deploy:
+
+```bash
+cd backend
+python scripts/create_dashboard_user.py --email you@gmail.com --hash-only \
+  | gh secret set DASHBOARD_USER_PASSWORD_HASH
+gh secret set DASHBOARD_USER_EMAIL --body you@gmail.com
+```
+
+Every deploy then sets that account's password from the hash (the step
+"Create dashboard sign-in account"). The password never leaves your machine;
+to change it, run the same command again and redeploy. The email must also be in `ALLOWED_EMAILS`. Passwords are
 stored as salted scrypt hashes. After 10 wrong attempts for one email in 15
 minutes, that email is blocked until the 15 minutes pass. Note that this
 means someone guessing at your address can lock you out for that long; you

@@ -9,6 +9,7 @@ provider's response is trusted for.
 from __future__ import annotations
 
 import importlib.util
+import io
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -338,3 +339,27 @@ def test_create_dashboard_user_script(tmp_path, monkeypatch, capsys):
 
     assert script.main(["--email", ALLOWED, "--delete"]) == 0
     assert MarketRepository().get_dashboard_password_hash(ALLOWED) is None
+
+
+def test_the_deployed_account_is_made_from_a_hash_never_the_password(tmp_path, monkeypatch, capsys):
+    """--hash-only prints a hash on the operator's machine (no database);
+    --hash-stdin stores it on the server. The password itself never travels."""
+    path = Path(__file__).resolve().parents[1] / "scripts" / "create_dashboard_user.py"
+    spec = importlib.util.spec_from_file_location("create_dashboard_user", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'deployed.db'}")
+    typed = iter([PASSWORD, PASSWORD])
+    monkeypatch.setattr(script.getpass, "getpass", lambda prompt="": next(typed))
+
+    assert script.main(["--email", ALLOWED, "--hash-only"]) == 0
+    printed = capsys.readouterr().out.strip()
+    assert PASSWORD not in printed and auth.verify_password(PASSWORD, printed)
+    assert not (tmp_path / "deployed.db").exists()  # hashing touches no database
+
+    monkeypatch.setattr(script.sys, "stdin", io.StringIO(printed + "\n"))
+    assert script.main(["--email", ALLOWED, "--hash-stdin"]) == 0
+    assert auth.verify_password(PASSWORD, MarketRepository().get_dashboard_password_hash(ALLOWED))
+
+    monkeypatch.setattr(script.sys, "stdin", io.StringIO(PASSWORD))  # a raw password is refused
+    assert script.main(["--email", ALLOWED, "--hash-stdin"]) == 1

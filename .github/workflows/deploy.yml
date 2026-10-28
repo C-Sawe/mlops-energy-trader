@@ -236,6 +236,20 @@ jobs:
           ssh target "cd ~/${DEPLOY_DIR} && docker compose ps && docker compose logs --tail=100 backend"
           exit 1
 
+      # The sign-in page's password account (FR-22), without SSH. The operator
+      # hashes the password on their own machine and stores only the hash
+      # (create_dashboard_user.py --hash-only | gh secret set ...). It goes to
+      # the server on stdin, never on a command line. Re-running just re-sets it.
+      - name: Create dashboard sign-in account
+        env:
+          D_EMAIL: ${{ secrets.DASHBOARD_USER_EMAIL }}
+          D_HASH: ${{ secrets.DASHBOARD_USER_PASSWORD_HASH }}
+        run: |
+          if [ -z "$D_EMAIL" ] || [ -z "$D_HASH" ]; then
+            echo "DASHBOARD_USER_EMAIL / DASHBOARD_USER_PASSWORD_HASH not set; skipped"; exit 0
+          fi
+          printf '%s\n' "$D_HASH" | ssh target "cd ~/${DEPLOY_DIR} && docker compose exec -T backend python scripts/create_dashboard_user.py --email '${D_EMAIL}' --hash-stdin"
+
       # First deploy only. The ingestion scheduler refetches a 120-day
       # trailing window, which cannot fill an empty database (CLAUDE.md §13),
       # so a fresh host needs one explicit full backfill. Then /ct/evaluate
