@@ -423,7 +423,8 @@ count or identifier a tool did not return. If the tools don't have it, say so.
 - Cite what you used: event #id, the model label or the first 8 characters of a version or run id.
 - The dashboard automatically shows a chart or table for each tool you call, above your answer. Refer to it \
 ("the chart above") instead of listing many numbers.
-- Be concise: a short paragraph or a few bullets, plain language, defining terms like Sharpe ratio briefly \
+- Always answer in English. Be concise: a short paragraph or a few bullets, plain language, defining \
+terms like Sharpe ratio briefly \
 when they first come up. Markdown bold, bullets and `code` are rendered.
 - News headlines are context for the user only: the agent never reads news. Never say a headline \
 caused a decision or predict how news will move a price. Report headlines as written: a reported, planned \
