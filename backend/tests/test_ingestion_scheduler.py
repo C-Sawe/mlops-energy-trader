@@ -3,12 +3,14 @@
 `fetch_market_data` is monkeypatched rather than hitting the network — this
 project's convention (CLAUDE.md §11) is synthetic deterministic data, no
 network, no real database. The fake slices a full synthetic history down to
-whatever [start, end] the tick actually requested, which is what makes it
-possible to test the property that matters here: recomputing indicators
+whatever [start, end) the tick actually requested (exclusive end, as
+yfinance does), which is what makes it possible to test the property that matters here: recomputing indicators
 from only a *trailing slice* of history must reproduce the same values a
 full backfill already computed and persisted, not silently NaN them out.
 """
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 import pandas as pd
 import pytest
@@ -18,6 +20,8 @@ from src.dataops import processing as P
 from src.dataops.ingestion import IngestionResult
 from src.dataops.repository import MarketRepository
 from src.orchestration import ingestion_scheduler as S
+from src.orchestration import schedule
+from src.orchestration.paper_trader import market_today
 from tests.test_processing import make_series
 
 
@@ -47,10 +51,10 @@ def test_ingestion_tick_reproduces_warm_indicators_not_nulls(tmp_path, monkeypat
         start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
         eq = equities[
             (equities["date"] >= start_ts)
-            & (equities["date"] <= end_ts)
+            & (equities["date"] < end_ts)
             & (equities["ticker"].isin(tickers or DATA.tickers))
         ].reset_index(drop=True)
-        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] < end_ts)].reset_index(drop=True)
         return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(tickers or DATA.tickers), failed_tickers=())
 
     monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
@@ -81,10 +85,10 @@ def test_ingestion_tick_does_not_clobber_already_warm_history_behind_it(tmp_path
         start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
         eq = equities[
             (equities["date"] >= start_ts)
-            & (equities["date"] <= end_ts)
+            & (equities["date"] < end_ts)
             & (equities["ticker"].isin(tickers or DATA.tickers))
         ].reset_index(drop=True)
-        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] < end_ts)].reset_index(drop=True)
         return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(tickers or DATA.tickers), failed_tickers=())
 
     monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
@@ -122,10 +126,10 @@ def test_ingestion_tick_is_idempotent_on_repeated_runs(tmp_path, monkeypatch):
         start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
         eq = equities[
             (equities["date"] >= start_ts)
-            & (equities["date"] <= end_ts)
+            & (equities["date"] < end_ts)
             & (equities["ticker"].isin(tickers or DATA.tickers))
         ].reset_index(drop=True)
-        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] < end_ts)].reset_index(drop=True)
         return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(tickers or DATA.tickers), failed_tickers=())
 
     monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
@@ -150,10 +154,10 @@ def test_ingestion_state_records_a_successful_tick(tmp_path, monkeypatch):
         start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
         eq = equities[
             (equities["date"] >= start_ts)
-            & (equities["date"] <= end_ts)
+            & (equities["date"] < end_ts)
             & (equities["ticker"].isin(tickers or DATA.tickers))
         ].reset_index(drop=True)
-        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] < end_ts)].reset_index(drop=True)
         return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(tickers or DATA.tickers), failed_tickers=())
 
     monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
@@ -222,8 +226,8 @@ def test_ingestion_tick_backfills_a_gap_longer_than_its_window(tmp_path, monkeyp
     def fake_fetch(start, end, tickers=None, strict=True):
         requested["start"] = pd.Timestamp(start).date()
         start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
-        eq = equities[(equities["date"] >= start_ts) & (equities["date"] <= end_ts)].reset_index(drop=True)
-        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        eq = equities[(equities["date"] >= start_ts) & (equities["date"] < end_ts)].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] < end_ts)].reset_index(drop=True)
         return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(DATA.tickers), failed_tickers=())
 
     monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
@@ -257,8 +261,8 @@ def test_ingestion_tick_without_a_gap_keeps_the_plain_trailing_window(tmp_path, 
     def fake_fetch(start, end, tickers=None, strict=True):
         requested["start"] = pd.Timestamp(start).date()
         start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
-        eq = equities[(equities["date"] >= start_ts) & (equities["date"] <= end_ts)].reset_index(drop=True)
-        vx = vix[(vix["date"] >= start_ts) & (vix["date"] <= end_ts)].reset_index(drop=True)
+        eq = equities[(equities["date"] >= start_ts) & (equities["date"] < end_ts)].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] < end_ts)].reset_index(drop=True)
         return IngestionResult(equities=eq, vix=vx, requested_tickers=tuple(DATA.tickers), failed_tickers=())
 
     monkeypatch.setattr(S, "fetch_market_data", fake_fetch)
@@ -268,3 +272,93 @@ def test_ingestion_tick_without_a_gap_keeps_the_plain_trailing_window(tmp_path, 
 
     assert requested["start"] == as_of - pd.Timedelta(days=S.DEFAULT_TRAILING_WINDOW_DAYS)
     assert "backfilling" not in caplog.text
+
+
+def _shift_to_end_on(frame: pd.DataFrame, last_day: pd.Timestamp) -> pd.DataFrame:
+    return frame.assign(date=frame["date"] + (last_day - frame["date"].max()))
+
+
+def _exclusive_end_fetch(equities, vix):
+    """A stand-in for `fetch_market_data` with yfinance's real behaviour:
+    the `end` date itself is not returned."""
+    def fake_fetch(start, end, tickers=None, strict=True):
+        start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+        eq = equities[(equities["date"] >= start_ts) & (equities["date"] < end_ts)].reset_index(drop=True)
+        vx = vix[(vix["date"] >= start_ts) & (vix["date"] < end_ts)].reset_index(drop=True)
+        return IngestionResult(equities=eq, vix=vx, requested_tickers=DATA.tickers, failed_tickers=())
+    return fake_fetch
+
+
+def _repo_one_bar_behind(tmp_path, last_day: str):
+    """A repo holding every bar up to the session before `last_day`, plus
+    the fetch that can supply `last_day` itself."""
+    equities = make_series(300, tickers=DATA.tickers)
+    dates = pd.DatetimeIndex(sorted(equities["date"].unique()))
+    vix = pd.DataFrame({"date": dates, "close": 18.0})
+    last = pd.Timestamp(last_day)
+    equities, vix = _shift_to_end_on(equities, last), _shift_to_end_on(vix, last)
+
+    repo = MarketRepository(url=f"sqlite:///{tmp_path / 'test.db'}")
+    repo.create_schema()
+    repo.persist(P.build_feature_frame(equities[equities["date"] < last], vix[vix["date"] < last]))
+    return repo, _exclusive_end_fetch(equities, vix)
+
+
+def _freeze_clock(monkeypatch, now: datetime) -> None:
+    monkeypatch.setattr(S, "last_closed_market_date", lambda: schedule.last_closed_market_date(now))
+
+
+def test_scheduled_tick_stores_that_days_bar_so_paper_trading_can_use_it(tmp_path, monkeypatch):
+    """The 21:30 UTC run must store New York's bar for the same day: the
+    22:00 paper cycle skips unless the newest bar is `market_today`. Passing
+    `end` through to yfinance unchanged stopped one trading day short."""
+    now = datetime(2026, 11, 3, 21, 30, tzinfo=timezone.utc)
+    repo, fetch = _repo_one_bar_behind(tmp_path, "2026-11-03")
+    assert repo.latest_ingest_info()["date"] < market_today(now)
+    monkeypatch.setattr(S, "fetch_market_data", fetch)
+    _freeze_clock(monkeypatch, now)
+
+    S.run_ingestion_tick(repo)
+
+    assert repo.latest_ingest_info()["date"] == market_today(now)
+
+
+def test_explicit_end_is_inclusive(tmp_path, monkeypatch):
+    repo, fetch = _repo_one_bar_behind(tmp_path, "2026-11-03")
+    monkeypatch.setattr(S, "fetch_market_data", fetch)
+    _freeze_clock(monkeypatch, datetime(2026, 11, 4, 8, 0, tzinfo=timezone.utc))
+
+    S.run_ingestion_tick(repo, end=pd.Timestamp("2026-11-03").date())
+
+    assert str(repo.latest_ingest_info()["date"]) == "2026-11-03"
+
+
+@pytest.mark.parametrize("explicit_end", [None, pd.Timestamp("2026-11-03").date()])
+def test_tick_during_the_session_never_requests_the_unfinished_bar(tmp_path, monkeypatch, explicit_end):
+    """15:00 UTC is mid-session in New York: today's bar isn't final, even
+    if `/ingest/run?end=` names today explicitly."""
+    repo, fetch = _repo_one_bar_behind(tmp_path, "2026-11-03")
+    requested = {}
+
+    def spy(start, end, tickers=None, strict=True):
+        requested["end"] = end
+        return fetch(start, end, tickers, strict)
+
+    monkeypatch.setattr(S, "fetch_market_data", spy)
+    _freeze_clock(monkeypatch, datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc))
+
+    S.run_ingestion_tick(repo, end=explicit_end)
+
+    assert requested["end"] == "2026-11-03"  # exclusive, so the last bar is 2 Nov
+    assert str(repo.latest_ingest_info()["date"]) == "2026-11-02"
+
+
+@pytest.mark.parametrize("now, expected", [
+    (datetime(2026, 11, 3, 20, 59, tzinfo=timezone.utc), "2026-11-02"),  # 15:59 EST, still open
+    (datetime(2026, 11, 3, 21, 0, tzinfo=timezone.utc), "2026-11-03"),   # 16:00 EST, closed
+    (datetime(2026, 11, 4, 3, 0, tzinfo=timezone.utc), "2026-11-03"),    # past UTC midnight
+    (datetime(2026, 7, 1, 19, 59, tzinfo=timezone.utc), "2026-06-30"),   # 15:59 EDT, still open
+    (datetime(2026, 7, 1, 20, 0, tzinfo=timezone.utc), "2026-07-01"),    # 16:00 EDT, closed
+])
+def test_last_closed_market_date_follows_new_york_close_across_dst(now, expected):
+    assert str(schedule.last_closed_market_date(now)) == expected

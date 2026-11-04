@@ -34,22 +34,10 @@ from src.dataops.repository import MarketRepository
 from src.execution.alpaca_broker import AlpacaBroker
 from src.execution.rebalance import OrderIntent, liquidate_all, plan_rebalance
 from src.orchestration.events import emit
-from src.orchestration.schedule import next_run_at  # noqa: F401 - re-exported for api.py and tests
+from src.orchestration.schedule import market_today, next_run_at  # noqa: F401 - next_run_at re-exported for api.py and tests
 from src.serving.inference import InferenceService
 
 logger = logging.getLogger(__name__)
-
-MARKET_TZ = "America/New_York"
-
-
-def market_today(now: datetime | None = None) -> date:
-    """The US market's calendar date — the date a bar ingested tonight
-    carries, regardless of the server's own timezone."""
-    ts = pd.Timestamp(now or datetime.now(timezone.utc))
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
-    return ts.tz_convert(MARKET_TZ).date()
-
 
 def _parse_ts(value: str | None) -> datetime | None:
     return pd.Timestamp(value).to_pydatetime() if value else None

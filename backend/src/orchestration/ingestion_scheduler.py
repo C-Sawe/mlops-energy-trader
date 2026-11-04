@@ -21,7 +21,7 @@ from src.dataops.ingestion import fetch_market_data
 from src.dataops.processing import build_feature_frame
 from src.dataops.repository import MarketRepository
 from src.orchestration.events import emit
-from src.orchestration.schedule import previous_run_at
+from src.orchestration.schedule import last_closed_market_date, previous_run_at
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +121,13 @@ def run_ingestion_tick(
     `end` (`_fetch_start`), so an outage never leaves a permanent hole that
     needs a manual `run_ingestion.py` run.
 
+    `end` is the last bar wanted, inclusive. It defaults to the last closed
+    session and is capped there, so a fetch during market hours can't store
+    an unfinished bar as that day's close. yfinance treats its own `end` as
+    exclusive, so the fetch asks for the day after: passing `end` through
+    unchanged stopped every tick one trading day short on a UTC server, and
+    paper trading then skipped every cycle for lack of that day's bar.
+
     Returns the number of rows actually persisted (post-trim), not the
     number fetched.
 
@@ -131,9 +138,11 @@ def run_ingestion_tick(
     the next tick tries again rather than the process crashing.
     """
     repo = repo or MarketRepository()
-    end = end or date.today()
+    last_closed = last_closed_market_date()
+    end = min(end, last_closed) if end else last_closed
     start = _fetch_start(repo, end, window_days)
-    result = fetch_market_data(str(start), str(end), tickers=tickers or DATA.tickers)
+    fetch_end = end + timedelta(days=1)  # yfinance's `end` is exclusive
+    result = fetch_market_data(str(start), str(fetch_end), tickers=tickers or DATA.tickers)
     frame = build_feature_frame(result.equities, result.vix)
     # Not groupby(...).apply(lambda g: g.iloc[n:]) — pandas 3.x's groupby
     # excludes the grouping column from what apply's callback receives,
