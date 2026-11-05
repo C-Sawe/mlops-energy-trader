@@ -43,8 +43,9 @@ logger = logging.getLogger(__name__)
 MAX_STEPS = 6  # model turns per question; each data tool round is one turn
 MAX_TOKENS = 4096  # per turn: answers are short, and this caps a runaway one (model max 16,384)
 MAX_HISTORY = 8  # messages sent per question; older turns cost input tokens and rarely matter
-MAX_RATE_WAIT = 20.0  # seconds we'll wait on Groq's per-minute limit before giving up
-RATE_RETRIES = 2
+MAX_RATE_WAIT = 60.0  # seconds we'll wait on one 429: a per-minute budget is full again by then
+RATE_RETRIES = 4  # 429 waits per answer; one answer can take up to MAX_STEPS calls
+OVERLOAD_RETRIES = 2  # 503 retries per answer, counted separately from the waits above
 FOLLOW_UPS = "suggest_follow_ups"
 
 
@@ -83,8 +84,8 @@ def _short(value: str | None) -> str | None:
 def compact_events(events: list[dict]) -> list[dict]:
     """The activity log as the model reads it: consecutive routine checks
     merged into one entry with a count (the dashboard does the same), ids
-    shortened, empty fields dropped. Groq's free plan allows 7,000 input
-    tokens a minute, and the raw log alone was ~1,300."""
+    shortened, empty fields dropped. Groq's free plan allows 8,000 tokens a
+    minute, and the raw log alone was ~1,300."""
     out: list[dict] = []
     for e in events:
         last = out[-1] if out else None
@@ -492,7 +493,8 @@ async def run_chat(messages: list[dict], tools: PipelineTools) -> AsyncIterator[
     convo += [{"role": m["role"], "content": m["content"]} for m in recent]
     seen: dict[str, str] = {}  # (tool, args) -> result already sent this answer
     malformed = 0
-    waited = 0
+    rate_waits = 0
+    overloads = 0
     step = 0
     while step < MAX_STEPS:
         text: list[str] = []
@@ -542,11 +544,17 @@ async def run_chat(messages: list[dict], tools: PipelineTools) -> AsyncIterator[
             yield _error("The assistant isn't configured correctly on the server.")
             return
         except groq.RateLimitError as exc:
-            # Groq's free plan counts input tokens per minute. A short wait is
-            # worth it; say so, so a paused answer doesn't look frozen.
+            # Groq's free plan counts tokens per minute. A wait of up to a
+            # minute is worth it; say so, so a paused answer doesn't look frozen.
             delay = _retry_after(exc)
-            if delay is not None and delay <= MAX_RATE_WAIT and waited < RATE_RETRIES and not text and not calls:
-                waited += 1
+            will_wait = (delay is not None and delay <= MAX_RATE_WAIT
+                         and rate_waits < RATE_RETRIES and not text and not calls)
+            # The user's message can't say which limit this was; Groq's can
+            # (per minute or per day), so it goes in the log either way.
+            logger.warning("assistant: Groq rate limit, %s (retry-after=%s, waits so far=%d): %s",
+                           "waiting" if will_wait else "giving up", delay, rate_waits, exc.message)
+            if will_wait:
+                rate_waits += 1
                 seconds = max(1, round(delay))
                 yield {"type": "notice", "message": f"Waiting {seconds} s for Groq's rate limit"}
                 await asyncio.sleep(delay)
@@ -556,9 +564,9 @@ async def run_chat(messages: list[dict], tools: PipelineTools) -> AsyncIterator[
         except groq.InternalServerError as exc:
             # 503 "over capacity" is common on Groq's shared models and passes
             # in seconds: back off briefly, visibly, before giving up.
-            if exc.status_code == 503 and waited < RATE_RETRIES and not text and not calls:
-                waited += 1
-                delay = 2.0 * waited
+            if exc.status_code == 503 and overloads < OVERLOAD_RETRIES and not text and not calls:
+                overloads += 1
+                delay = 2.0 * overloads
                 yield {"type": "notice", "message": f"Groq is over capacity; retrying in {delay:.0f} s"}
                 await asyncio.sleep(delay)
                 continue

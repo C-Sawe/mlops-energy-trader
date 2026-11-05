@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -346,11 +347,62 @@ def test_a_short_rate_limit_wait_is_shown_then_retried(seeded, monkeypatch):
     assert events[0] == {"type": "notice", "message": "Waiting 7 s for Groq's rate limit"}
     assert slept == [7.0] and len(fake.calls) == 2 and events[-1]["type"] == "done"
 
-    # A long wait isn't worth it: say so straight away.
+    # Up to a minute is still worth waiting: the per-minute budget is full by then.
     slept.clear()
-    long_wait = _groq_error(groq.RateLimitError, 429, {"error": {}}, headers={"retry-after": "120"})
+    minute = _groq_error(groq.RateLimitError, 429, {"error": {}}, headers={"retry-after": "60"})
+    events, fake = _chat(monkeypatch, PipelineTools(repo, lambda: STATUS), [minute, _turn(_text("Done."))])
+    assert slept == [60.0] and len(fake.calls) == 2 and events[-1]["type"] == "done"
+
+    # A longer wait isn't worth it: say so straight away.
+    slept.clear()
+    long_wait = _groq_error(groq.RateLimitError, 429, {"error": {}}, headers={"retry-after": "61"})
     events, _ = _chat(monkeypatch, PipelineTools(repo, lambda: STATUS), [long_wait])
     assert slept == [] and "busy" in events[-1]["message"]
+
+
+def test_rate_limit_waits_are_bounded_per_answer(seeded, monkeypatch):
+    import groq
+
+    repo, _ = seeded
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+    monkeypatch.setattr(assistant.asyncio, "sleep", fake_sleep)
+    limited = lambda: _groq_error(groq.RateLimitError, 429, {"error": {}}, headers={"retry-after": "7"})  # noqa: E731
+    events, fake = _chat(monkeypatch, PipelineTools(repo, lambda: STATUS), [limited() for _ in range(5)])
+    assert slept == [7.0] * 4 and len(fake.calls) == 5
+    assert "busy" in events[-1]["message"]
+
+
+def test_rate_limit_waits_and_overload_retries_are_counted_separately(seeded, monkeypatch):
+    import groq
+
+    repo, _ = seeded
+
+    async def fake_sleep(seconds):
+        pass
+    monkeypatch.setattr(assistant.asyncio, "sleep", fake_sleep)
+    overloaded = lambda: _groq_error(groq.InternalServerError, 503, {"error": {}})  # noqa: E731
+    limited = lambda: _groq_error(groq.RateLimitError, 429, {"error": {}}, headers={"retry-after": "7"})  # noqa: E731
+    # Every retry of both kinds in one answer: a shared counter would run out.
+    turns = [overloaded(), overloaded()] + [limited() for _ in range(4)] + [_turn(_text("Done."))]
+    events, fake = _chat(monkeypatch, PipelineTools(repo, lambda: STATUS), turns)
+    assert events[-1]["type"] == "done" and len(fake.calls) == 7
+
+
+def test_a_rate_limit_logs_which_limit_groq_named(seeded, monkeypatch, caplog):
+    import groq
+
+    repo, _ = seeded
+    message = "Rate limit reached on tokens per day (TPD)"
+    limit = _groq_error(groq.RateLimitError, 429, {"error": {"message": message}}, headers={"retry-after": "900"})
+    with caplog.at_level(logging.WARNING, logger=assistant.logger.name):
+        events, _ = _chat(monkeypatch, PipelineTools(repo, lambda: STATUS), [limit])
+    assert "busy" in events[-1]["message"]
+    assert "giving up" in caplog.text and "retry-after=900" in caplog.text and message in caplog.text
+    # The limit's details stay in the log, away from the browser.
+    assert message not in events[-1]["message"]
 
 
 def test_groq_over_capacity_is_retried_briefly_then_explained(seeded, monkeypatch):

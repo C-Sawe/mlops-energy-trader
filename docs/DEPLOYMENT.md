@@ -369,11 +369,14 @@ and prices. It shows the records it read as charts while it explains them.
   Qwen3.8 27B on Groq). Any Groq model with tool calling works; list the ones
   your key can use with `GET https://api.groq.com/openai/v1/models`. A typical
   question reads 1-3 records, about 2,000-4,000 input tokens. Groq's free
-  plan allows 7,000 input tokens a minute, so two questions back to back can
-  hit it. When Groq asks for a wait of 20 s or less, the panel says "Waiting
-  N s for Groq's rate limit" and carries on; a longer wait, or Groq being over
-  capacity after two short retries, ends with a message to try again. A paid
-  plan removes most of this.
+  plan allows 8,000 tokens a minute and 1,000 requests a day (measured
+  2026-11-05), so two or three questions back to back can hit it. When Groq
+  asks for a wait of 60 s or less, the panel says "Waiting N s for Groq's rate
+  limit" and carries on, up to four times per answer. A longer wait, or Groq
+  being over capacity after two short retries, ends with a message to try
+  again. A paid plan removes most of this. Each rate limit is logged by the
+  backend with Groq's own message, which names the limit; to see them, search
+  the backend's logs for `Groq rate limit`.
 - **Limits:** 20 questions per signed-in user per 10 minutes
   (`ASSISTANT_RATE_LIMIT`). It needs the same sign-in as the rest of the API.
   Set a spend limit in the Groq console as well.
