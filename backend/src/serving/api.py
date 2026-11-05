@@ -409,7 +409,8 @@ def trigger_ingestion(
 
     `end`/`window_days` exist for the same operational reason `/ct/evaluate`
     takes `as_of`: forcing a specific range for backfill or a demo, rather
-    than always defaulting to `date.today()`.
+    than always defaulting to the last closed session. `end` is inclusive
+    and capped at that session (`run_ingestion_tick`).
     """
     ingestion.run(repo, window_days=window_days, end=end, source="manual")
     return ct_status()
