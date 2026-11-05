@@ -23,7 +23,7 @@ from src.config import DATA, RISK
 from src.dataops import processing as P
 from src.dataops.models import ModelRun
 from src.dataops.repository import MarketRepository
-from src.orchestration.ct_orchestrator import CTOrchestrator, CTStatus
+from src.orchestration.ct_orchestrator import CTOrchestrator, CTStatus, _evaluation_start
 from src.rlops.agent import PPOAgent
 from src.rlops.baselines import buy_and_hold, run_policy
 from src.rlops.environment import TradingEnvironment
@@ -363,7 +363,7 @@ def test_evaluate_persists_a_buy_and_hold_benchmark_on_the_same_window(tmp_path,
 
     end = pd.Timestamp(as_of)
     frame = orchestrator._load_normalised_frame(end - pd.Timedelta(days=200), end)
-    eval_slice = frame[frame["date"] >= end - pd.Timedelta(days=RISK.sharpe_evaluation_window + 15)]
+    eval_slice = frame[frame["date"] >= _evaluation_start(frame)]
     expected = run_policy(TradingEnvironment(eval_slice.reset_index(drop=True), tickers=DATA.tickers), buy_and_hold)
 
     snaps = repo.list_snapshots(eval_slice["date"].min(), as_of)
@@ -374,3 +374,169 @@ def test_evaluate_persists_a_buy_and_hold_benchmark_on_the_same_window(tmp_path,
     assert snaps["benchmark_equity"].iloc[0] == pytest.approx(snaps["equity_value"].iloc[0])
     # And it is a real second series, not the incumbent's curve copied over.
     assert not np.allclose(snaps["benchmark_equity"].to_numpy(), snaps["equity_value"].to_numpy())
+
+
+# ------------------------------------------------- D-15 and the shared evaluation window
+_LOSING = {"equity_curve": np.array([100_000.0, 95_000.0, 90_000.0]), "returns": np.array([-0.05, -0.0526])}
+_WINNING = {"equity_curve": np.array([100_000.0, 101_000.0, 102_000.0]), "returns": np.array([0.01, 0.0099])}
+
+
+def _join_retrain(orchestrator) -> None:
+    if orchestrator._retrain_thread is not None:
+        orchestrator._retrain_thread.join(timeout=60)
+
+
+def _run_count(repo) -> int:
+    return repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())["total_runs"]
+
+
+def _events_of_kind(repo, kind) -> list[dict]:
+    events, _ = repo.list_events(limit=200)
+    return [e for e in events if e["kind"] == kind]
+
+
+def test_unchanged_inputs_do_not_retrain_the_same_candidate_again(tmp_path, monkeypatch):
+    """D-15: the scheduler re-fires every 300 s while the incumbent is below
+    target. With the same model and the same last bar, a retrain can only
+    reproduce the candidate that just lost, so it must not run. It is
+    deferred, not cancelled: the next bar makes it run again."""
+    repo, as_of = _seed_repo(tmp_path)
+    earlier = (pd.Timestamp(as_of) - pd.Timedelta(days=7)).date()
+    incumbent = _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+    monkeypatch.setattr(PPOAgent, "evaluate", lambda self, env, n_episodes=1, seed=None, deterministic=True: [_LOSING])
+    runs_before = _run_count(repo)
+
+    orchestrator.evaluate(as_of=earlier)
+    _join_retrain(orchestrator)
+    assert _run_count(repo) == runs_before + 1
+
+    for _ in range(3):
+        orchestrator.evaluate(as_of=earlier)
+        assert orchestrator.status == CTStatus.SERVING
+    _join_retrain(orchestrator)
+    assert _run_count(repo) == runs_before + 1
+    assert service.active_version_id == incumbent
+
+    deferred = _events_of_kind(repo, "retrain_deferred")
+    assert len(deferred) == 3
+    assert "already compared" in deferred[0]["summary"]
+    # This path is not the VIX deferral, which /ct-status reports separately.
+    assert orchestrator.last_retrain_deferred_at is None
+
+    orchestrator.evaluate(as_of=as_of)  # later last bar: new inputs
+    _join_retrain(orchestrator)
+    assert _run_count(repo) == runs_before + 2
+
+
+def test_a_promoted_candidate_is_not_retrained_on_the_same_bar(tmp_path, monkeypatch):
+    """After a promotion the incumbent is the model this data just produced.
+    Retraining on the same bar would rebuild it and compare it to itself."""
+    repo, as_of = _seed_repo(tmp_path)
+    incumbent = _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def fake_evaluate(self, env, n_episodes=1, seed=None, deterministic=True):
+        calls["n"] += 1
+        # Replay for the trigger (loses), candidate (wins), incumbent (loses).
+        return [_WINNING] if calls["n"] == 2 else [_LOSING]
+
+    monkeypatch.setattr(PPOAgent, "evaluate", fake_evaluate)
+
+    orchestrator.evaluate(as_of=as_of)
+    _join_retrain(orchestrator)
+    promoted = service.active_version_id
+    assert promoted != incumbent
+    runs = _run_count(repo)
+
+    orchestrator.evaluate(as_of=as_of)
+    _join_retrain(orchestrator)
+    assert _run_count(repo) == runs
+    assert service.active_version_id == promoted
+
+
+def test_a_crashed_retrain_is_tried_again_on_the_same_bar(tmp_path, monkeypatch):
+    """A crash reached no FR-17 decision, so the same inputs have no known
+    outcome yet and the next evaluation must retry them (NFR-05)."""
+    repo, as_of = _seed_repo(tmp_path)
+    _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+    monkeypatch.setattr(PPOAgent, "evaluate", lambda self, env, n_episodes=1, seed=None, deterministic=True: [_LOSING])
+    attempts = {"n": 0}
+
+    def exploding_train(self, total_timesteps):
+        attempts["n"] += 1
+        raise RuntimeError("simulated training crash")
+
+    monkeypatch.setattr(PPOAgent, "train", exploding_train)
+
+    orchestrator.evaluate(as_of=as_of)
+    _join_retrain(orchestrator)
+    orchestrator.evaluate(as_of=as_of)
+    _join_retrain(orchestrator)
+    assert attempts["n"] == 2
+    assert _events_of_kind(repo, "retrain_deferred") == []
+
+
+def test_trigger_and_gate_judge_on_the_same_number_of_trading_day_returns(tmp_path, monkeypatch):
+    """FR-14 and FR-17 must judge a model on the same evidence. Counting
+    calendar days gave the gate about 21 returns against the trigger's 30."""
+    repo, as_of = _seed_repo(tmp_path)
+    _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+    windows = []
+
+    def spy(self, env, n_episodes=1, seed=None, deterministic=True):
+        windows.append((env._n_steps - 1, pd.Timestamp(env._dates[0]), pd.Timestamp(env._dates[-1])))
+        return [_LOSING]
+
+    monkeypatch.setattr(PPOAgent, "evaluate", spy)
+
+    orchestrator.evaluate(as_of=as_of)
+    _join_retrain(orchestrator)
+
+    assert len(windows) == 3  # trigger replay, candidate, incumbent
+    assert {w[0] for w in windows} == {RISK.sharpe_evaluation_window}
+    assert len(set(windows)) == 1
+
+
+def test_gate_window_counts_trading_days_across_a_gap_and_stays_after_training(tmp_path, monkeypatch):
+    """A holiday-like gap must lengthen the window in calendar days rather
+    than shorten it in returns, an `as_of` past the last bar must not change
+    it, and DR-06 must still hold on the boundaries that get recorded."""
+    repo, last_bar = _seed_repo(tmp_path)
+    _promote_initial_model(repo, tmp_path, monkeypatch, last_bar)
+    gap_end = pd.Timestamp(last_bar) - pd.Timedelta(days=10)
+    gap_start = gap_end - pd.Timedelta(days=14)
+    from src.dataops.models import MarketObservation
+    with repo.session() as session:
+        session.query(MarketObservation).filter(
+            MarketObservation.observation_date >= gap_start.date(),
+            MarketObservation.observation_date <= gap_end.date(),
+        ).delete()
+        session.commit()
+
+    service = InferenceService(repo=repo)
+    orchestrator = _fast_orchestrator(service, repo, tmp_path, monkeypatch)
+    returns = []
+
+    def spy(self, env, n_episodes=1, seed=None, deterministic=True):
+        returns.append(env._n_steps - 1)
+        return [_LOSING]
+
+    monkeypatch.setattr(PPOAgent, "evaluate", spy)
+
+    weekend_after = (pd.Timestamp(last_bar) + pd.Timedelta(days=2)).date()
+    orchestrator._retrain_and_maybe_promote(weekend_after)
+    assert returns == [RISK.sharpe_evaluation_window] * 2
+
+    with repo.session() as session:
+        run = session.query(ModelRun).filter(ModelRun.status == "REJECTED").one()
+        assert run.eval_start > run.train_end
+        assert run.eval_end == last_bar
+

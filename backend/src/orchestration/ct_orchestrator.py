@@ -37,6 +37,17 @@ from src.serving.inference import InferenceService
 logger = logging.getLogger(__name__)
 
 
+def _evaluation_start(frame: pd.DataFrame) -> pd.Timestamp:
+    """First date of the evaluation window: the row that gives the newest
+    `sharpe_evaluation_window` daily returns, counted in trading rows rather
+    than calendar days. The FR-14 trigger and the FR-17 gate both use it, so
+    they judge a model on the same number of returns. A calendar window
+    gave the gate about 21 returns against the trigger's 30, and holidays
+    could shorten the trigger's."""
+    dates = pd.to_datetime(frame["date"]).drop_duplicates().sort_values()
+    return dates.iloc[max(0, len(dates) - (RISK.sharpe_evaluation_window + 1))]
+
+
 class CTStatus(str, Enum):
     """FR-20: what the dashboard's CT pipeline indicator renders."""
 
@@ -74,6 +85,13 @@ class CTOrchestrator:
         self._last_retrain_failed_at: datetime | None = None
         self._last_retrain_error: str | None = None
         self._retrain_thread: threading.Thread | None = None
+        # (active version, last bar) after the newest finished FR-17 decision.
+        # Training is deterministic for a fixed seed and window, so while
+        # both are unchanged a retrain could only reproduce the same outcome
+        # (D-15: the same candidate was retrained up to 220 times). The
+        # training settings are fixed for this object's lifetime. Kept in
+        # memory, so a restart costs at most one repeated retrain.
+        self._last_decision: tuple[str | None, pd.Timestamp] | None = None
 
     @property
     def status(self) -> CTStatus:
@@ -156,7 +174,6 @@ class CTOrchestrator:
             # CLAUDE.md §7, applied to a single slice instead of a train/eval pair.
             end = pd.Timestamp(as_of or date.today())
             lookback_start = end - pd.Timedelta(days=200)
-            window_start = end - pd.Timedelta(days=RISK.sharpe_evaluation_window + 15)
 
             frame = self._load_normalised_frame(lookback_start, end)
             if frame.empty:
@@ -177,7 +194,7 @@ class CTOrchestrator:
                 with self._lock:
                     self._status = CTStatus.SERVING
                 return self.status
-            eval_slice = frame[frame["date"] >= window_start].reset_index(drop=True)
+            eval_slice = frame[frame["date"] >= _evaluation_start(frame)].reset_index(drop=True)
 
             env = TradingEnvironment(eval_slice, tickers=self.tickers)
             [result] = agent.evaluate(env, n_episodes=1, deterministic=True)
@@ -225,6 +242,28 @@ class CTOrchestrator:
                         source=source,
                         detail={"rolling_sharpe": finite_or_none(rolling), "vix": current_vix,
                                 "target": RISK.target_sharpe_threshold},
+                    )
+                    return self.status
+                last_bar = pd.Timestamp(eval_slice["date"].max())
+                with self._lock:
+                    already_decided = self._last_decision == (self.inference_service.active_version_id, last_bar)
+                if already_decided:
+                    logger.info(
+                        "rolling Sharpe %.3f below target %.3f, but this model was already compared "
+                        "on data through %s; waiting for a new bar",
+                        rolling, RISK.target_sharpe_threshold, last_bar.date(),
+                    )
+                    with self._lock:
+                        self._status = CTStatus.SERVING
+                    emit(
+                        self.repo, "retrain_deferred",
+                        f"Rolling Sharpe {fmt(rolling)} is below the {fmt(RISK.target_sharpe_threshold)} target, "
+                        f"but this model was already compared on data through {last_bar.date()}: "
+                        "retrain deferred until a new bar arrives",
+                        source=source,
+                        detail={"rolling_sharpe": finite_or_none(rolling), "target": RISK.target_sharpe_threshold,
+                                "last_bar": str(last_bar.date()), "reason": "no_new_data"},
+                        version_id=self.inference_service.active_version_id,
                     )
                     return self.status
                 logger.info("rolling Sharpe %.3f below target %.3f; retraining", rolling, RISK.target_sharpe_threshold)
@@ -330,10 +369,18 @@ class CTOrchestrator:
         """
         try:
             end = pd.Timestamp(as_of or date.today())
-            train_start = end - pd.Timedelta(days=self.retrain_train_days + RISK.sharpe_evaluation_window)
-            train_end = end - pd.Timedelta(days=RISK.sharpe_evaluation_window + 1)
-            eval_start = train_end + pd.Timedelta(days=1)
-            eval_end = end
+            # Three calendar days per trading row comfortably covers weekends
+            # and holidays. DR-06 holds by construction: training ends the day
+            # before the evaluation window starts.
+            recent = self.repo.load_partition(
+                end - pd.Timedelta(days=3 * RISK.sharpe_evaluation_window), end, tickers=self.tickers
+            )
+            if recent.empty:
+                raise ValueError(f"no market data to evaluate a candidate on, up to {end.date()}")
+            eval_start = _evaluation_start(recent)
+            eval_end = pd.to_datetime(recent["date"]).max()
+            train_end = eval_start - pd.Timedelta(days=1)
+            train_start = train_end - pd.Timedelta(days=self.retrain_train_days)
 
             frame = self._load_normalised_frame(train_start, eval_end)
             train_df, eval_df = partition_chronological(frame, train_start, train_end, eval_start, eval_end)
@@ -388,6 +435,11 @@ class CTOrchestrator:
             else:
                 # FR-17: the incumbent is retained; promotion is aborted.
                 logger.info("candidate did not beat incumbent; incumbent retained")
+
+            # Only a finished decision counts: a crash above never gets here,
+            # so the next evaluation retries it.
+            with self._lock:
+                self._last_decision = (self.inference_service.active_version_id, eval_end)
 
             outcome = {
                 "candidate_sharpe": finite_or_none(candidate_sharpe),
