@@ -7,6 +7,7 @@
  * press rather than merely recolouring.
  */
 import { forwardRef, useCallback, useEffect, useRef, useState } from "react";
+import { marketStatus } from "../market.js";
 
 /* ----------------------------------------------------------------- spring */
 export function useSpring(target, { stiffness = 300, damping = 30, mass = 1 } = {}) {
@@ -100,6 +101,36 @@ export function ingestionToneAndLabel(ingestionStatus, ingestionOk) {
   return { tone, label };
 }
 
+const fmtYourTime = (d) =>
+  d.toLocaleString("en-GB", { weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+    .replace(",", "");
+
+/** Keeps its own clock, updating on each minute, so the rest of the strip
+ * doesn't re-render with it. */
+function MarketCell() {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setTimeout(() => setNow(new Date()), 60_000 - (now.getTime() % 60_000));
+    return () => clearTimeout(timer);
+  }, [now]);
+
+  const market = marketStatus(now);
+  const closedLabel = market.holiday ? "Closed · Holiday" : "Closed";
+  return (
+    <div className="strip-cell">
+      <span className="strip-k">US market</span>
+      <Pill tone={market.open ? "good" : "idle"}>{market.open ? "Open" : closedLabel}</Pill>
+      <span className="strip-sub">New York {market.nyTime} {market.nyZone}</span>
+      <span className="strip-sub">
+        {market.open
+          ? `Closes ${market.next.time} ET`
+          : `Opens ${market.next.weekday} ${market.next.time} ET`}
+      </span>
+      <span className="strip-sub">{fmtYourTime(market.next.at)} your time</span>
+    </div>
+  );
+}
+
 export function StatusStrip({
   pipeline, model, modelLabel, modelId, lastIngest,
   ingestionStatus, ingestionCheckedAt, ingestionOk, ingestionNextAt, vix, failSafeThreshold,
@@ -118,6 +149,7 @@ export function StatusStrip({
         <span className="strip-k">Active model</span>
         <span className="strip-v" title={modelId ?? undefined}>{modelLabel ?? model ?? "—"}</span>
       </div>
+      <MarketCell />
       <div className="strip-cell">
         <span className="strip-k">Last ingest</span>
         <span className="strip-v num">{lastIngest ?? "—"}</span>

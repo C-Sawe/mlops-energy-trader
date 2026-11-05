@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Pill, StatusStrip, ingestionToneAndLabel, pipelineToneAndLabel } from "./Primitives.jsx";
 
 describe("pipelineToneAndLabel", () => {
@@ -85,5 +85,36 @@ describe("StatusStrip", () => {
   it("shows the ingestion checked-at timestamp when one exists", () => {
     render(<StatusStrip {...baseProps} />);
     expect(screen.getByText(/Checked/)).toBeInTheDocument();
+  });
+
+  describe("US market tile", () => {
+    afterEach(() => vi.useRealTimers());
+
+    it("shows closed, New York's time and the next open", () => {
+      vi.useFakeTimers({ now: new Date("2026-11-05T07:51:00Z") });
+      render(<StatusStrip {...baseProps} />);
+      expect(screen.getByText("Closed")).toBeInTheDocument();
+      expect(screen.getByText("New York 02:51 EST")).toBeInTheDocument();
+      expect(screen.getByText("Opens Thu 09:30 ET")).toBeInTheDocument();
+      expect(screen.getByText(/your time$/)).toBeInTheDocument();
+    });
+
+    it("says so when it is closed for a holiday", () => {
+      vi.useFakeTimers({ now: new Date("2026-11-26T16:00:00Z") });
+      render(<StatusStrip {...baseProps} />);
+      expect(screen.getByText("Closed · Holiday")).toBeInTheDocument();
+    });
+
+    it("turns open at the opening minute without a page reload", () => {
+      vi.useFakeTimers({ now: new Date("2026-11-05T14:29:30Z") });
+      render(<StatusStrip {...baseProps} />);
+      expect(screen.getByText("Closed")).toBeInTheDocument();
+
+      act(() => { vi.advanceTimersByTime(30_000); });
+
+      expect(screen.getByText("Open")).toBeInTheDocument();
+      expect(screen.getByText("New York 09:30 EST")).toBeInTheDocument();
+      expect(screen.getByText("Closes 16:00 ET")).toBeInTheDocument();
+    });
   });
 });
