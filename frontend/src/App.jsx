@@ -109,6 +109,10 @@ export function adaptMetrics(statusRaw, telemetryAdapted) {
     // are in training_runs but not here.
     autonomous: statusRaw.autonomous_retrains ?? null,
     autonomousPromoted: statusRaw.autonomous_promoted ?? null,
+    // Runs are attempts: older ones can repeat one candidate many times (D-15).
+    distinctCandidates: statusRaw.distinct_candidates ?? null,
+    // No trigger recorded, so who started them is unknown, not "not the loop".
+    unlabelled: statusRaw.unlabelled_runs ?? null,
   };
 }
 
@@ -396,17 +400,22 @@ export default function App({ user = null, onSignOut } = {}) {
                 </div>
                 <div className="gauge-meta">
                   Training runs, last {m.windowDays} days
-                  {m.autonomous != null && (
-                    <> · <span className="num">{m.autonomous}</span> started by the CT loop
-                      {m.autonomous > 0 && <> (<span className="num">{m.autonomousPromoted}</span> promoted)</>}
-                    </>
+                  {m.distinctCandidates != null && (
+                    <> · <span className="num">{m.distinctCandidates}</span> different {m.distinctCandidates === 1 ? "candidate" : "candidates"}</>
                   )}
                 </div>
+                {m.autonomous != null && (
+                  <div className="gauge-meta">
+                    <span className="num">{m.autonomous}</span> started by the CT loop
+                    {m.autonomous > 0 && <> (<span className="num">{m.autonomousPromoted}</span> promoted)</>}
+                    {m.unlabelled > 0 && <> · <span className="num">{m.unlabelled}</span> older runs with no label</>}
+                  </div>
+                )}
               </div>
             </div>
             <div style={{ marginTop: 14, display: "flex", gap: 8, flexWrap: "wrap" }}>
               <Pill tone="good">{m.promoted} promoted</Pill>
-              <Pill tone="warn">{m.heldBack} held back</Pill>
+              <Pill tone="warn">{m.heldBack} {m.heldBack === 1 ? "run" : "runs"} held back</Pill>
             </div>
           </GlassCard>
   );

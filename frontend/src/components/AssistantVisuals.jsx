@@ -302,9 +302,10 @@ function TrainingVisual({ days, stats }) {
   const share = (n) => (total ? `${(n / total) * 100}%` : "0%");
   return (
     <Frame title={`Training activity, last ${days} days`}
-           note="Counts are training runs, not distinct models: an unchanged candidate can be retrained many times.">
+           note="Runs are attempts, not models: older runs can retrain an unchanged candidate many times.">
       <div className="av-chips">
         <span className="av-chip"><span className="k">Runs</span><b className="num">{total}</b></span>
+        <span className="av-chip"><span className="k">Different candidates</span><b className="num">{stats.distinct_candidates ?? "—"}</b></span>
         <span className="av-chip"><span className="k">Promoted</span><b className="num">{promoted}</b></span>
         <span className="av-chip"><span className="k">Held back by the gate</span><b className="num">{rejected}</b></span>
         <span className="av-chip"><span className="k">Started by the pipeline</span><b className="num">{stats.autonomous_runs ?? 0}</b></span>

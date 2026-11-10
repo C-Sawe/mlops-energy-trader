@@ -133,6 +133,10 @@ class CTStatusResponse(BaseModel):
     # logged before trigger_reason existed are in neither count.
     autonomous_retrains: int = 0
     autonomous_promoted: int = 0
+    # Different models among training_runs (D-15: one candidate could be
+    # retrained many times), and the runs with no trigger recorded.
+    distinct_candidates: int = 0
+    unlabelled_runs: int = 0
     # Not FR-20 itself (that's the CT loop) — shows FR-01's "without manual
     # intervention" ingestion actually ticking, the same way the fields
     # above show FR-13/14 actually ticking.

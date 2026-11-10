@@ -371,6 +371,8 @@ def ct_status() -> CTStatusResponse:
         rejected_count=cycle["rejected"],
         autonomous_retrains=cycle["autonomous_runs"],
         autonomous_promoted=cycle["autonomous_promoted"],
+        distinct_candidates=cycle["distinct_candidates"],
+        unlabelled_runs=cycle["unlabelled_runs"],
         ingestion_status=ingestion.status.value,
         last_ingestion_attempted_at=ingestion.last_attempted_at,
         last_ingestion_ok=ingestion.last_ok,

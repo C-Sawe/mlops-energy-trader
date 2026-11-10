@@ -53,6 +53,8 @@ const statusRaw = (over = {}) => ({
   rejected_count: 6,
   autonomous_retrains: 5,
   autonomous_promoted: 1,
+  distinct_candidates: 3,
+  unlabelled_runs: 2,
   ingestion_status: "IDLE",
   last_ingestion_attempted_at: "2026-10-06T22:00:00Z",
   last_ingestion_ok: true,
@@ -283,7 +285,24 @@ describe("live equity benchmark and cycle history", () => {
     await renderApp("Pipeline");
 
     const meta = screen.getByText(/started by the CT loop/);
-    expect(meta.textContent).toMatch(/last 90 days · 5 started by the CT loop \(1 promoted\)/);
+    expect(meta.textContent).toMatch(/^5 started by the CT loop \(1 promoted\) · 2 older runs with no label$/);
+  });
+
+  it("shows different candidates next to runs, and calls rejections runs (D-15)", async () => {
+    backendUp();
+    await renderApp("Pipeline");
+
+    const meta = screen.getByText(/different candidates/);
+    expect(meta.textContent).toMatch(/last 90 days · 3 different candidates/);
+    expect(screen.getByText("6 runs held back")).toBeInTheDocument();
+  });
+
+  it("uses the singular for one candidate and one run", async () => {
+    backendUp({ status: statusRaw({ distinct_candidates: 1, rejected_count: 1 }) });
+    await renderApp("Pipeline");
+
+    expect(screen.getByText(/different candidate/).textContent).toMatch(/· 1 different candidate$/);
+    expect(screen.getByText("1 run held back")).toBeInTheDocument();
   });
 });
 
