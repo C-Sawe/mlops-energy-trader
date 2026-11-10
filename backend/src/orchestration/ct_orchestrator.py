@@ -15,10 +15,14 @@ otherwise.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import multiprocessing
+import tempfile
 import threading
 from datetime import date, datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -28,6 +32,7 @@ from src.dataops.processing import normalize_rolling, partition_chronological
 from src.dataops.repository import MarketRepository
 from src.orchestration.evaluator import max_drawdown, sharpe_ratio
 from src.orchestration.events import emit, finite_or_none, fmt
+from src.orchestration.retrain_worker import train_and_evaluate_candidate
 from src.rlops.agent import PPOAgent
 from src.rlops.baselines import buy_and_hold, run_policy
 from src.rlops.environment import TradingEnvironment
@@ -67,6 +72,7 @@ class CTOrchestrator:
         retrain_timesteps: int = 20_000,
         retrain_n_steps: int = 2048,
         retrain_seed: int = 0,
+        train_in_subprocess: bool = True,
     ) -> None:
         self.inference_service = inference_service
         self.repo = repo or MarketRepository()
@@ -76,6 +82,13 @@ class CTOrchestrator:
         self.retrain_timesteps = retrain_timesteps
         self.retrain_n_steps = retrain_n_steps
         self.retrain_seed = retrain_seed
+        # NFR-02: train candidates in a spawned child process so the GIL-bound
+        # `learn()` cannot stall concurrent `/predict` calls (measured at +71%
+        # to +107% p95 degradation when it ran as a thread in this process —
+        # CLAUDE.md §3). Tests pass False so monkeypatching `PPOAgent.train`
+        # still reaches the training call; both modes run the identical
+        # `retrain_worker.train_and_evaluate_candidate`.
+        self.train_in_subprocess = train_in_subprocess
 
         self._lock = threading.RLock()
         self._status = CTStatus.SERVING
@@ -362,10 +375,14 @@ class CTOrchestrator:
         vix: float | None = None,
         source: str = "scheduled",
     ) -> None:
-        """FR-15: runs in its own thread — `InferenceService.predict()` is
-        untouched while this executes, since it only ever reads the
-        currently-loaded agent under `InferenceService`'s own lock, and this
-        method does not touch that lock until (and unless) promotion.
+        """FR-15: runs in its own thread, and the CPU-bound training itself
+        runs in a separate *process* (`retrain_worker`, NFR-02) — a thread
+        alone kept serving available (NFR-03) but not fast, because PPO's
+        `learn()` holds the GIL: measured +71% to +107% p95 degradation with
+        in-thread training. `InferenceService.predict()` is untouched while
+        this executes; this method does not touch its lock until (and
+        unless) promotion. The FR-17 decision, `log_run` and promotion all
+        stay in this process — the child only trains and evaluates.
         """
         try:
             end = pd.Timestamp(as_of or date.today())
@@ -382,16 +399,43 @@ class CTOrchestrator:
             train_end = eval_start - pd.Timedelta(days=1)
             train_start = train_end - pd.Timedelta(days=self.retrain_train_days)
 
+            # Only the incumbent's replay needs data in this process; the
+            # worker loads and partitions its own copy, so the heavy lifting
+            # (normalise + train + candidate replay) all happens in the
+            # child when `train_in_subprocess` is on.
             frame = self._load_normalised_frame(train_start, eval_end)
-            train_df, eval_df = partition_chronological(frame, train_start, train_end, eval_start, eval_end)
+            _train_df, eval_df = partition_chronological(frame, train_start, train_end, eval_start, eval_end)
 
-            candidate_env = TradingEnvironment(train_df, tickers=self.tickers)
-            candidate = PPOAgent(candidate_env, n_steps=self.retrain_n_steps, seed=self.retrain_seed)
-            candidate.train(total_timesteps=self.retrain_timesteps)
-
-            eval_env_candidate = TradingEnvironment(eval_df, tickers=self.tickers)
-            [candidate_result] = candidate.evaluate(eval_env_candidate, n_episodes=1)
-            candidate_sharpe = sharpe_ratio(candidate_result["returns"])
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                model_path = str(Path(tmp_dir) / "candidate.zip")
+                worker_kwargs = dict(
+                    db_url=self.repo.url,
+                    tickers=tuple(self.tickers),
+                    train_start=str(train_start.date()),
+                    train_end=str(train_end.date()),
+                    eval_start=str(pd.Timestamp(eval_start).date()),
+                    eval_end=str(pd.Timestamp(eval_end).date()),
+                    n_steps=self.retrain_n_steps,
+                    timesteps=self.retrain_timesteps,
+                    seed=self.retrain_seed,
+                    model_path=model_path,
+                )
+                if self.train_in_subprocess:
+                    # `spawn`, never `fork`: this process holds live threads,
+                    # SQLAlchemy pools and torch state. A child exception is
+                    # re-raised here, so the except below records a training
+                    # crash exactly as it did for in-thread training.
+                    ctx = multiprocessing.get_context("spawn")
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+                        worker_result = pool.submit(train_and_evaluate_candidate, **worker_kwargs).result()
+                    logger.info("candidate trained in child process %s", worker_result["pid"])
+                else:
+                    worker_result = train_and_evaluate_candidate(**worker_kwargs)
+                candidate = PPOAgent.load(model_path)
+                # A loaded agent has empty hyperparameters; restore the
+                # trainer's own so `log_run` records them (FR-08/NFR-07).
+                candidate.hyperparameters = worker_result["hyperparameters"]
+            candidate_sharpe = worker_result["sharpe"]
 
             incumbent = self.inference_service.get_agent()
             if incumbent is not None:
