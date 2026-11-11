@@ -120,6 +120,29 @@ function EmptyChart({ label }) {
 }
 
 /* ------------------------------------------------------------ equity chart */
+/** Vertical anchors for the direct end-of-line labels. Each label is a
+ * two-line block (name above, value below) spanning roughly 24px around its
+ * anchor, so when the two series finish close together the blocks overprint
+ * each other and both prices become unreadable. Same fix as the price
+ * chart's entry/last reference labels: push the pair apart around their
+ * midpoint to `minGap`, then shift both together if that pushed either
+ * outside the plot area — clamping each independently would just re-collide
+ * them at the edge. The dot stays on the true data point; only the text
+ * moves. Exported (not inlined) so this is unit-testable without SVG. */
+export function spreadEndLabelYs(ys, { minGap = 28, top = -Infinity, bottom = Infinity } = {}) {
+  const out = ys.slice();
+  if (out.length === 2 && Math.abs(out[0] - out[1]) < minGap) {
+    const mid = (out[0] + out[1]) / 2;
+    const half = out[0] <= out[1] ? -minGap / 2 : minGap / 2;
+    out[0] = mid + half;
+    out[1] = mid - half;
+  }
+  const lo = Math.min(...out);
+  const hi = Math.max(...out);
+  const shift = lo < top ? top - lo : hi > bottom ? bottom - hi : 0;
+  return shift === 0 ? out : out.map((v) => v + shift);
+}
+
 export function EquityChart({ dates, agent, bench, label = "Agent" }) {
   const ref = useRef(null);
   const n = agent.length;
@@ -148,6 +171,13 @@ export function EquityChart({ dates, agent, bench, label = "Agent" }) {
         [bench, "var(--series-bench)", "Buy & hold", lastIndexWithValue(bench)],
       ]
     : [[agent, "var(--series-agent)", label, n - 1]];
+
+  // Keep each label block fully inside the plot: the name line reaches
+  // ~18px above the anchor and the value line ~6px below it.
+  const labelY = spreadEndLabelYs(
+    series.map(([d, , , end]) => s.y(d[end])),
+    { top: pad.t + 18, bottom: box.h - pad.b - 6 },
+  );
 
   return (
     <div className="chartbox" style={{ position: "relative" }}>
@@ -209,17 +239,17 @@ export function EquityChart({ dates, agent, bench, label = "Agent" }) {
           strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
         />
 
-        {series.map(([d, c, label, end]) => (
+        {series.map(([d, c, label, end], i) => (
           <g key={label}>
             <circle
               cx={s.x(end)} cy={s.y(d[end])} r="4.5"
               fill={c} stroke="var(--glass-strong)" strokeWidth="2"
             />
-            <text x={s.x(end) + 9} y={s.y(d[end]) - 7}
+            <text x={s.x(end) + 9} y={labelY[i] - 7}
                   fontSize="11.5" fontWeight="600" fill="var(--ink-2)">
               {label}
             </text>
-            <text x={s.x(end) + 9} y={s.y(d[end]) + 6}
+            <text x={s.x(end) + 9} y={labelY[i] + 6}
                   fontSize="12" fontWeight="600" fill="var(--ink)">
               {fmtMoney(d[end])}
             </text>

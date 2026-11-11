@@ -130,6 +130,39 @@ describe("candleDomain", () => {
   });
 });
 
+import { spreadEndLabelYs } from "./Charts.jsx";
+
+describe("spreadEndLabelYs", () => {
+  it("leaves labels alone when the series end far apart", () => {
+    expect(spreadEndLabelYs([40, 120])).toEqual([40, 120]);
+  });
+
+  it("pushes two near-coincident labels apart to the minimum gap, around their midpoint", () => {
+    // The real case: agent $104,622 vs buy & hold $104,423 — anchors a few
+    // px apart, both label blocks overprinting each other.
+    const [a, b] = spreadEndLabelYs([100, 104], { minGap: 28 });
+    expect(Math.abs(a - b)).toBeCloseTo(28);
+    expect((a + b) / 2).toBeCloseTo(102); // midpoint preserved
+    expect(a).toBeLessThan(b); // vertical order preserved
+  });
+
+  it("preserves order when the first label is the lower one", () => {
+    const [a, b] = spreadEndLabelYs([104, 100], { minGap: 28 });
+    expect(a).toBeGreaterThan(b);
+    expect(Math.abs(a - b)).toBeCloseTo(28);
+  });
+
+  it("shifts the pair together when spreading would push one past the plot edge", () => {
+    const [a, b] = spreadEndLabelYs([20, 22], { minGap: 28, top: 18, bottom: 240 });
+    expect(Math.min(a, b)).toBeGreaterThanOrEqual(18);
+    expect(Math.abs(a - b)).toBeCloseTo(28); // the gap survives the clamp
+  });
+
+  it("handles a single label (no benchmark) without changing it", () => {
+    expect(spreadEndLabelYs([130], { top: 18, bottom: 240 })).toEqual([130]);
+  });
+});
+
 describe("gappedPath", () => {
   const identity = { x: (i) => i, y: (v) => v };
 
