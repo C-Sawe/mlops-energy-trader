@@ -157,7 +157,7 @@ body {
   border-top: 0.5px solid var(--hairline);
   padding-bottom: env(safe-area-inset-bottom);
 }
-.sidenav ul { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4, 1fr); }
+.sidenav ul { list-style: none; margin: 0; padding: 0; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
 .side-brand { display: none; }
 .nav-item {
   position: relative; display: flex; flex-direction: column; align-items: center; gap: 3px;
@@ -759,3 +759,24 @@ a.news-head:hover, a.news-head:focus-visible { text-decoration: underline; }
                   border-color: color-mix(in srgb, var(--critical) 40%, transparent); }
 .ovr-actions .ovr-btn.danger, .ovr-btn.danger.solid { background: var(--critical); color: #fff; border-color: transparent; }
 .ovr-btn.primary { background: var(--accent); color: #fff; border-color: transparent; }
+
+/* pipeline simulation (Simulation.jsx) */
+.sim-banner { margin-bottom: 14px; padding: 12px 16px; border-radius: var(--r-md); font-size: 13.5px; line-height: 1.5;
+              background: color-mix(in srgb, var(--warn) 13%, var(--glass-strong)); color: var(--ink);
+              border: 0.5px solid color-mix(in srgb, var(--warn) 38%, transparent); }
+.sim-stages { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 10px;
+              grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.sim-stage { display: flex; flex-direction: column; gap: 2px; padding: 12px 14px; border-radius: var(--r-md);
+             border: 0.5px solid var(--hairline); background: var(--glass-strong); }
+.sim-stage b { font-size: 15px; font-weight: 600; } .sim-stage span { font-size: 12.5px; color: var(--ink-2); }
+.sim-stage em { font-style: normal; font-size: 12px; font-weight: 600; color: var(--ink-3); }
+.sim-stage.active { border: 2px solid var(--accent); padding: 10.5px 12.5px; }
+.sim-stage.active em { color: var(--accent); }
+.sim-stage.done em { color: color-mix(in srgb, var(--good) 70%, var(--ink)); }
+.sim-explain { margin: 14px 0; min-height: 3em; font-size: 14px; line-height: 1.5; }
+.sim-left { justify-content: flex-start; align-items: center; } .sim-pad { margin: 0 18px 12px; }
+.sim-vix { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 600; }
+.sim-vix input { width: 76px; font: inherit; min-height: 34px; padding: 4px 10px; color: var(--ink);
+                 border-radius: var(--r-sm); border: 0.5px solid var(--hairline); background: var(--glass); }
+.ovr-btn[aria-pressed="true"] { background: color-mix(in srgb, var(--critical) 14%, transparent); }
+@media (max-width: 720px) { .sim-stages { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

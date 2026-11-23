@@ -367,4 +367,39 @@ class OversightResponse(BaseModel):
     pipeline_status: str
 
 
+
+# ------------------------------------------------------------ simulation
+class SimulationStartRequest(BaseModel):
+    scenario: str = Field(min_length=1, max_length=32)
+
+
+class SimulationCommand(BaseModel):
+    """What a viewer may do to a running simulation. Everything else the
+    worker might be sent is refused here (NFR-08)."""
+
+    cmd: Literal["step", "play", "pause", "vix", "crash", "control"]
+    delay: float = Field(default=1.0, ge=0.1, le=10.0)
+    value: float | None = Field(default=None, ge=5.0, le=100.0)
+    name: OperatorControlName | None = None
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _control_needs_a_name(self) -> "SimulationCommand":
+        if self.cmd == "control" and self.name in (None, "pause_paper_trading"):
+            raise ValueError("control must be halt_trading or pause_retraining")  # no broker in the sandbox
+        return self
+
+
+class SimulationScenario(BaseModel):
+    id: str
+    title: str
+    description: str
+
+
+class SimulationResponse(BaseModel):
+    enabled: bool
+    scenarios: list[SimulationScenario] = []
+    state: dict | None = None
+
+
 CTStatusResponse.model_rebuild()

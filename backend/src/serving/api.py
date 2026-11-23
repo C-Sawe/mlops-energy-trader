@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-from src.config import ASSISTANT, AUTH, DATA, INGESTION, NEWS, PAPER, RISK, SERVING
+from src.config import ASSISTANT, AUTH, DATA, INGESTION, NEWS, PAPER, RISK, SERVING, SIMULATION
 from src.dataops.news import NewsFeed, NewsUnavailable
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator, RollbackRefused
@@ -38,6 +38,8 @@ from src.orchestration.ingestion_scheduler import (
 from src.orchestration.paper_trader import PaperTrader, next_run_at
 from src.rlops.registry import ModelRegistry
 from src.serving import assistant, auth
+from src.simulation.manager import SimulationManager, SimulationRefused
+from src.simulation.scenarios import SCENARIOS
 from src.serving.inference import InferenceService, NoActiveModelError
 from src.serving.oversight import CONTROL_LABELS
 from src.serving.schemas import (
@@ -61,6 +63,10 @@ from src.serving.schemas import (
     RollbackCandidate,
     RollbackRequest,
     SetControlRequest,
+    SimulationCommand,
+    SimulationResponse,
+    SimulationScenario,
+    SimulationStartRequest,
     TelemetryResponse,
     TickerDecision,
 )
@@ -80,6 +86,7 @@ registry: ModelRegistry
 orchestrator: CTOrchestrator
 ingestion: IngestionState
 paper: PaperTrader
+simulation: SimulationManager
 _scheduler_task: asyncio.Task | None = None
 _ingestion_task: asyncio.Task | None = None
 _paper_tasks: list[asyncio.Task] = []
@@ -176,6 +183,16 @@ async def _run_paper_sync() -> None:
             logging.getLogger(__name__).exception("paper account sync failed")
 
 
+async def _reap_simulation() -> None:
+    """Ends a simulation nobody is watching, so it can't hold memory."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await asyncio.to_thread(simulation.reap)
+        except Exception:  # noqa: BLE001 - must survive a bad tick
+            logging.getLogger(__name__).exception("could not reap the simulation")
+
+
 def _check_auth_config() -> None:
     """CLAUDE.md §11, explicit failure: sign-in configured without a session
     secret would sign cookies with a key that changes on every restart, and
@@ -194,7 +211,7 @@ def _check_auth_config() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global repo, service, registry, orchestrator, ingestion, paper
+    global repo, service, registry, orchestrator, ingestion, paper, simulation
     global _scheduler_task, _ingestion_task, _paper_tasks
     _check_auth_config()
     repo = MarketRepository()
@@ -213,7 +230,11 @@ async def lifespan(_app: FastAPI):
             asyncio.create_task(_run_paper_scheduler()),
             asyncio.create_task(_run_paper_sync()),
         ]
+    simulation = SimulationManager(repo)
+    reaper = asyncio.create_task(_reap_simulation())
     yield
+    reaper.cancel()
+    simulation.stop()
     _scheduler_task.cancel()
     _ingestion_task.cancel()
     for task in _paper_tasks:
@@ -626,6 +647,49 @@ def trigger_paper_sync() -> PaperStatusResponse:
     except BrokerError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return paper_status()
+
+
+# ----------------------------------------------------------------- simulation
+def _simulation_response(state: dict) -> SimulationResponse:
+    return SimulationResponse(
+        enabled=True,
+        scenarios=[SimulationScenario(id=s.id, title=s.title, description=s.description) for s in SCENARIOS.values()],
+        state=state,
+    )
+
+
+def _simulate(action) -> SimulationResponse:
+    if not SIMULATION.enabled:
+        raise HTTPException(status_code=409, detail="the simulation is disabled (SIMULATION_ENABLED)")
+    try:
+        return _simulation_response(action())
+    except SimulationRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/simulation", response_model=SimulationResponse, dependencies=[Depends(_verify_token)])
+def simulation_state(watch: bool = Query(default=False)) -> SimulationResponse:
+    """The sandbox replay of the pipeline (src/simulation). A demonstration:
+    it runs in its own process and store, and nothing it does is recorded
+    here. `watch` keeps a session alive while its page is open."""
+    if not SIMULATION.enabled:
+        return SimulationResponse(enabled=False)
+    return _simulation_response(simulation.state(watching=watch))
+
+
+@app.post("/simulation/start", response_model=SimulationResponse, dependencies=[Depends(_verify_token)])
+def simulation_start(body: SimulationStartRequest) -> SimulationResponse:
+    return _simulate(lambda: simulation.start(body.scenario))
+
+
+@app.post("/simulation/command", response_model=SimulationResponse, dependencies=[Depends(_verify_token)])
+def simulation_command(body: SimulationCommand) -> SimulationResponse:
+    return _simulate(lambda: simulation.command(body.model_dump()))
+
+
+@app.post("/simulation/stop", response_model=SimulationResponse, dependencies=[Depends(_verify_token)])
+def simulation_stop() -> SimulationResponse:
+    return _simulate(simulation.stop)
 
 
 # ----------------------------------------------------------------- assistant

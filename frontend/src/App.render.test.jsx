@@ -28,6 +28,7 @@ vi.mock("./api.js", async (importOriginal) => {
     fetchOversight: vi.fn(),
     setControl: vi.fn(),
     rollbackModel: vi.fn(),
+    fetchSimulation: vi.fn(),
   };
 });
 
@@ -141,6 +142,7 @@ beforeEach(() => {
   api.fetchAssistantStatus.mockResolvedValue(DOWN);
   api.fetchNews.mockResolvedValue(DOWN);
   api.fetchOversight.mockResolvedValue(DOWN);
+  api.fetchSimulation.mockResolvedValue(DOWN);
 });
 
 afterEach(() => {
@@ -491,5 +493,27 @@ describe("operator override (FR-23)", () => {
     await renderApp("Pipeline");
     expect(screen.getByText(/the controls work once the backend answers/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Switch on trading halt…" })).toBeDisabled();
+  });
+});
+
+describe("simulation section", () => {
+  it("is in the navigation only when the server offers it", async () => {
+    backendUp();
+    api.fetchSimulation.mockResolvedValue(ok({ enabled: false, scenarios: [], state: null }));
+    await renderApp();
+    expect(screen.queryByRole("link", { name: "Simulation" })).toBeNull();
+
+    api.fetchSimulation.mockResolvedValue(ok({ enabled: true, scenarios: [], state: { status: "idle", days: [], events: [] } }));
+    await advance(60000);
+    await openSection("Simulation");
+    expect(screen.getByText("Choose a scenario")).toBeTruthy();
+  });
+
+  it("isn't labelled example data when the rest of the dashboard has none", async () => {
+    backendDown();
+    api.fetchSimulation.mockResolvedValue(ok({ enabled: true, scenarios: [], state: { status: "idle", days: [], events: [] } }));
+    await renderApp("Simulation");
+    expect(screen.queryByText("Example data — not live results")).toBeNull();
+    expect(screen.queryByText(/generated example data/)).toBeNull();
   });
 });

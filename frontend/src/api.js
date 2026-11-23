@@ -277,6 +277,15 @@ export const setControl = (name, enabled, reason) =>
 export const rollbackModel = (versionId, reason) =>
   post("/oversight/rollback", { version_id: versionId, reason });
 
+/**
+ * The pipeline simulation (a sandbox replay). `watch` tells the server a page
+ * is open on it, which keeps the session alive.
+ */
+export const fetchSimulation = (watch = false) => get(`/simulation${watch ? "?watch=true" : ""}`);
+export const startSimulation = (scenario) => post("/simulation/start", { scenario });
+export const sendSimulation = (command) => post("/simulation/command", command);
+export const stopSimulation = () => post("/simulation/stop");
+
 /** On-demand counterpart to the backend's scheduled CT evaluation (FR-13/14). */
 export const triggerEvaluation = () => post("/ct/evaluate");
 

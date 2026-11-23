@@ -17,6 +17,7 @@ import { useEffect, useRef, useState } from "react";
 import { ActivityCard } from "./components/Activity.jsx";
 import Assistant from "./components/Assistant.jsx";
 import { NewsCard } from "./components/News.jsx";
+import { SimulationPage } from "./components/Simulation.jsx";
 import { OverrideBanner, OversightCard } from "./components/Oversight.jsx";
 import { SECTIONS, SectionNav, useSection } from "./components/Nav.jsx";
 import { CandleChart, EquityChart, SharpeChart, Gauge } from "./components/Charts.jsx";
@@ -24,7 +25,7 @@ import {
   GlassCard, CardHead, Pill, StatusStrip, Sheet, Button,
 } from "./components/Primitives.jsx";
 import {
-  fetchCandles, fetchDecisions, fetchEvents, fetchOversight, fetchPaper, fetchStatus, fetchTelemetry, poll,
+  fetchCandles, fetchDecisions, fetchEvents, fetchOversight, fetchPaper, fetchSimulation, fetchStatus, fetchTelemetry, poll,
   rollbackModel, setControl, triggerEvaluation,
 } from "./api.js";
 import * as mock from "./mock.js";
@@ -197,6 +198,7 @@ export default function App({ user = null, onSignOut } = {}) {
   const [candlesLive, setCandlesLive] = useState(null);
   const [eventsLive, setEventsLive] = useState(null);
   const [oversight, setOversight] = useState(null);
+  const [simulationOn, setSimulationOn] = useState(false);
   const [section, go] = useSection();
   const current = SECTIONS.find((s) => s.id === section);
   const titleRef = useRef(null);
@@ -225,6 +227,7 @@ export default function App({ user = null, onSignOut } = {}) {
   // Polled separately too, so a backend without FR-23 leaves the rest live.
   const loadOversight = (r) => { if (r.ok) setOversight(r.data); };
   useEffect(() => poll(fetchOversight, 15000, loadOversight), []);
+  useEffect(() => poll(() => fetchSimulation(), 60000, (r) => { if (r.ok) setSimulationOn(r.data.enabled); }), []);
   useEffect(() => {
     setCandlesLive(null);
     return poll(() => fetchCandles(ticker, 120), 60000, (r) => {
@@ -622,7 +625,8 @@ export default function App({ user = null, onSignOut } = {}) {
 
   return (
     <div className="shell">
-      <SectionNav current={section} onSelect={go} pipeline={status.pipeline} />
+      <SectionNav current={section} onSelect={go} pipeline={status.pipeline}
+                  optional={simulationOn ? ["simulation"] : []} />
       <main className="wrap">
       <header className="masthead">
         <div>
@@ -631,7 +635,7 @@ export default function App({ user = null, onSignOut } = {}) {
           <p>{current.sub}</p>
         </div>
         <div className="mast-right">
-          {usingMock && (
+          {usingMock && section !== "simulation" && (
             <span className="demo-chip">Example data — not live results</span>
           )}
           {!usingMock && stale && (
@@ -690,6 +694,8 @@ export default function App({ user = null, onSignOut } = {}) {
         </>
       )}
 
+      {section === "simulation" && <SimulationPage />}
+
       {section === "decisions" && decisionLog}
 
       {section === "trading" && (
@@ -706,7 +712,8 @@ export default function App({ user = null, onSignOut } = {}) {
         </div>
       )}
 
-      {usingMock && (
+      {/* The simulation never shows example data. */}
+      {usingMock && section !== "simulation" && (
         <p className="note">
           <b>Figures on this page are generated example data</b>, shown so the interface
           can be judged before the pipeline is wired to it. The agent series is not a

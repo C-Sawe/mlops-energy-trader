@@ -54,3 +54,33 @@ source_modules =
     src.execution
 forbidden_modules =
     src.dataops.news
+
+# The simulation (src/simulation) is a disposable sandbox: it can't reach a
+# broker, the network fetch or the live API, and nothing that trains, serves
+# or trades may depend on it.
+[importlinter:contract:simulation-cannot-trade]
+name = The simulation cannot reach a broker, the data fetch or the live API
+type = forbidden
+source_modules =
+    src.simulation
+forbidden_modules =
+    src.execution
+    src.dataops.ingestion
+    src.dataops.news
+    src.orchestration.paper_trader
+    src.serving.api
+    src.serving.assistant
+    src.serving.auth
+
+[importlinter:contract:nothing-depends-on-simulation]
+name = No pipeline code depends on the simulation
+type = forbidden
+source_modules =
+    src.dataops
+    src.rlops
+    src.orchestration
+    src.serving.inference
+    src.serving.oversight
+    src.execution
+forbidden_modules =
+    src.simulation
