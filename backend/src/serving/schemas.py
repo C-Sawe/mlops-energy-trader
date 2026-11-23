@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.config import DATA
 
@@ -52,6 +52,8 @@ class TickerDecision(BaseModel):
 class PredictResponse(BaseModel):
     decisions: list[TickerDecision]
     failsafe_triggered: bool
+    # "vix" (FR-12) or "operator" (FR-23's trading halt); None when it didn't fire.
+    failsafe_reason: Literal["vix", "operator"] | None = None
     vix_at_decision: float | None
     version_id: str | None
     decided_at: datetime
@@ -88,6 +90,7 @@ class DecisionLogEntry(BaseModel):
     discrete_action: str
     vix_at_decision: float | None
     failsafe_triggered: bool
+    failsafe_reason: str | None = None
 
 
 class DecisionLogResponse(BaseModel):
@@ -140,6 +143,9 @@ class CTStatusResponse(BaseModel):
     last_ingestion_attempted_at: datetime | None
     last_ingestion_ok: bool | None
     next_ingestion_at: datetime | None = None
+    # FR-23: the operator's switches, so every view of the status (the
+    # dashboard's banner, the assistant) knows when a human has stepped in.
+    controls: list["OperatorControlOut"] = []
 
 
 class HealthResponse(BaseModel):
@@ -296,3 +302,69 @@ class NewsResponse(BaseModel):
 class AssistantStatusResponse(BaseModel):
     enabled: bool
     model: str | None
+
+
+# ---------------------------------------------------------------- FR-23
+OperatorControlName = Literal["halt_trading", "pause_retraining", "pause_paper_trading"]
+
+
+class OperatorControlOut(BaseModel):
+    name: OperatorControlName
+    label: str
+    enabled: bool
+    reason: str | None = None
+    set_by: str | None = None
+    set_at: datetime | None = None
+
+
+class SetControlRequest(BaseModel):
+    """Switching a control on needs a reason: it is what the audit trail
+    says about why a human overrode the autonomous loop. Switching it off
+    doesn't, though one can be given."""
+
+    enabled: bool
+    reason: str | None = Field(default=None, max_length=300)
+
+    @field_validator("reason")
+    @classmethod
+    def _strip(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
+
+    @model_validator(mode="after")
+    def _reason_to_switch_on(self) -> "SetControlRequest":
+        if self.enabled and not self.reason:
+            raise ValueError("a reason is required to switch a control on")
+        return self
+
+
+class RollbackRequest(BaseModel):
+    version_id: str = Field(min_length=1, max_length=36)
+    reason: str = Field(min_length=1, max_length=300)
+
+    @field_validator("reason")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a reason is required")
+        return value.strip()
+
+
+class RollbackCandidate(BaseModel):
+    version_id: str
+    label: str | None
+    promoted_at: datetime | None
+    is_active: bool
+    sharpe_ratio: float | None
+    trigger_reason: str | None
+
+
+class OversightResponse(BaseModel):
+    controls: list[OperatorControlOut]
+    # Models that have served before, newest first; the active one is
+    # included and flagged so the dashboard can show what is serving now.
+    versions: list[RollbackCandidate]
+    # Rollback is refused unless the CT loop is SERVING (CTOrchestrator.rollback).
+    pipeline_status: str
+
+
+CTStatusResponse.model_rebuild()

@@ -17,13 +17,15 @@ import { useEffect, useRef, useState } from "react";
 import { ActivityCard } from "./components/Activity.jsx";
 import Assistant from "./components/Assistant.jsx";
 import { NewsCard } from "./components/News.jsx";
+import { OverrideBanner, OversightCard } from "./components/Oversight.jsx";
 import { SECTIONS, SectionNav, useSection } from "./components/Nav.jsx";
 import { CandleChart, EquityChart, SharpeChart, Gauge } from "./components/Charts.jsx";
 import {
   GlassCard, CardHead, Pill, StatusStrip, Sheet, Button,
 } from "./components/Primitives.jsx";
 import {
-  fetchCandles, fetchDecisions, fetchEvents, fetchPaper, fetchStatus, fetchTelemetry, poll, triggerEvaluation,
+  fetchCandles, fetchDecisions, fetchEvents, fetchOversight, fetchPaper, fetchStatus, fetchTelemetry, poll,
+  rollbackModel, setControl, triggerEvaluation,
 } from "./api.js";
 import * as mock from "./mock.js";
 
@@ -58,6 +60,8 @@ export function adaptStatus(raw) {
     ingestionOk: raw.last_ingestion_ok,
     // Viewer's local time: the fetch is scheduled in UTC after the US close.
     ingestionNextAt: raw.next_ingestion_at ? fmtNextRun(new Date(raw.next_ingestion_at)) : null,
+    // FR-23. An older backend has no `controls`; that reads as "none on".
+    controls: raw.controls ?? [],
   };
 }
 
@@ -87,6 +91,9 @@ export function adaptDecisions(raw) {
       action: d.discrete_action,
       vix: d.vix_at_decision != null ? d.vix_at_decision.toFixed(1) : "—",
       failsafe: d.failsafe_triggered,
+      // "vix" or "operator" (FR-23); null on rows from before it was
+      // recorded, which the table still shows as a plain fail-safe.
+      failsafeReason: d.failsafe_reason ?? null,
       version: shortId(d.version_id),
       run: shortId(d.run_id),
       trainPartition: `${d.train_start} → ${d.train_end}`,
@@ -189,6 +196,7 @@ export default function App({ user = null, onSignOut } = {}) {
   const [paperLive, setPaperLive] = useState(null);
   const [candlesLive, setCandlesLive] = useState(null);
   const [eventsLive, setEventsLive] = useState(null);
+  const [oversight, setOversight] = useState(null);
   const [section, go] = useSection();
   const current = SECTIONS.find((s) => s.id === section);
   const titleRef = useRef(null);
@@ -214,6 +222,9 @@ export default function App({ user = null, onSignOut } = {}) {
   );
   const loadEvents = (r) => { if (r.ok) setEventsLive(adaptEvents(r.data)); };
   useEffect(() => poll(fetchEvents, 15000, loadEvents), []);
+  // Polled separately too, so a backend without FR-23 leaves the rest live.
+  const loadOversight = (r) => { if (r.ok) setOversight(r.data); };
+  useEffect(() => poll(fetchOversight, 15000, loadOversight), []);
   useEffect(() => {
     setCandlesLive(null);
     return poll(() => fetchCandles(ticker, 120), 60000, (r) => {
@@ -303,6 +314,23 @@ export default function App({ user = null, onSignOut } = {}) {
     }
   };
 
+  // FR-23 actions. The response is the new state, so the card, the banner
+  // and the timeline update straight away rather than at the next poll.
+  const afterOverride = async (result) => {
+    if (result.ok) {
+      setOversight(result.data);
+      setLive((prev) => (prev
+        ? { ...prev, status: { ...prev.status, controls: result.data.controls } }
+        : prev));
+      loadEvents(await fetchEvents());
+    }
+    return result;
+  };
+  const onSetControl = async (name, enabled, reason) => afterOverride(await setControl(name, enabled, reason));
+  const onRollback = async (versionId, reason) => afterOverride(await rollbackModel(versionId, reason));
+  const controls = usingMock ? [] : (oversight?.controls ?? status.controls ?? []);
+  const halted = controls.some((c) => c.name === "halt_trading" && c.enabled);
+
   const totalPages = Math.max(1, Math.ceil((decisionsView.total ?? decisions.length) / pageSize));
 
   // Each card is defined once, then placed by section below. The cards
@@ -320,6 +348,7 @@ export default function App({ user = null, onSignOut } = {}) {
         ingestionNextAt={status.ingestionNextAt}
         vix={status.vix}
         failSafeThreshold={status.failSafeThreshold}
+        halted={halted}
       />
   );
   const equityCard = (
@@ -557,7 +586,7 @@ export default function App({ user = null, onSignOut } = {}) {
                   <td className="num">{r.vix}</td>
                   <td>
                     {r.failsafe
-                      ? <Pill tone="crit">Triggered</Pill>
+                      ? <Pill tone="crit">{r.failsafeReason === "operator" ? "Operator halt" : "Triggered"}</Pill>
                       : <span style={{ color: "var(--ink-3)" }}>No</span>}
                   </td>
                 </tr>
@@ -630,6 +659,8 @@ export default function App({ user = null, onSignOut } = {}) {
         </div>
       </header>
 
+      <OverrideBanner controls={controls} />
+
       {section === "overview" && (
         <>
           {statusStrip}
@@ -648,6 +679,9 @@ export default function App({ user = null, onSignOut } = {}) {
 
       {section === "pipeline" && (
         <>
+          <div className="section-gap-after">
+            <OversightCard oversight={oversight} demo={usingMock} onSet={onSetControl} onRollback={onRollback} />
+          </div>
           <div className="panel">
             <div className="col">{sharpeChartCard}</div>
             <div className="col">{cycleCard}</div>
@@ -721,7 +755,13 @@ function DecisionDetail({ row }) {
         ))}
       </div>
       <div className="trace">
-        {row.failsafe ? (
+        {row.failsafe && row.failsafeReason === "operator" ? (
+          <>
+            An operator had halted trading (FR-23), so the request bypassed the agent
+            entirely and returned a capital-preservation instruction, as the volatility
+            fail-safe would. VIX was <b>{row.vix}</b>. <b>No model weight was consulted.</b>
+          </>
+        ) : row.failsafe ? (
           <>
             The volatility fail-safe fired: VIX <b>{row.vix}</b> exceeded the critical
             threshold, so the request bypassed the agent entirely and returned a

@@ -1,4 +1,4 @@
-"""FastAPI inference gateway (FR-10, FR-18, FR-19, FR-20, FR-21, IR-04, IR-05, NFR-08).
+"""FastAPI inference gateway (FR-10, FR-18, FR-19, FR-20, FR-21, FR-23, IR-04, IR-05, NFR-08).
 
 Access: dashboard sign-in for allowlisted people (FR-21/FR-22,
 src/serving/auth.py), and one optional bearer token for scripts and
@@ -27,7 +27,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from src.config import ASSISTANT, AUTH, DATA, INGESTION, NEWS, PAPER, RISK, SERVING
 from src.dataops.news import NewsFeed, NewsUnavailable
 from src.dataops.repository import MarketRepository
-from src.orchestration.ct_orchestrator import CTOrchestrator
+from src.orchestration.ct_orchestrator import CTOrchestrator, RollbackRefused
+from src.orchestration.events import emit
 from src.execution.alpaca_broker import AlpacaBroker, BrokerError
 from src.orchestration.ingestion_scheduler import (
     DEFAULT_TRAILING_WINDOW_DAYS,
@@ -38,6 +39,7 @@ from src.orchestration.paper_trader import PaperTrader, next_run_at
 from src.rlops.registry import ModelRegistry
 from src.serving import assistant, auth
 from src.serving.inference import InferenceService, NoActiveModelError
+from src.serving.oversight import CONTROL_LABELS
 from src.serving.schemas import (
     AssistantChatRequest,
     AssistantStatusResponse,
@@ -49,10 +51,16 @@ from src.serving.schemas import (
     EventsResponse,
     HealthResponse,
     NewsResponse,
+    OperatorControlName,
+    OperatorControlOut,
+    OversightResponse,
     PaperStatusResponse,
     PipelineEventOut,
     PredictRequest,
     PredictResponse,
+    RollbackCandidate,
+    RollbackRequest,
+    SetControlRequest,
     TelemetryResponse,
     TickerDecision,
 )
@@ -284,6 +292,7 @@ def predict(request: PredictRequest) -> PredictResponse:
     return PredictResponse(
         decisions=[TickerDecision(**d) for d in result["decisions"]],
         failsafe_triggered=result["failsafe_triggered"],
+        failsafe_reason=result["failsafe_reason"],
         vix_at_decision=result["vix_at_decision"],
         version_id=result["version_id"],
         decided_at=result["decided_at"],
@@ -375,6 +384,7 @@ def ct_status() -> CTStatusResponse:
         last_ingestion_attempted_at=ingestion.last_attempted_at,
         last_ingestion_ok=ingestion.last_ok,
         next_ingestion_at=next_run_at(datetime.now(timezone.utc), INGESTION.run_time_utc),
+        controls=_controls_out(),
     )
 
 
@@ -442,6 +452,96 @@ def candles(
     return CandlesResponse(
         ticker=ticker, candles=repo.load_candles(ticker, end - timedelta(days=days), end)
     )
+
+
+# ------------------------------------------------------- operator override
+def _controls_out() -> list[OperatorControlOut]:
+    return [OperatorControlOut(**c, label=CONTROL_LABELS[c["name"]]) for c in service.controls.all()]
+
+
+def _actor(request: Request) -> str:
+    """Who an override is recorded against (FR-23). A signed-in person's
+    email when sign-in is on; otherwise the credential used, since without
+    sign-in there is no person to name."""
+    if AUTH.enabled and (user := auth.current_user(request)) is not None:
+        return user["email"]
+    token = SERVING.bearer_token
+    if token is not None and request.headers.get("authorization") == f"Bearer {token}":
+        return "API token"
+    return "local operator"
+
+
+def _oversight() -> OversightResponse:
+    versions = [v for v in repo.list_model_versions(limit=20) if v["promoted_at"] is not None]
+    return OversightResponse(
+        controls=_controls_out(),
+        versions=[
+            RollbackCandidate(
+                version_id=v["version_id"],
+                label=_active_model_label(v),
+                promoted_at=v["promoted_at"],
+                is_active=v["is_active"],
+                sharpe_ratio=v["sharpe_ratio"],
+                trigger_reason=v["trigger_reason"],
+            )
+            for v in versions
+        ],
+        pipeline_status=orchestrator.status.value,
+    )
+
+
+@app.get("/oversight", response_model=OversightResponse, dependencies=[Depends(_verify_token)])
+def oversight() -> OversightResponse:
+    """FR-23: the operator's switches, and the models a rollback can restore."""
+    return _oversight()
+
+
+@app.put(
+    "/oversight/controls/{name}", response_model=OversightResponse, dependencies=[Depends(_verify_token)]
+)
+def set_control(name: OperatorControlName, body: SetControlRequest, request: Request) -> OversightResponse:
+    """FR-23: switch one control on or off. Takes effect on the next request
+    or tick: `/predict` reads the halt on every call, the CT loop and paper
+    trader before they act. Recorded with who, when and why, both as the
+    control's state and as an `operator_override` event on the timeline."""
+    before = service.controls.get(name)
+    if before["enabled"] == body.enabled:
+        # Nothing to switch. Writing anyway would replace who set it and why
+        # with no event to keep the original.
+        return _oversight()
+    actor = _actor(request)
+    service.controls.set(name, body.enabled, body.reason, actor)
+    # The operator's email goes in `detail`, never in the summary: the
+    # assistant sends summaries to its language model (DR-10).
+    summary = f"{CONTROL_LABELS[name]} {'switched on' if body.enabled else 'lifted'}"
+    if body.reason:
+        summary += f": {body.reason}"
+    emit(repo, "operator_override", summary, source="manual",
+         detail={"control": name, "enabled": body.enabled, "reason": body.reason, "by": actor})
+    return _oversight()
+
+
+@app.post("/oversight/rollback", response_model=OversightResponse, dependencies=[Depends(_verify_token)])
+def rollback(body: RollbackRequest, request: Request) -> OversightResponse:
+    """FR-23: restore a model that has served before, hot-swapped like a
+    promotion (FR-16). 409 while the CT loop is evaluating or retraining, or
+    for a version that has never served or is already serving."""
+    previous = service.active_version_id
+    try:
+        active = orchestrator.rollback(body.version_id)
+    except RollbackRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    actor = _actor(request)
+    label = _active_model_label(repo.get_active_version()) or (active or "")[:8]
+    emit(
+        repo, "operator_override",
+        f"Rolled back to {label}: {body.reason}",
+        source="manual",
+        detail={"control": "rollback", "from_version": previous, "to_version": active,
+                "reason": body.reason, "by": actor},
+        version_id=active,
+    )
+    return _oversight()
 
 
 # ----------------------------------------------------------------- news

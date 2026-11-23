@@ -134,8 +134,9 @@ function MarketCell() {
 export function StatusStrip({
   pipeline, model, modelLabel, modelId, lastIngest,
   ingestionStatus, ingestionCheckedAt, ingestionOk, ingestionNextAt, vix, failSafeThreshold,
+  halted = false,
 }) {
-  const tripped = vix != null && failSafeThreshold != null && vix > failSafeThreshold;
+  const tripped = vix != null && failSafeThreshold != null && vix >= failSafeThreshold;
   const { tone, label } = pipelineToneAndLabel(pipeline);
   const { tone: ingestTone, label: ingestLabel } = ingestionToneAndLabel(ingestionStatus, ingestionOk);
 
@@ -165,6 +166,8 @@ export function StatusStrip({
         <Pill tone={tripped ? "crit" : "idle"}>
           {tripped ? "Triggered" : "Inactive"} · VIX {vix?.toFixed(1) ?? "—"}
         </Pill>
+        {/* FR-23: an operator's halt gives the same answer as a VIX trip. */}
+        {halted && <Pill tone="crit">Operator halt</Pill>}
       </div>
     </section>
   );

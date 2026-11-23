@@ -64,12 +64,23 @@ class FakeBroker:
         pass
 
 
+class FakeControls:
+    """Stands in for OperatorControls (FR-23): the names switched on."""
+
+    def __init__(self, on: tuple[str, ...] = ()):
+        self.on = set(on)
+
+    def is_on(self, name):
+        return name in self.on
+
+
 class FakeService:
     """Returns fixed raw weights; mimics InferenceService.predict's shape."""
 
-    def __init__(self, weights: dict[str, float], failsafe: bool = False):
+    def __init__(self, weights: dict[str, float], failsafe: bool = False, controls_on: tuple[str, ...] = ()):
         self.weights = weights
         self.failsafe = failsafe
+        self.controls = FakeControls(controls_on)
         self.calls: list[tuple[dict, float]] = []
 
     def predict(self, positions, cash_weight):
@@ -213,3 +224,23 @@ def test_next_run_is_a_fixed_weekday_time_after_now():
 def test_market_today_uses_new_york_date_not_utc():
     # 02:00 UTC on Oct 3 is still Oct 2 in New York.
     assert str(market_today(datetime(2026, 10, 3, 2, 0, tzinfo=timezone.utc))) == "2026-10-02"
+
+
+def test_cycle_skips_without_trading_while_an_operator_has_paused_it(tmp_path):
+    """FR-23: a paused cycle places no order and records no cycle, so the
+    same day can still trade once the pause is lifted. The account is still
+    synced, so the equity curve keeps being recorded while paused."""
+    repo, now = _repo(tmp_path)
+    broker = FakeBroker(cash=100_000)
+    service = FakeService({"XOM": 0.3}, controls_on=("pause_paper_trading",))
+    trader = PaperTrader(service, repo)
+
+    outcome = trader.run_cycle(broker, now=now)
+
+    assert outcome == "skipped: paused by an operator"
+    assert broker.submitted == [] and service.calls == []
+    assert not repo.has_paper_cycle(now.date())
+    assert repo.list_paper_account()  # synced anyway
+
+    service.controls.on.clear()
+    assert trader.run_cycle(broker, now=now).startswith("traded")

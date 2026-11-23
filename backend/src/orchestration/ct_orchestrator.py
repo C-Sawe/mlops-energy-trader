@@ -1,4 +1,4 @@
-"""The Continuous Training loop (FR-13, FR-14, FR-15, FR-17, FR-20).
+"""The Continuous Training loop (FR-13, FR-14, FR-15, FR-17, FR-20, FR-23).
 
 This is the closed feedback loop CLAUDE.md §6 describes as the project's
 actual contribution: telemetry from serving feeds a drift evaluator, which
@@ -46,6 +46,10 @@ def _evaluation_start(frame: pd.DataFrame) -> pd.Timestamp:
     could shorten the trigger's."""
     dates = pd.to_datetime(frame["date"]).drop_duplicates().sort_values()
     return dates.iloc[max(0, len(dates) - (RISK.sharpe_evaluation_window + 1))]
+
+
+class RollbackRefused(RuntimeError):
+    """FR-23: a rollback that can't be done safely right now, or at all."""
 
 
 class CTStatus(str, Enum):
@@ -287,6 +291,42 @@ class CTOrchestrator:
 
         return self.status
 
+    def rollback(self, version_id: str) -> str | None:
+        """FR-23: an operator puts back a model that has served before.
+
+        Refused while an evaluation or retrain is in flight: a retrain
+        compares its candidate against the incumbent it read when it
+        started, so swapping the incumbent underneath it could let the
+        candidate be promoted over a model it was never compared with. The
+        orchestrator's lock is held for the swap, so no evaluation can
+        start halfway through. The version keeps its original promotion
+        time (`restamp=False`). Returns the version now active.
+
+        Rolling back doesn't stop the loop: if the restored model's rolling
+        Sharpe is below target, the next evaluation retrains as usual. To
+        keep it, pause retraining as well.
+        """
+        with self._lock:
+            if self._status != CTStatus.SERVING:
+                raise RollbackRefused(f"the CT loop is {self._status.value.lower()}; try again when it is serving")
+            versions = {v["version_id"]: v for v in self.repo.list_model_versions(limit=500)}
+            target = versions.get(version_id)
+            if target is None or target["promoted_at"] is None:
+                raise RollbackRefused("only a model version that has served before can be restored")
+            if target["is_active"]:
+                raise RollbackRefused("that model version is already serving")
+            previous = self.repo.get_active_version()
+            self.repo.promote_version(version_id, restamp=False)
+            try:
+                return self.inference_service.reload()
+            except Exception as exc:
+                # A missing or unreadable artifact: the old model is still
+                # loaded, so the record must go back to naming it.
+                logger.exception("rollback to %s failed to load", version_id)
+                if previous is not None:
+                    self.repo.promote_version(previous["version_id"], restamp=False)
+                raise RollbackRefused("that model could not be loaded; the current one is still serving") from exc
+
     def _persist_snapshots(
         self, env: TradingEnvironment, result: dict, benchmark_curve: np.ndarray | None = None
     ) -> None:
@@ -328,7 +368,37 @@ class CTOrchestrator:
         ("analysis" from measurement scripts that force a retrain) —
         recorded on the candidate's `model_run` row with the Sharpe and VIX
         the decision was made on, so autonomous retrains are queryable
-        (NFR-07)."""
+        (NFR-07).
+
+        FR-23: while an operator has paused retraining, nothing is trained,
+        whichever path asked. The pause is checked here rather than in each
+        caller so that no path (bootstrap, decay, a script's forced retrain)
+        can get around it. It is a deferral, like the VIX one: the next
+        evaluation after the pause is lifted decides afresh."""
+        controls = self.inference_service.controls
+        if controls.is_on("pause_retraining"):
+            pause = controls.get("pause_retraining")
+            logger.info("retrain (%s) not started: retraining is paused by %s", reason, pause["set_by"])
+            with self._lock:
+                self._last_retrain_deferred_at = datetime.now(timezone.utc)
+                if self._status != CTStatus.RETRAINING:
+                    self._status = CTStatus.SERVING
+            because = (
+                f"rolling Sharpe {fmt(rolling_sharpe)} is below the {fmt(RISK.target_sharpe_threshold)} target"
+                if reason == "ct_decay" else "no model is serving yet" if reason == "ct_bootstrap"
+                else f"a retrain was requested ({reason})"
+            )
+            emit(
+                self.repo, "retrain_deferred",
+                f"A retrain is due ({because}), but an operator has paused retraining: "
+                "the current model keeps serving",
+                source=source,
+                detail={"reason": "operator_paused", "trigger": reason,
+                        "rolling_sharpe": finite_or_none(rolling_sharpe), "vix": vix,
+                        "paused_by": pause["set_by"]},
+                version_id=self.inference_service.active_version_id,
+            )
+            return
         with self._lock:
             if self._status == CTStatus.RETRAINING:
                 return
@@ -406,6 +476,12 @@ class CTOrchestrator:
             )
 
             accepted = candidate_sharpe > incumbent_sharpe
+            # FR-23: a pause switched on while this candidate was training
+            # still stops it being promoted. It is logged as WITHHELD, not
+            # REJECTED, because the FR-17 gate didn't turn it down: an
+            # operator did, and counting it as a gate rejection would
+            # overstate the gate (the D-15 lesson).
+            withheld = accepted and self.inference_service.controls.is_on("pause_retraining")
             # Every trained candidate is logged, win or lose — FR-17's
             # "abort promotion" must still leave a record that a candidate
             # was tried and rejected, or "how many candidates were held
@@ -417,11 +493,27 @@ class CTOrchestrator:
                 eval_start,
                 eval_end,
                 {"sharpe_ratio": candidate_sharpe},
-                status="COMPLETED" if accepted else "REJECTED",
+                status="WITHHELD" if withheld else "COMPLETED" if accepted else "REJECTED",
                 trigger_reason=reason,
                 trigger_rolling_sharpe=rolling_sharpe,
                 trigger_vix=vix,
             )
+
+            if withheld:
+                logger.info("candidate beat the incumbent, but retraining is paused; promotion withheld")
+                emit(
+                    self.repo, "candidate_withheld",
+                    f"Candidate beat the current model out of sample (Sharpe {fmt(candidate_sharpe)} vs "
+                    f"{fmt(incumbent_sharpe)}), but an operator paused retraining while it trained: "
+                    "not promoted, current model kept",
+                    source=source,
+                    detail={"candidate_sharpe": finite_or_none(candidate_sharpe),
+                            "incumbent_sharpe": finite_or_none(incumbent_sharpe), "reason": reason},
+                    run_id=run_id,
+                )
+                # Not recorded as a finished FR-17 decision: once the pause is
+                # lifted, the gate gets to decide this window properly.
+                return
 
             if accepted:
                 from src.dataops.models import ModelRun

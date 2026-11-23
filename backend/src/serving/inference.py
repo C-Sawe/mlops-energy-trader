@@ -1,10 +1,11 @@
-"""Inference service: fail-safe, action mapping, hot reload (FR-11, FR-12, FR-16).
+"""Inference service: fail-safe, action mapping, hot reload (FR-11, FR-12, FR-16, FR-23).
 
 I5: the VIX fail-safe lives here, in the serving layer — not in the agent,
 not in the model — because it must survive model promotion. A component
 that promotion replaces (the loaded PPOAgent) cannot be where a safety
 mechanism lives, or promoting a new model would silently promote away the
-fail-safe with it.
+fail-safe with it. The operator's trading halt (FR-23,
+`src/serving/oversight.py`) lives here for the same reason.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from src.dataops.processing import normalize_rolling
 from src.dataops.repository import MarketRepository
 from src.rlops.agent import PPOAgent
 from src.rlops.environment import FEATURE_COLUMNS
+from src.serving.oversight import OperatorControls
 
 # Calendar days of trailing history to fetch for one prediction. Needs to
 # comfortably clear the zscore_window (60 trading days, DR-07) plus the
@@ -40,6 +42,9 @@ class InferenceService:
         self._lock = threading.RLock()
         self._agent: PPOAgent | None = None
         self._active_version_id: str | None = None
+        # FR-23: the operator's switches, read by predict() below and by the
+        # CT orchestrator and paper trader through this service.
+        self.controls = OperatorControls(self.repo)
         self.reload()
 
     def reload(self) -> str | None:
@@ -122,7 +127,8 @@ class InferenceService:
         return np.asarray(features + position_weights + [cash_weight], dtype=np.float32)
 
     def _failsafe_decisions(self) -> list[dict]:
-        """FR-12: bypass inference entirely and return capital-preservation."""
+        """FR-12 (and FR-23's halt): bypass inference entirely and return
+        capital-preservation."""
         return [
             {"ticker": t, "raw_weight": None, "discrete_action": "LIQUIDATE"} for t in self.tickers
         ]
@@ -144,8 +150,25 @@ class InferenceService:
         on `src.serving.schemas` — the API layer adapts it, not the other
         way around.
         """
-        frame, vix = self._load_recent_frame()
-        failsafe = vix is not None and vix >= RISK.vix_critical_threshold
+        halted = self.controls.is_on("halt_trading")
+        try:
+            frame, vix = self._load_recent_frame()
+        except Exception:  # noqa: BLE001 - re-raised unless halted
+            # A halt must hold when the market data can't be read: that may
+            # be why it was switched on. It needs neither the frame nor VIX.
+            if not halted:
+                raise
+            frame, vix = None, None
+        # FR-23 before FR-12: an operator's halt and a VIX trip give the same
+        # answer, but the halt is named as the reason when both hold, since
+        # it is the decision someone actually made. Neither consults the model.
+        if halted:
+            failsafe_reason = "operator"
+        elif vix is not None and vix >= RISK.vix_critical_threshold:
+            failsafe_reason = "vix"
+        else:
+            failsafe_reason = None
+        failsafe = failsafe_reason is not None
 
         if failsafe:
             decisions = self._failsafe_decisions()
@@ -174,11 +197,13 @@ class InferenceService:
                     decision["discrete_action"],
                     vix,
                     failsafe_triggered=failsafe,
+                    failsafe_reason=failsafe_reason,
                 )
 
         return {
             "decisions": decisions,
             "failsafe_triggered": failsafe,
+            "failsafe_reason": failsafe_reason,
             "vix_at_decision": vix,
             "version_id": version_id,
             "decided_at": decided_at,

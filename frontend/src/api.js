@@ -51,12 +51,12 @@ async function get(path) {
   }
 }
 
-async function post(path, body) {
+async function send(method, path, body) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
     const res = await fetch(`${BASE}${path}`, {
-      method: "POST",
+      method,
       signal: ctrl.signal,
       credentials: "include",
       headers: { "Content-Type": "application/json", Accept: "application/json", ...authHeaders() },
@@ -74,6 +74,12 @@ async function post(path, body) {
       const detail = await res.json().catch(() => null);
       return { ok: false, reason: "not_ready", detail };
     }
+    if (res.status === 409) {
+      // Refused for a reason the operator can read (e.g. a rollback while
+      // the loop is retraining).
+      const detail = await res.json().catch(() => null);
+      return { ok: false, reason: "conflict", detail };
+    }
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     if (res.status === 204) return { ok: true, data: null };
     return { ok: true, data: await res.json() };
@@ -84,6 +90,9 @@ async function post(path, body) {
     clearTimeout(timer);
   }
 }
+
+const post = (path, body) => send("POST", path, body);
+const put = (path, body) => send("PUT", path, body);
 
 /**
  * Whether sign-in is on, which providers are configured, and who (if
@@ -256,6 +265,17 @@ export async function streamAssistant(messages, onEvent, signal) {
   }
   return { ok: true };
 }
+
+/** FR-23: the operator's switches and the models a rollback can restore. */
+export const fetchOversight = () => get("/oversight");
+
+/** FR-23: switch one control on (a reason is required) or off. */
+export const setControl = (name, enabled, reason) =>
+  put(`/oversight/controls/${encodeURIComponent(name)}`, { enabled, reason });
+
+/** FR-23: restore a model that has served before. 409 while the loop is busy. */
+export const rollbackModel = (versionId, reason) =>
+  post("/oversight/rollback", { version_id: versionId, reason });
 
 /** On-demand counterpart to the backend's scheduled CT evaluation (FR-13/14). */
 export const triggerEvaluation = () => post("/ct/evaluate");

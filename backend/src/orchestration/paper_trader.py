@@ -159,6 +159,12 @@ class PaperTrader:
         today = market_today(now)
         account = self.sync(broker, now)
 
+        # FR-23: checked after the sync, so the account keeps being recorded
+        # while paused, and before anything is recorded as a cycle, so the
+        # day can still trade if the pause is lifted before the next run.
+        if self.service.controls.is_on("pause_paper_trading"):
+            return "skipped: paused by an operator"
+
         latest = self.repo.latest_ingest_info()
         if latest is None or latest["date"] != today:
             got = latest["date"] if latest else None
