@@ -413,7 +413,7 @@ export default function App({ user = null, onSignOut } = {}) {
               <Gauge fraction={m.maxDrawdown != null ? Math.abs(m.maxDrawdown) / 50 : 0} colour="var(--warn)" />
               <div className="gauge-read">
                 <div className="gauge-val num">{m.maxDrawdown != null ? `${m.maxDrawdown.toFixed(1)}%` : "—"}</div>
-                <div className="gauge-meta">Worst peak-to-trough this period</div>
+                <div className="gauge-meta">Worst peak-to-trough in the latest 30-day replay</div>
               </div>
             </div>
           </GlassCard>

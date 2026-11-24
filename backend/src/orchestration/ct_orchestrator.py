@@ -147,7 +147,7 @@ class CTOrchestrator:
 
     def evaluate(self, as_of: date | None = None, source: str = "scheduled") -> CTStatus:
         """FR-13: replay the incumbent over the most recent evaluation
-        window, persist a fresh snapshot per day (FR-18 reads these back),
+        window, append the new days to the stored history (FR-18 reads it back),
         and trigger a retrain (FR-14) if the resulting rolling Sharpe has
         fallen below target — or if there is no incumbent to begin with.
 
@@ -330,31 +330,58 @@ class CTOrchestrator:
     def _persist_snapshots(
         self, env: TradingEnvironment, result: dict, benchmark_curve: np.ndarray | None = None
     ) -> None:
-        """FR-13/FR-18: one snapshot per simulated day, each computed only
-        from the days up to and including it — the dashboard's charts must
-        never show a metric that used information from a future day.
-        `benchmark_curve` is buy-and-hold over the same slice; it is the
-        same length as the incumbent's curve because both episodes run the
-        same environment to its end."""
-        dates = env._dates[: len(result["equity_curve"])]
-        equity_curve = result["equity_curve"]
-        returns = result["returns"]
+        """FR-13/FR-18: appends the days not yet in the stored history.
 
-        for i, equity in enumerate(equity_curve):
-            window = equity_curve[: i + 1]
-            window_returns = returns[:i][-RISK.sharpe_evaluation_window :]
+        The replay covers the newest `sharpe_evaluation_window` returns and
+        starts from the initial cash every time, so its days can't be stored
+        as they are: until 2026-11-24 each check rewrote all of them, and a
+        day was left, as it aged to the first row of the window, at exactly
+        the initial cash with no Sharpe and no drawdown (D-20). Now a day is
+        written once, by the first check that sees it, and never again: the
+        equity continues from the last stored value by that day's replayed
+        return, so a model promoted later (chosen on those same days) can't
+        rewrite the record of the one it replaced.
+
+        The drawdown and the Sharpe are the check's own: over the replay up to
+        that day, with no Sharpe unless it covers the full window. Days missed
+        while nothing was running are filled from the replay, so they have no
+        Sharpe; the first day of a window after a longer gap is skipped,
+        because the replay measures no return for it.
+
+        `benchmark_curve` is buy-and-hold over the same slice, chained the
+        same way. Where the history has none yet it starts level with the
+        agent's equity."""
+        dates = env._dates[: len(result["equity_curve"])]
+        equity_curve, returns = result["equity_curve"], result["returns"]
+        window = RISK.sharpe_evaluation_window
+        previous = self.repo.latest_snapshot()
+
+        for i, ts in enumerate(dates):
+            day = pd.Timestamp(ts).date()
+            if previous is not None and (day <= previous["date"] or i == 0):
+                continue
+            has_benchmark = benchmark_curve is not None and i < len(benchmark_curve)
+            if previous is None:
+                equity, cumulative = float(equity_curve[0]), 0.0
+                benchmark = float(benchmark_curve[0]) if has_benchmark else None
+            else:
+                growth = float(equity_curve[i] / equity_curve[i - 1])
+                equity = previous["equity_value"] * growth
+                cumulative = (1.0 + (previous["cumulative_return"] or 0.0)) * growth - 1.0
+                base = previous["benchmark_equity"]
+                base = previous["equity_value"] if base is None else base
+                benchmark = base * float(benchmark_curve[i] / benchmark_curve[i - 1]) if has_benchmark else None
+            recent = returns[:i][-window:]
             self.repo.record_snapshot(
-                pd.Timestamp(dates[i]).date(),
-                float(equity),
-                rolling_sharpe_30d=sharpe_ratio(window_returns) if len(window_returns) >= 2 else None,
-                max_drawdown=max_drawdown(window),
-                cumulative_return=float(equity / equity_curve[0] - 1.0),
-                benchmark_equity=(
-                    float(benchmark_curve[i])
-                    if benchmark_curve is not None and i < len(benchmark_curve)
-                    else None
-                ),
+                day,
+                equity,
+                rolling_sharpe_30d=sharpe_ratio(recent) if len(recent) == window else None,
+                max_drawdown=max_drawdown(equity_curve[: i + 1]),
+                cumulative_return=cumulative,
+                benchmark_equity=benchmark,
             )
+            previous = {"date": day, "equity_value": equity, "cumulative_return": cumulative,
+                        "benchmark_equity": benchmark}
 
     def _trigger_retrain(
         self,

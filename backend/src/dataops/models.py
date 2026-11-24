@@ -248,7 +248,8 @@ class OperatorControl(Base):
 
 
 class PortfolioSnapshot(Base):
-    """Daily portfolio telemetry driving FR-13 and FR-18."""
+    """Daily portfolio telemetry driving FR-13 and FR-18. Each day is written
+    once, by the first check that sees it (`CTOrchestrator._persist_snapshots`)."""
 
     __tablename__ = "portfolio_snapshot"
 

@@ -442,9 +442,9 @@ class MarketRepository:
         cumulative_return: float | None = None,
         benchmark_equity: float | None = None,
     ) -> None:
-        """FR-13, FR-18: idempotent like `persist()` — the CT orchestrator
-        recomputes today's snapshot on every scheduled pass, so re-writing
-        the same date must update, not duplicate."""
+        """FR-13, FR-18: idempotent like `persist()`: writing a date twice
+        updates it. `CTOrchestrator._persist_snapshots` decides which dates
+        may be written, and writes each once."""
         snapshot_date = pd.Timestamp(snapshot_date).date()
         with self.session() as session:
             with session.begin():
@@ -466,6 +466,46 @@ class MarketRepository:
                     existing.max_drawdown = max_drawdown
                     existing.cumulative_return = cumulative_return
                     existing.benchmark_equity = benchmark_equity
+
+    def latest_snapshot(self) -> dict | None:
+        """The newest stored day, which the next one continues from (FR-13)."""
+        stmt = select(PortfolioSnapshot).order_by(PortfolioSnapshot.snapshot_date.desc()).limit(1)
+        with self.session() as session:
+            r = session.execute(stmt).scalars().first()
+            if r is None:
+                return None
+            return {
+                "date": r.snapshot_date,
+                "equity_value": float(r.equity_value),
+                "cumulative_return": float(r.cumulative_return) if r.cumulative_return is not None else None,
+                "benchmark_equity": float(r.benchmark_equity) if r.benchmark_equity is not None else None,
+            }
+
+    def placeholder_snapshot_dates(self, initial_cash: float) -> list[date]:
+        """D-20: stored days that say nothing, left by the old rewriting:
+        exactly the initial cash, no Sharpe, no drawdown. Only those followed
+        by another one, so the last (the level the next real day continues
+        from) stays, and so does a genuine first day."""
+        with self.session() as session:
+            rows = session.execute(
+                select(PortfolioSnapshot).order_by(PortfolioSnapshot.snapshot_date)
+            ).scalars().all()
+        blank = [
+            float(r.equity_value) == initial_cash and r.rolling_sharpe_30d is None
+            and (r.max_drawdown is None or float(r.max_drawdown) == 0.0)
+            and (r.benchmark_equity is None or float(r.benchmark_equity) == initial_cash)
+            for r in rows
+        ]
+        return [r.snapshot_date for r, here, nxt in zip(rows, blank, blank[1:]) if here and nxt]
+
+    def delete_snapshots(self, dates: list[date]) -> int:
+        with self.session() as session:
+            with session.begin():
+                for d in dates:
+                    row = session.get(PortfolioSnapshot, d)
+                    if row is not None:
+                        session.delete(row)
+        return len(dates)
 
     def list_snapshots(self, start: date | str, end: date | str) -> pd.DataFrame:
         """FR-18: the equity curve, rolling Sharpe and max drawdown series

@@ -505,3 +505,37 @@ def test_latest_ingest_info_returns_most_recent_observation(repo):
 
 def test_latest_ingest_info_none_when_store_is_empty(repo):
     assert repo.latest_ingest_info() is None
+
+
+def test_blank_days_left_by_d20_are_found_and_nothing_else(repo, tmp_path, monkeypatch, capsys):
+    """Blank means exactly the initial cash, no Sharpe and no drawdown, and
+    followed by another such day: the level real days continue from stays."""
+    for d in ("2024-01-02", "2024-01-03", "2024-01-04"):
+        repo.record_snapshot(d, 100_000.0, max_drawdown=0.0, benchmark_equity=100_000.0)
+    repo.record_snapshot("2024-01-05", 100_500.0, rolling_sharpe_30d=1.0, max_drawdown=0.01)
+    # Exactly the initial cash, but measured: a model that stayed in cash.
+    repo.record_snapshot("2024-01-08", 100_000.0, rolling_sharpe_30d=0.0, max_drawdown=0.0)
+    repo.record_snapshot("2024-01-09", 100_000.0, rolling_sharpe_30d=0.0, max_drawdown=0.0)
+
+    dates = repo.placeholder_snapshot_dates(100_000.0)
+    assert [str(d) for d in dates] == ["2024-01-02", "2024-01-03"]
+
+    from scripts import clean_snapshot_history as script
+
+    monkeypatch.setattr(script, "MarketRepository", lambda: repo)
+    assert script.main([]) == 0  # a dry run changes nothing
+    assert len(repo.list_snapshots("2024-01-01", "2024-01-31")) == 6
+    assert "dry run" in capsys.readouterr().out
+    assert script.main(["--apply"]) == 0
+    assert list(repo.list_snapshots("2024-01-01", "2024-01-31")["date"].dt.strftime("%m-%d")) == [
+        "01-04", "01-05", "01-08", "01-09"]
+    assert repo.placeholder_snapshot_dates(100_000.0) == []
+
+
+def test_latest_snapshot_is_the_newest_day_or_none(repo):
+    assert repo.latest_snapshot() is None
+    repo.record_snapshot("2024-01-03", 101_000.0, cumulative_return=0.01)
+    repo.record_snapshot("2024-01-02", 100_000.0)
+    latest = repo.latest_snapshot()
+    assert str(latest["date"]) == "2024-01-03"
+    assert latest["benchmark_equity"] is None

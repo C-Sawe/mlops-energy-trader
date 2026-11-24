@@ -14,6 +14,7 @@ Two different testing strategies are used deliberately:
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -24,8 +25,9 @@ from src.dataops import processing as P
 from src.dataops.models import ModelRun
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator, CTStatus, _evaluation_start
+from src.orchestration.evaluator import max_drawdown
 from src.rlops.agent import PPOAgent
-from src.rlops.baselines import buy_and_hold, run_policy
+from src.rlops.baselines import all_cash, buy_and_hold, equal_weight_rebalanced, run_policy
 from src.rlops.environment import TradingEnvironment
 from src.rlops.registry import ModelRegistry
 from src.serving.inference import InferenceService
@@ -374,6 +376,141 @@ def test_evaluate_persists_a_buy_and_hold_benchmark_on_the_same_window(tmp_path,
     assert snaps["benchmark_equity"].iloc[0] == pytest.approx(snaps["equity_value"].iloc[0])
     # And it is a real second series, not the incumbent's curve copied over.
     assert not np.allclose(snaps["benchmark_equity"].to_numpy(), snaps["equity_value"].to_numpy())
+
+
+# ------------------------------------------------- D-20: the stored history
+class _HoldEqualWeight:
+    """A serving model that stays the same, so every change in the history
+    comes from how it is stored."""
+
+    def evaluate(self, env, n_episodes=1, seed=None, deterministic=True):
+        return [run_policy(env, equal_weight_rebalanced)]
+
+
+class _AllCash:
+    def evaluate(self, env, n_episodes=1, seed=None, deterministic=True):
+        return [run_policy(env, all_cash)]
+
+
+def _history_orchestrator(tmp_path, n_days: int = 260):
+    """An orchestrator that checks but never trains, over real storage."""
+    repo, _ = _seed_repo(tmp_path, n_days=n_days)
+    service = SimpleNamespace(
+        agent=_HoldEqualWeight(), active_version_id="v",
+        controls=SimpleNamespace(is_on=lambda name: False),
+    )
+    service.get_agent = lambda: service.agent
+    orch = CTOrchestrator(service, repo=repo, registry=object())
+    orch._trigger_retrain = lambda *a, **k: setattr(orch, "_status", CTStatus.SERVING)
+    days = sorted(repo.load_partition("1990-01-01", "2100-01-01")["date"].unique())
+    return orch, repo, service, [pd.Timestamp(d).date() for d in days]
+
+
+def _history(repo):
+    return repo.list_snapshots("1990-01-01", "2100-01-01").set_index("date")
+
+
+def test_a_day_once_stored_is_never_rewritten_as_the_window_moves_on(tmp_path):
+    """D-20: daily checks left every day that aged out of the replay window
+    at exactly the initial cash, with no Sharpe and no drawdown."""
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    checked = days[-50:]
+    seen = {}
+    for day in checked:
+        orch.evaluate(as_of=day)
+        row = _history(repo).loc[pd.Timestamp(day)]
+        seen[day] = (row["equity_value"], row["rolling_sharpe_30d"], row["max_drawdown"], row["benchmark_equity"])
+
+    final = _history(repo)
+    for day, then in seen.items():
+        row = final.loc[pd.Timestamp(day)]
+        now = (row["equity_value"], row["rolling_sharpe_30d"], row["max_drawdown"], row["benchmark_equity"])
+        assert now == pytest.approx(then), day
+    assert (final["equity_value"] == 100_000.0).sum() == 1  # the first day only
+    assert final.loc[pd.Timestamp(checked[0]):, "rolling_sharpe_30d"].notna().all()
+
+
+def test_the_history_continues_from_the_last_stored_value(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    for day in days[-12:]:
+        orch.evaluate(as_of=day)
+    history = _history(repo)
+
+    end = pd.Timestamp(days[-1])
+    frame = orch._load_normalised_frame(end - pd.Timedelta(days=200), end)
+    window = frame[frame["date"] >= _evaluation_start(frame)].reset_index(drop=True)
+    for column, policy in (("equity_value", equal_weight_rebalanced), ("benchmark_equity", buy_and_hold)):
+        replay = run_policy(TradingEnvironment(window, tickers=DATA.tickers), policy)["equity_curve"]
+        got = history[column].iloc[-1] / history[column].iloc[-2]
+        assert got == pytest.approx(replay[-1] / replay[-2], rel=1e-6)
+        if policy is equal_weight_rebalanced:
+            assert history["max_drawdown"].iloc[-1] == pytest.approx(max_drawdown(replay), rel=1e-4)
+            assert max_drawdown(replay) > 0
+    grown = history["equity_value"].iloc[-1] / history["equity_value"].iloc[0] - 1
+    assert history["cumulative_return"].iloc[-1] == pytest.approx(grown, rel=1e-4)
+
+
+def test_the_stored_sharpe_is_the_one_the_check_used_and_never_a_partial_window(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-1])
+    history = _history(repo)
+    assert len(history) == RISK.sharpe_evaluation_window + 1
+    assert history["rolling_sharpe_30d"].iloc[:-1].isna().all()
+    assert history["rolling_sharpe_30d"].iloc[-1] == pytest.approx(orch.last_rolling_sharpe, rel=1e-5)
+
+
+def test_a_model_swapped_in_later_cannot_rewrite_the_record(tmp_path):
+    """The replacement was chosen on the same days, so letting it rewrite
+    them would hide the decline it was chosen for."""
+    orch, repo, service, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-2])
+    before = _history(repo)
+    service.agent = _AllCash()
+    orch.evaluate(as_of=days[-2])
+    pd.testing.assert_frame_equal(_history(repo), before)
+    orch.evaluate(as_of=days[-1])
+    after = _history(repo)
+    pd.testing.assert_frame_equal(after.iloc[:-1], before)
+    assert after["equity_value"].iloc[-1] == pytest.approx(before["equity_value"].iloc[-1])  # cash: no change
+
+
+def test_a_check_forced_onto_a_past_date_adds_nothing(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-1])
+    before = _history(repo)
+    orch.evaluate(as_of=days[-60])
+    pd.testing.assert_frame_equal(_history(repo), before)
+
+
+def test_days_missed_while_nothing_ran_are_filled_without_a_sharpe(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-6])
+    orch.evaluate(as_of=days[-1])
+    history = _history(repo)
+    assert list(history.index[-6:]) == [pd.Timestamp(d) for d in days[-6:]]
+    assert history["rolling_sharpe_30d"].iloc[-5:-1].isna().all()
+    assert pd.notna(history["rolling_sharpe_30d"].iloc[-1])
+
+
+def test_a_gap_longer_than_the_window_continues_without_inventing_a_return(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-60])
+    last = _history(repo)["equity_value"].iloc[-1]
+    orch.evaluate(as_of=days[-1])
+    history = _history(repo)
+    assert pd.Timestamp(days[-31]) not in history.index  # no return is measured for the window's first day
+    first_new = history.loc[pd.Timestamp(days[-30])]
+    assert first_new["equity_value"] == pytest.approx(last, rel=0.1)
+    assert first_new["equity_value"] != pytest.approx(100_000.0)
+
+
+def test_a_history_without_a_benchmark_starts_one_level_with_the_agent(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    repo.record_snapshot(days[-2], 91_000.0, cumulative_return=-0.09)
+    orch.evaluate(as_of=days[-1])
+    row = _history(repo).iloc[-1]
+    assert row["benchmark_equity"] == pytest.approx(91_000.0, rel=0.1)
+    assert row["benchmark_equity"] != pytest.approx(100_000.0, rel=0.01)
 
 
 # ------------------------------------------------- D-15 and the shared evaluation window
