@@ -92,6 +92,9 @@ def _fast_orchestrator(inference_service, repo, tmp_path, monkeypatch) -> CTOrch
         retrain_train_days=200,
         retrain_timesteps=128,
         retrain_n_steps=64,
+        # In-process so monkeypatching PPOAgent.train reaches the training
+        # call; the subprocess path has its own dedicated test below.
+        train_in_subprocess=False,
     )
 
 
@@ -308,6 +311,81 @@ def test_retrain_survives_a_genuine_crash_and_leaves_incumbent_active(tmp_path, 
     # never happened.
     runs_after = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())["total_runs"]
     assert runs_after == runs_before
+
+
+# --------------------------------------------------------------- NFR-02 (out-of-process training)
+def test_retrain_worker_trains_in_a_genuinely_separate_process(tmp_path, monkeypatch):
+    """NFR-02's fix is only real if training leaves this process: run the
+    worker under the same spawn executor production uses and prove the work
+    happened under a different pid, with the artifact and Sharpe coming
+    back across the process boundary."""
+    import concurrent.futures
+    import multiprocessing
+    import os
+
+    from src.orchestration.retrain_worker import train_and_evaluate_candidate
+
+    repo, as_of = _seed_repo(tmp_path)
+    end = pd.Timestamp(as_of)
+    model_path = str(tmp_path / "candidate.zip")
+
+    ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+        result = pool.submit(
+            train_and_evaluate_candidate,
+            db_url=repo.url,
+            tickers=tuple(DATA.tickers),
+            train_start=str((end - pd.Timedelta(days=200)).date()),
+            train_end=str((end - pd.Timedelta(days=46)).date()),
+            eval_start=str((end - pd.Timedelta(days=45)).date()),
+            eval_end=str(end.date()),
+            n_steps=64,
+            timesteps=128,
+            seed=0,
+            model_path=model_path,
+        ).result(timeout=120)
+
+    assert result["pid"] != os.getpid()
+    assert np.isfinite(result["sharpe"])
+    assert result["hyperparameters"]["algorithm"] == "ppo"
+    # The artifact crossed the boundary as a file the parent can serve.
+    assert PPOAgent.load(model_path).predict(
+        np.zeros(5 * 8 + 5 + 1, dtype=np.float32)
+    ).shape == (5,)
+
+
+def test_subprocess_retrain_promotes_end_to_end(tmp_path, monkeypatch):
+    """The production path (train_in_subprocess=True) through the real
+    bootstrap: evaluate() spawns the retrain thread, the thread spawns the
+    training process, and the promoted model serves — FR-14/16/17 wiring
+    unchanged by NFR-02's process boundary."""
+    repo, as_of = _seed_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    service = InferenceService(repo=repo)
+    registry = ModelRegistry(tracking_uri=f"sqlite:///{tmp_path / 'mlruns.db'}", repo=repo)
+    orchestrator = CTOrchestrator(
+        service,
+        repo=repo,
+        registry=registry,
+        retrain_train_days=200,
+        retrain_timesteps=128,
+        retrain_n_steps=64,
+        train_in_subprocess=True,
+    )
+
+    status = orchestrator.evaluate(as_of=as_of)
+    assert status == CTStatus.RETRAINING
+    orchestrator._retrain_thread.join(timeout=120)
+
+    assert orchestrator.status == CTStatus.SERVING
+    assert orchestrator.last_retrain_failed_at is None, orchestrator.last_retrain_error
+    assert service.active_version_id is not None  # bootstrap promoted
+    # log_run recorded the trainer's hyperparameters, not a loaded agent's
+    # empty dict (FR-08/NFR-07 across the process boundary).
+    with repo.session() as session:
+        run = session.query(ModelRun).one()
+    assert run.hyperparameters["algorithm"] == "ppo"
+    assert run.hyperparameters["n_steps"] == 64
 
 
 # --------------------------------------------------------------- NFR-07 (trigger provenance)

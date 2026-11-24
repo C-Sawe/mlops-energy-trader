@@ -221,6 +221,10 @@ async def lifespan(_app: FastAPI):
     registry = ModelRegistry(repo=repo)
     orchestrator = CTOrchestrator(service, repo=repo, registry=registry)
     ingestion = IngestionState()
+    # NFR-01: a successful ingestion drops the cached feature frame, so a
+    # same-date revision (the tick's trailing-window upsert) is picked up
+    # by the next /predict rather than served stale until a new bar.
+    ingestion.on_success = service.invalidate_cache
     paper = PaperTrader(service, repo)
     _scheduler_task = asyncio.create_task(_run_scheduler())
     _ingestion_task = asyncio.create_task(_run_ingestion_scheduler())

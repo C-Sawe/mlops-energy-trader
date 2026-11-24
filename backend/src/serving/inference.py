@@ -45,6 +45,17 @@ class InferenceService:
         # FR-23: the operator's switches, read by predict() below and by the
         # CT orchestrator and paper trader through this service.
         self.controls = OperatorControls(self.repo)
+        # NFR-01: (key, frame, vix) from the last _load_recent_frame. Loading
+        # and rolling-normalising 200 days of history dominated every
+        # /predict (p95 ~17-23 ms); with daily bars the result only changes
+        # when a new bar lands. The key is each ticker's newest stored date,
+        # so a new bar refreshes the cache by itself; `invalidate_cache()`
+        # covers the rare revision that rewrites values under unchanged
+        # dates (the ingestion tick's trailing-window upsert).
+        self._frame_cache: tuple[tuple, pd.DataFrame, float | None] | None = None
+        # Raised by every invalidation, so a load that began before one can't
+        # put its stale rows back afterwards (the VIX fail-safe reads them).
+        self._cache_generation = 0
         self.reload()
 
     def reload(self) -> str | None:
@@ -72,7 +83,18 @@ class InferenceService:
             )
             self._agent = PPOAgent.load(local_path)
             self._active_version_id = active["version_id"]
+            self._frame_cache = None  # belt-and-braces; data did not change
             return self._active_version_id
+
+    def invalidate_cache(self) -> None:
+        """Drop the cached feature frame. Called after an ingestion tick:
+        the tick's trailing-window upsert can revise *values* under dates
+        that already existed (late corrections, refreshed dividend
+        adjustments), which the date-tuple cache key cannot see. A new bar
+        needs no call — it changes the key on its own."""
+        with self._lock:
+            self._frame_cache = None
+            self._cache_generation += 1
 
     @property
     def active_version_id(self) -> str | None:
@@ -99,8 +121,19 @@ class InferenceService:
         if not latest_states:
             raise NoActiveModelError("no market data ingested yet")
         end = max(s["date"] for s in latest_states)
-        start = end - pd.Timedelta(days=_LOOKBACK_DAYS)
 
+        # NFR-01: the per-ticker latest-date queries above stay in the path
+        # (they are the cache key); only the heavy load + normalise is
+        # skipped while no ticker has a newer bar. Callers only read the
+        # returned frame, so sharing one DataFrame between requests is safe.
+        key = tuple(pd.Timestamp(s["date"]) for s in latest_states)
+        with self._lock:
+            if self._frame_cache is not None and self._frame_cache[0] == key:
+                _, frame, latest_vix = self._frame_cache
+                return frame, latest_vix
+            generation = self._cache_generation
+
+        start = end - pd.Timedelta(days=_LOOKBACK_DAYS)
         raw = self.repo.load_partition(start, end, tickers=self.tickers)
         frame = normalize_rolling(raw)
 
@@ -108,6 +141,9 @@ class InferenceService:
         if not frame.empty:
             latest_row = frame.sort_values("date").iloc[-1]
             latest_vix = float(latest_row["vix"]) if pd.notna(latest_row["vix"]) else None
+        with self._lock:
+            if generation == self._cache_generation:
+                self._frame_cache = (key, frame, latest_vix)
         return frame, latest_vix
 
     def _observation_from_frame(

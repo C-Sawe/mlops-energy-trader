@@ -198,6 +198,12 @@ class IngestionState:
         self._last_ok: bool | None = None
         self._last_error: str | None = None
         self._last_rows: int | None = None
+        # Called after every successful tick. The serving layer sets this to
+        # `InferenceService.invalidate_cache` (NFR-01): a tick's trailing-
+        # window upsert can revise values under existing dates, which the
+        # frame cache's newest-date key cannot see. A callback, not an
+        # import — orchestration must not import serving (NFR-06).
+        self.on_success: object | None = None
 
     @property
     def status(self) -> IngestionStatus:
@@ -233,6 +239,8 @@ class IngestionState:
                 self._last_ok = True
                 self._last_error = None
                 self._last_rows = rows
+            if self.on_success is not None:
+                self.on_success()
             latest = repo.latest_ingest_info()
             through = f" through {latest['date']}" if latest else ""
             emit(

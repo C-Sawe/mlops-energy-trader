@@ -79,7 +79,9 @@ class Simulation:
         self.repo.persist(history)
 
         self.service = InferenceService(repo=self.repo)
-        self.orchestrator = CTOrchestrator(self.service, repo=self.repo)
+        # In this process, not a further one: the injected crash patches
+        # PPOAgent.train here, and the sandbox already has its own interpreter.
+        self.orchestrator = CTOrchestrator(self.service, repo=self.repo, train_in_subprocess=False)
         self.vix_override: float | None = None
         self.crash_next = False
         self._crash_after_bootstrap = bool(scenario.get("crash_first_retrain"))
