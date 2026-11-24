@@ -17,13 +17,16 @@ import { useEffect, useRef, useState } from "react";
 import { ActivityCard } from "./components/Activity.jsx";
 import Assistant from "./components/Assistant.jsx";
 import { NewsCard } from "./components/News.jsx";
+import { SimulationPage } from "./components/Simulation.jsx";
+import { OverrideBanner, OversightCard } from "./components/Oversight.jsx";
 import { SECTIONS, SectionNav, useSection } from "./components/Nav.jsx";
 import { CandleChart, EquityChart, SharpeChart, Gauge } from "./components/Charts.jsx";
 import {
   GlassCard, CardHead, Pill, StatusStrip, Sheet, Button,
 } from "./components/Primitives.jsx";
 import {
-  fetchCandles, fetchDecisions, fetchEvents, fetchPaper, fetchStatus, fetchTelemetry, poll, triggerEvaluation,
+  fetchCandles, fetchDecisions, fetchEvents, fetchOversight, fetchPaper, fetchSimulation, fetchStatus, fetchTelemetry, poll,
+  rollbackModel, setControl, triggerEvaluation,
 } from "./api.js";
 import * as mock from "./mock.js";
 
@@ -58,6 +61,8 @@ export function adaptStatus(raw) {
     ingestionOk: raw.last_ingestion_ok,
     // Viewer's local time: the fetch is scheduled in UTC after the US close.
     ingestionNextAt: raw.next_ingestion_at ? fmtNextRun(new Date(raw.next_ingestion_at)) : null,
+    // FR-23. An older backend has no `controls`; that reads as "none on".
+    controls: raw.controls ?? [],
   };
 }
 
@@ -87,6 +92,9 @@ export function adaptDecisions(raw) {
       action: d.discrete_action,
       vix: d.vix_at_decision != null ? d.vix_at_decision.toFixed(1) : "—",
       failsafe: d.failsafe_triggered,
+      // "vix" or "operator" (FR-23); null on rows from before it was
+      // recorded, which the table still shows as a plain fail-safe.
+      failsafeReason: d.failsafe_reason ?? null,
       version: shortId(d.version_id),
       run: shortId(d.run_id),
       trainPartition: `${d.train_start} → ${d.train_end}`,
@@ -109,6 +117,10 @@ export function adaptMetrics(statusRaw, telemetryAdapted) {
     // are in training_runs but not here.
     autonomous: statusRaw.autonomous_retrains ?? null,
     autonomousPromoted: statusRaw.autonomous_promoted ?? null,
+    // Runs are attempts: older ones can repeat one candidate many times (D-15).
+    distinctCandidates: statusRaw.distinct_candidates ?? null,
+    // No trigger recorded, so who started them is unknown, not "not the loop".
+    unlabelled: statusRaw.unlabelled_runs ?? null,
   };
 }
 
@@ -189,6 +201,8 @@ export default function App({ user = null, onSignOut } = {}) {
   const [paperLive, setPaperLive] = useState(null);
   const [candlesLive, setCandlesLive] = useState(null);
   const [eventsLive, setEventsLive] = useState(null);
+  const [oversight, setOversight] = useState(null);
+  const [simulationOn, setSimulationOn] = useState(false);
   const [section, go] = useSection();
   const current = SECTIONS.find((s) => s.id === section);
   const titleRef = useRef(null);
@@ -214,6 +228,10 @@ export default function App({ user = null, onSignOut } = {}) {
   );
   const loadEvents = (r) => { if (r.ok) setEventsLive(adaptEvents(r.data)); };
   useEffect(() => poll(fetchEvents, 15000, loadEvents), []);
+  // Polled separately too, so a backend without FR-23 leaves the rest live.
+  const loadOversight = (r) => { if (r.ok) setOversight(r.data); };
+  useEffect(() => poll(fetchOversight, 15000, loadOversight), []);
+  useEffect(() => poll(() => fetchSimulation(), 60000, (r) => { if (r.ok) setSimulationOn(r.data.enabled); }), []);
   useEffect(() => {
     setCandlesLive(null);
     return poll(() => fetchCandles(ticker, 120), 60000, (r) => {
@@ -303,6 +321,23 @@ export default function App({ user = null, onSignOut } = {}) {
     }
   };
 
+  // FR-23 actions. The response is the new state, so the card, the banner
+  // and the timeline update straight away rather than at the next poll.
+  const afterOverride = async (result) => {
+    if (result.ok) {
+      setOversight(result.data);
+      setLive((prev) => (prev
+        ? { ...prev, status: { ...prev.status, controls: result.data.controls } }
+        : prev));
+      loadEvents(await fetchEvents());
+    }
+    return result;
+  };
+  const onSetControl = async (name, enabled, reason) => afterOverride(await setControl(name, enabled, reason));
+  const onRollback = async (versionId, reason) => afterOverride(await rollbackModel(versionId, reason));
+  const controls = usingMock ? [] : (oversight?.controls ?? status.controls ?? []);
+  const halted = controls.some((c) => c.name === "halt_trading" && c.enabled);
+
   const totalPages = Math.max(1, Math.ceil((decisionsView.total ?? decisions.length) / pageSize));
 
   // Each card is defined once, then placed by section below. The cards
@@ -320,6 +355,7 @@ export default function App({ user = null, onSignOut } = {}) {
         ingestionNextAt={status.ingestionNextAt}
         vix={status.vix}
         failSafeThreshold={status.failSafeThreshold}
+        halted={halted}
       />
   );
   const equityCard = (
@@ -381,7 +417,7 @@ export default function App({ user = null, onSignOut } = {}) {
               <Gauge fraction={m.maxDrawdown != null ? Math.abs(m.maxDrawdown) / 50 : 0} colour="var(--warn)" />
               <div className="gauge-read">
                 <div className="gauge-val num">{m.maxDrawdown != null ? `${m.maxDrawdown.toFixed(1)}%` : "—"}</div>
-                <div className="gauge-meta">Worst peak-to-trough this period</div>
+                <div className="gauge-meta">Worst peak-to-trough in the latest 30-day replay</div>
               </div>
             </div>
           </GlassCard>
@@ -396,17 +432,22 @@ export default function App({ user = null, onSignOut } = {}) {
                 </div>
                 <div className="gauge-meta">
                   Training runs, last {m.windowDays} days
-                  {m.autonomous != null && (
-                    <> · <span className="num">{m.autonomous}</span> started by the CT loop
-                      {m.autonomous > 0 && <> (<span className="num">{m.autonomousPromoted}</span> promoted)</>}
-                    </>
+                  {m.distinctCandidates != null && (
+                    <> · <span className="num">{m.distinctCandidates}</span> different {m.distinctCandidates === 1 ? "candidate" : "candidates"}</>
                   )}
                 </div>
+                {m.autonomous != null && (
+                  <div className="gauge-meta">
+                    <span className="num">{m.autonomous}</span> started by the CT loop
+                    {m.autonomous > 0 && <> (<span className="num">{m.autonomousPromoted}</span> promoted)</>}
+                    {m.unlabelled > 0 && <> · <span className="num">{m.unlabelled}</span> older runs with no label</>}
+                  </div>
+                )}
               </div>
             </div>
             <div style={{ marginTop: 14, display: "flex", gap: 8, flexWrap: "wrap" }}>
               <Pill tone="good">{m.promoted} promoted</Pill>
-              <Pill tone="warn">{m.heldBack} held back</Pill>
+              <Pill tone="warn">{m.heldBack} {m.heldBack === 1 ? "run" : "runs"} held back</Pill>
             </div>
           </GlassCard>
   );
@@ -557,7 +598,7 @@ export default function App({ user = null, onSignOut } = {}) {
                   <td className="num">{r.vix}</td>
                   <td>
                     {r.failsafe
-                      ? <Pill tone="crit">Triggered</Pill>
+                      ? <Pill tone="crit">{r.failsafeReason === "operator" ? "Operator halt" : "Triggered"}</Pill>
                       : <span style={{ color: "var(--ink-3)" }}>No</span>}
                   </td>
                 </tr>
@@ -593,7 +634,8 @@ export default function App({ user = null, onSignOut } = {}) {
 
   return (
     <div className="shell">
-      <SectionNav current={section} onSelect={go} pipeline={status.pipeline} />
+      <SectionNav current={section} onSelect={go} pipeline={status.pipeline}
+                  optional={simulationOn ? ["simulation"] : []} />
       <main className="wrap">
       <header className="masthead">
         <div>
@@ -602,7 +644,7 @@ export default function App({ user = null, onSignOut } = {}) {
           <p>{current.sub}</p>
         </div>
         <div className="mast-right">
-          {usingMock && (
+          {usingMock && section !== "simulation" && (
             <span className="demo-chip">Example data — not live results</span>
           )}
           {!usingMock && stale && (
@@ -630,6 +672,8 @@ export default function App({ user = null, onSignOut } = {}) {
         </div>
       </header>
 
+      <OverrideBanner controls={controls} />
+
       {section === "overview" && (
         <>
           {statusStrip}
@@ -648,6 +692,9 @@ export default function App({ user = null, onSignOut } = {}) {
 
       {section === "pipeline" && (
         <>
+          <div className="section-gap-after">
+            <OversightCard oversight={oversight} demo={usingMock} onSet={onSetControl} onRollback={onRollback} />
+          </div>
           <div className="panel">
             <div className="col">{sharpeChartCard}</div>
             <div className="col">{cycleCard}</div>
@@ -655,6 +702,8 @@ export default function App({ user = null, onSignOut } = {}) {
           <div className="section-gap"><ActivityCard events={activityEvents} limit={10} /></div>
         </>
       )}
+
+      {section === "simulation" && <SimulationPage />}
 
       {section === "decisions" && decisionLog}
 
@@ -672,7 +721,8 @@ export default function App({ user = null, onSignOut } = {}) {
         </div>
       )}
 
-      {usingMock && (
+      {/* The simulation never shows example data. */}
+      {usingMock && section !== "simulation" && (
         <p className="note">
           <b>Figures on this page are generated example data</b>, shown so the interface
           can be judged before the pipeline is wired to it. The agent series is not a
@@ -721,7 +771,13 @@ function DecisionDetail({ row }) {
         ))}
       </div>
       <div className="trace">
-        {row.failsafe ? (
+        {row.failsafe && row.failsafeReason === "operator" ? (
+          <>
+            An operator had halted trading (FR-23), so the request bypassed the agent
+            entirely and returned a capital-preservation instruction, as the volatility
+            fail-safe would. VIX was <b>{row.vix}</b>. <b>No model weight was consulted.</b>
+          </>
+        ) : row.failsafe ? (
           <>
             The volatility fail-safe fired: VIX <b>{row.vix}</b> exceeded the critical
             threshold, so the request bypassed the agent entirely and returned a

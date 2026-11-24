@@ -14,6 +14,7 @@ Two different testing strategies are used deliberately:
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -24,8 +25,9 @@ from src.dataops import processing as P
 from src.dataops.models import ModelRun
 from src.dataops.repository import MarketRepository
 from src.orchestration.ct_orchestrator import CTOrchestrator, CTStatus, _evaluation_start
+from src.orchestration.evaluator import max_drawdown
 from src.rlops.agent import PPOAgent
-from src.rlops.baselines import buy_and_hold, run_policy
+from src.rlops.baselines import all_cash, buy_and_hold, equal_weight_rebalanced, run_policy
 from src.rlops.environment import TradingEnvironment
 from src.rlops.registry import ModelRegistry
 from src.serving.inference import InferenceService
@@ -90,6 +92,9 @@ def _fast_orchestrator(inference_service, repo, tmp_path, monkeypatch) -> CTOrch
         retrain_train_days=200,
         retrain_timesteps=128,
         retrain_n_steps=64,
+        # In-process so monkeypatching PPOAgent.train reaches the training
+        # call; the subprocess path has its own dedicated test below.
+        train_in_subprocess=False,
     )
 
 
@@ -308,6 +313,109 @@ def test_retrain_survives_a_genuine_crash_and_leaves_incumbent_active(tmp_path, 
     assert runs_after == runs_before
 
 
+# --------------------------------------------------------------- NFR-02 (out-of-process training)
+def test_candidate_and_incumbent_are_judged_on_identical_rows(tmp_path, monkeypatch):
+    """The serving process loads only the rows it needs (NFR-02) while the
+    worker loads two years; the gate is only fair if both give the same
+    normalised evaluation rows."""
+    repo, as_of = _seed_repo(tmp_path, n_days=900)
+    _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    registry = ModelRegistry(tracking_uri=f"sqlite:///{tmp_path / 'mlruns.db'}", repo=repo)
+    orchestrator = CTOrchestrator(service, repo=repo, registry=registry, retrain_train_days=730,
+                                  retrain_timesteps=64, retrain_n_steps=64, train_in_subprocess=False)
+    seen = []
+    real = PPOAgent.evaluate
+
+    def spy(self, env, *args, **kwargs):
+        seen.append((env._features.copy(), env._prices.copy(), list(env._dates)))
+        return real(self, env, *args, **kwargs)
+
+    monkeypatch.setattr(PPOAgent, "evaluate", spy)
+    orchestrator._trigger_retrain(as_of, "analysis")
+    _join_retrain(orchestrator)
+    assert orchestrator.last_retrain_failed_at is None, orchestrator.last_retrain_error
+
+    (cand, cand_prices, cand_dates), (inc, inc_prices, inc_dates) = seen
+    assert cand_dates == inc_dates and len(cand_dates) == RISK.sharpe_evaluation_window + 1
+    np.testing.assert_allclose(inc, cand, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(inc_prices, cand_prices)
+
+
+def test_retrain_worker_trains_in_a_genuinely_separate_process(tmp_path, monkeypatch):
+    """NFR-02's fix is only real if training leaves this process: run the
+    worker under the same spawn executor production uses and prove the work
+    happened under a different pid, with the artifact and Sharpe coming
+    back across the process boundary."""
+    import concurrent.futures
+    import multiprocessing
+    import os
+
+    from src.orchestration.retrain_worker import train_and_evaluate_candidate
+
+    repo, as_of = _seed_repo(tmp_path)
+    end = pd.Timestamp(as_of)
+    model_path = str(tmp_path / "candidate.zip")
+
+    ctx = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+        result = pool.submit(
+            train_and_evaluate_candidate,
+            db_url=repo.url,
+            tickers=tuple(DATA.tickers),
+            train_start=str((end - pd.Timedelta(days=200)).date()),
+            train_end=str((end - pd.Timedelta(days=46)).date()),
+            eval_start=str((end - pd.Timedelta(days=45)).date()),
+            eval_end=str(end.date()),
+            n_steps=64,
+            timesteps=128,
+            seed=0,
+            model_path=model_path,
+        ).result(timeout=120)
+
+    assert result["pid"] != os.getpid()
+    assert np.isfinite(result["sharpe"])
+    assert result["hyperparameters"]["algorithm"] == "ppo"
+    # The artifact crossed the boundary as a file the parent can serve.
+    assert PPOAgent.load(model_path).predict(
+        np.zeros(5 * 8 + 5 + 1, dtype=np.float32)
+    ).shape == (5,)
+
+
+def test_subprocess_retrain_promotes_end_to_end(tmp_path, monkeypatch):
+    """The production path (train_in_subprocess=True) through the real
+    bootstrap: evaluate() spawns the retrain thread, the thread spawns the
+    training process, and the promoted model serves — FR-14/16/17 wiring
+    unchanged by NFR-02's process boundary."""
+    repo, as_of = _seed_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    service = InferenceService(repo=repo)
+    registry = ModelRegistry(tracking_uri=f"sqlite:///{tmp_path / 'mlruns.db'}", repo=repo)
+    orchestrator = CTOrchestrator(
+        service,
+        repo=repo,
+        registry=registry,
+        retrain_train_days=200,
+        retrain_timesteps=128,
+        retrain_n_steps=64,
+        train_in_subprocess=True,
+    )
+
+    status = orchestrator.evaluate(as_of=as_of)
+    assert status == CTStatus.RETRAINING
+    orchestrator._retrain_thread.join(timeout=120)
+
+    assert orchestrator.status == CTStatus.SERVING
+    assert orchestrator.last_retrain_failed_at is None, orchestrator.last_retrain_error
+    assert service.active_version_id is not None  # bootstrap promoted
+    # log_run recorded the trainer's hyperparameters, not a loaded agent's
+    # empty dict (FR-08/NFR-07 across the process boundary).
+    with repo.session() as session:
+        run = session.query(ModelRun).one()
+    assert run.hyperparameters["algorithm"] == "ppo"
+    assert run.hyperparameters["n_steps"] == 64
+
+
 # --------------------------------------------------------------- NFR-07 (trigger provenance)
 def _runs_with_trigger(repo, trigger):
     with repo.session() as session:
@@ -374,6 +482,141 @@ def test_evaluate_persists_a_buy_and_hold_benchmark_on_the_same_window(tmp_path,
     assert snaps["benchmark_equity"].iloc[0] == pytest.approx(snaps["equity_value"].iloc[0])
     # And it is a real second series, not the incumbent's curve copied over.
     assert not np.allclose(snaps["benchmark_equity"].to_numpy(), snaps["equity_value"].to_numpy())
+
+
+# ------------------------------------------------- D-20: the stored history
+class _HoldEqualWeight:
+    """A serving model that stays the same, so every change in the history
+    comes from how it is stored."""
+
+    def evaluate(self, env, n_episodes=1, seed=None, deterministic=True):
+        return [run_policy(env, equal_weight_rebalanced)]
+
+
+class _AllCash:
+    def evaluate(self, env, n_episodes=1, seed=None, deterministic=True):
+        return [run_policy(env, all_cash)]
+
+
+def _history_orchestrator(tmp_path, n_days: int = 260):
+    """An orchestrator that checks but never trains, over real storage."""
+    repo, _ = _seed_repo(tmp_path, n_days=n_days)
+    service = SimpleNamespace(
+        agent=_HoldEqualWeight(), active_version_id="v",
+        controls=SimpleNamespace(is_on=lambda name: False),
+    )
+    service.get_agent = lambda: service.agent
+    orch = CTOrchestrator(service, repo=repo, registry=object())
+    orch._trigger_retrain = lambda *a, **k: setattr(orch, "_status", CTStatus.SERVING)
+    days = sorted(repo.load_partition("1990-01-01", "2100-01-01")["date"].unique())
+    return orch, repo, service, [pd.Timestamp(d).date() for d in days]
+
+
+def _history(repo):
+    return repo.list_snapshots("1990-01-01", "2100-01-01").set_index("date")
+
+
+def test_a_day_once_stored_is_never_rewritten_as_the_window_moves_on(tmp_path):
+    """D-20: daily checks left every day that aged out of the replay window
+    at exactly the initial cash, with no Sharpe and no drawdown."""
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    checked = days[-50:]
+    seen = {}
+    for day in checked:
+        orch.evaluate(as_of=day)
+        row = _history(repo).loc[pd.Timestamp(day)]
+        seen[day] = (row["equity_value"], row["rolling_sharpe_30d"], row["max_drawdown"], row["benchmark_equity"])
+
+    final = _history(repo)
+    for day, then in seen.items():
+        row = final.loc[pd.Timestamp(day)]
+        now = (row["equity_value"], row["rolling_sharpe_30d"], row["max_drawdown"], row["benchmark_equity"])
+        assert now == pytest.approx(then), day
+    assert (final["equity_value"] == 100_000.0).sum() == 1  # the first day only
+    assert final.loc[pd.Timestamp(checked[0]):, "rolling_sharpe_30d"].notna().all()
+
+
+def test_the_history_continues_from_the_last_stored_value(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    for day in days[-12:]:
+        orch.evaluate(as_of=day)
+    history = _history(repo)
+
+    end = pd.Timestamp(days[-1])
+    frame = orch._load_normalised_frame(end - pd.Timedelta(days=200), end)
+    window = frame[frame["date"] >= _evaluation_start(frame)].reset_index(drop=True)
+    for column, policy in (("equity_value", equal_weight_rebalanced), ("benchmark_equity", buy_and_hold)):
+        replay = run_policy(TradingEnvironment(window, tickers=DATA.tickers), policy)["equity_curve"]
+        got = history[column].iloc[-1] / history[column].iloc[-2]
+        assert got == pytest.approx(replay[-1] / replay[-2], rel=1e-6)
+        if policy is equal_weight_rebalanced:
+            assert history["max_drawdown"].iloc[-1] == pytest.approx(max_drawdown(replay), rel=1e-4)
+            assert max_drawdown(replay) > 0
+    grown = history["equity_value"].iloc[-1] / history["equity_value"].iloc[0] - 1
+    assert history["cumulative_return"].iloc[-1] == pytest.approx(grown, rel=1e-4)
+
+
+def test_the_stored_sharpe_is_the_one_the_check_used_and_never_a_partial_window(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-1])
+    history = _history(repo)
+    assert len(history) == RISK.sharpe_evaluation_window + 1
+    assert history["rolling_sharpe_30d"].iloc[:-1].isna().all()
+    assert history["rolling_sharpe_30d"].iloc[-1] == pytest.approx(orch.last_rolling_sharpe, rel=1e-5)
+
+
+def test_a_model_swapped_in_later_cannot_rewrite_the_record(tmp_path):
+    """The replacement was chosen on the same days, so letting it rewrite
+    them would hide the decline it was chosen for."""
+    orch, repo, service, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-2])
+    before = _history(repo)
+    service.agent = _AllCash()
+    orch.evaluate(as_of=days[-2])
+    pd.testing.assert_frame_equal(_history(repo), before)
+    orch.evaluate(as_of=days[-1])
+    after = _history(repo)
+    pd.testing.assert_frame_equal(after.iloc[:-1], before)
+    assert after["equity_value"].iloc[-1] == pytest.approx(before["equity_value"].iloc[-1])  # cash: no change
+
+
+def test_a_check_forced_onto_a_past_date_adds_nothing(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-1])
+    before = _history(repo)
+    orch.evaluate(as_of=days[-60])
+    pd.testing.assert_frame_equal(_history(repo), before)
+
+
+def test_days_missed_while_nothing_ran_are_filled_without_a_sharpe(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-6])
+    orch.evaluate(as_of=days[-1])
+    history = _history(repo)
+    assert list(history.index[-6:]) == [pd.Timestamp(d) for d in days[-6:]]
+    assert history["rolling_sharpe_30d"].iloc[-5:-1].isna().all()
+    assert pd.notna(history["rolling_sharpe_30d"].iloc[-1])
+
+
+def test_a_gap_longer_than_the_window_continues_without_inventing_a_return(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    orch.evaluate(as_of=days[-60])
+    last = _history(repo)["equity_value"].iloc[-1]
+    orch.evaluate(as_of=days[-1])
+    history = _history(repo)
+    assert pd.Timestamp(days[-31]) not in history.index  # no return is measured for the window's first day
+    first_new = history.loc[pd.Timestamp(days[-30])]
+    assert first_new["equity_value"] == pytest.approx(last, rel=0.1)
+    assert first_new["equity_value"] != pytest.approx(100_000.0)
+
+
+def test_a_history_without_a_benchmark_starts_one_level_with_the_agent(tmp_path):
+    orch, repo, _, days = _history_orchestrator(tmp_path)
+    repo.record_snapshot(days[-2], 91_000.0, cumulative_return=-0.09)
+    orch.evaluate(as_of=days[-1])
+    row = _history(repo).iloc[-1]
+    assert row["benchmark_equity"] == pytest.approx(91_000.0, rel=0.1)
+    assert row["benchmark_equity"] != pytest.approx(100_000.0, rel=0.01)
 
 
 # ------------------------------------------------- D-15 and the shared evaluation window

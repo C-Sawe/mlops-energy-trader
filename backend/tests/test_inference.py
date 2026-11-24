@@ -229,3 +229,131 @@ def test_no_active_model_raises_on_predict(tmp_path, monkeypatch):
 
     with pytest.raises(NoActiveModelError):
         service.predict(_flat_positions(), cash_weight=1.0)
+
+
+# --------------------------------------------------------------- NFR-01 (frame cache)
+def _count_partition_loads(repo, monkeypatch):
+    """Wrap repo.load_partition with a call counter, behaviour unchanged."""
+    counter = {"n": 0}
+    original = repo.load_partition
+
+    def counting(*args, **kwargs):
+        counter["n"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(repo, "load_partition", counting)
+    return counter
+
+
+def test_second_predict_reuses_the_cached_frame(tmp_path, monkeypatch):
+    """NFR-01: loading + rolling-normalising 200 days dominated every
+    /predict; with daily bars the result only changes when a new bar lands,
+    so an unchanged store must not pay for it twice."""
+    repo = _seed_repo_and_promote_model(tmp_path, monkeypatch, final_vix=20.0)
+    service = InferenceService(repo=repo)
+    counter = _count_partition_loads(repo, monkeypatch)
+
+    first = service.predict(_flat_positions(), cash_weight=1.0)
+    assert counter["n"] == 1
+    second = service.predict(_flat_positions(), cash_weight=1.0)
+
+    assert counter["n"] == 1  # the heavy load ran once, not twice
+    assert [d["discrete_action"] for d in second["decisions"]] == [
+        d["discrete_action"] for d in first["decisions"]
+    ]
+
+
+def test_a_new_bar_refreshes_the_cached_frame(tmp_path, monkeypatch):
+    """The cache key is each ticker's newest stored date, so a new bar must
+    invalidate it by itself — proven by the new bar's critical VIX flipping
+    the fail-safe, which a stale frame could not do."""
+    n_days = 250
+    repo = _seed_repo_and_promote_model(tmp_path, monkeypatch, final_vix=20.0, n_days=n_days)
+    service = InferenceService(repo=repo)
+    assert service.predict(_flat_positions(), cash_weight=1.0)["failsafe_triggered"] is False
+
+    counter = _count_partition_loads(repo, monkeypatch)
+    equities = make_series(n_days + 1, tickers=DATA.tickers)
+    dates = pd.DatetimeIndex(sorted(equities["date"].unique()))
+    vix_values = np.linspace(14, 20, len(dates))
+    vix_values[-1] = RISK.vix_critical_threshold + 5.0  # the new bar is a volatile day
+    repo.persist(P.build_feature_frame(equities, pd.DataFrame({"date": dates, "close": vix_values})))
+
+    result = service.predict(_flat_positions(), cash_weight=1.0)
+
+    assert counter["n"] == 1  # reloaded because the newest date changed
+    assert result["failsafe_triggered"] is True
+
+
+def test_invalidate_cache_picks_up_a_same_date_revision(tmp_path, monkeypatch):
+    """A revision that rewrites values under unchanged dates (the ingestion
+    tick's trailing-window upsert) is invisible to the date key — that is
+    the documented limitation — and `invalidate_cache()`, which the serving
+    layer calls after every successful tick, is the remedy."""
+    n_days = 250
+    repo = _seed_repo_and_promote_model(tmp_path, monkeypatch, final_vix=20.0, n_days=n_days)
+    service = InferenceService(repo=repo)
+    assert service.predict(_flat_positions(), cash_weight=1.0)["failsafe_triggered"] is False
+
+    equities = make_series(n_days, tickers=DATA.tickers)
+    dates = pd.DatetimeIndex(sorted(equities["date"].unique()))
+    vix_values = np.linspace(14, 20, len(dates))
+    vix_values[-1] = RISK.vix_critical_threshold + 5.0  # same date, revised value
+    repo.persist(P.build_feature_frame(equities, pd.DataFrame({"date": dates, "close": vix_values})))
+
+    stale = service.predict(_flat_positions(), cash_weight=1.0)
+    assert stale["failsafe_triggered"] is False  # the key cannot see a same-date revision
+
+    service.invalidate_cache()
+    fresh = service.predict(_flat_positions(), cash_weight=1.0)
+    assert fresh["failsafe_triggered"] is True
+
+
+def test_a_load_begun_before_an_invalidation_cannot_put_stale_rows_back(tmp_path, monkeypatch):
+    """A request can be reading the old rows while an ingestion revises them
+    and clears the cache. If it then cached what it read, the VIX fail-safe
+    would go on using the old value until the next bar."""
+    repo = _seed_repo_and_promote_model(tmp_path, monkeypatch, final_vix=20.0)
+    service = InferenceService(repo=repo)
+    original = repo.load_partition
+
+    def revised_during_the_load(*args, **kwargs):
+        rows = original(*args, **kwargs)
+        service.invalidate_cache()  # the ingestion finished in the meantime
+        return rows
+
+    monkeypatch.setattr(repo, "load_partition", revised_during_the_load)
+    service.predict(_flat_positions(), cash_weight=1.0)
+    monkeypatch.setattr(repo, "load_partition", original)
+
+    counter = _count_partition_loads(repo, monkeypatch)
+    service.predict(_flat_positions(), cash_weight=1.0)
+    assert counter["n"] == 1  # read again, not answered from the stale rows
+
+
+def test_the_api_clears_the_cache_after_a_successful_ingestion(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from src.orchestration import ingestion_scheduler
+    from src.serving import api
+    from tests.test_ct_orchestrator import _promote_initial_model, _seed_repo
+
+    repo, as_of = _seed_repo(tmp_path)  # file-backed: the API opens its own connection
+    _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    monkeypatch.setenv("DATABASE_URL", repo.url)
+    with TestClient(api.app):
+        positions = _flat_positions()
+        api.service.predict(positions, cash_weight=1.0)
+        assert api.service._frame_cache is not None
+
+        def failing(*args, **kwargs):
+            raise RuntimeError("provider down")
+
+        monkeypatch.setattr(ingestion_scheduler, "run_ingestion_tick", failing)
+        with pytest.raises(RuntimeError):
+            api.ingestion.run(repo)
+        assert api.service._frame_cache is not None  # nothing was written
+
+        monkeypatch.setattr(ingestion_scheduler, "run_ingestion_tick", lambda *a, **k: 5)
+        api.ingestion.run(repo)
+        assert api.service._frame_cache is None

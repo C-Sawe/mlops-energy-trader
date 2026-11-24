@@ -24,8 +24,11 @@ from src.dataops.models import (
     AUTONOMOUS_TRIGGERS,
     Base,
     DashboardUser,
+    OPERATOR_CONTROLS,
+    PIPELINE_EVENT_KINDS,
     MarketObservation,
     ModelRun,
+    OperatorControl,
     ModelVersion,
     PaperAccountSnapshot,
     PaperCycle,
@@ -71,6 +74,49 @@ class MarketRepository:
     def create_schema(self) -> None:
         Base.metadata.create_all(self.engine)
         self._add_missing_columns()
+        self._widen_event_kind_check()
+
+    def _widen_event_kind_check(self) -> None:
+        """Let an existing `pipeline_event` table accept event kinds added
+        after it was created (`operator_override`, FR-23).
+
+        The kind CHECK is fixed when the table is created, so on an older
+        database a new kind is refused and `emit()` would quietly drop the
+        event (D-15's fix reused an existing kind for exactly this reason).
+        On PostgreSQL the constraint is replaced in place; the new list is a
+        superset of the old one, so every existing row still passes. SQLite
+        can't alter a constraint; there it is logged, and the event is lost
+        until the table is rebuilt (tests always start from a fresh table).
+        """
+        if "pipeline_event" not in inspect(self.engine).get_table_names():
+            return
+        allowed = ", ".join(f"'{k}'" for k in PIPELINE_EVENT_KINDS)
+        if self.engine.dialect.name == "sqlite":
+            with self.engine.connect() as conn:
+                ddl = conn.execute(text(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_event'"
+                )).scalar() or ""
+            missing = [k for k in PIPELINE_EVENT_KINDS if f"'{k}'" not in ddl]
+            if missing:
+                logger.warning(
+                    "schema: pipeline_event's kind check predates %s; those events can't be recorded "
+                    "on this SQLite file until the table is rebuilt", ", ".join(missing),
+                )
+            return
+        if self.engine.dialect.name != "postgresql":
+            return
+        with self.engine.begin() as conn:
+            current = conn.execute(text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conname = 'ck_pipeline_event_kind' AND conrelid = 'pipeline_event'::regclass"
+            )).scalar()
+            if current is not None and all(f"'{k}'" in current for k in PIPELINE_EVENT_KINDS):
+                return
+            conn.execute(text(
+                "ALTER TABLE pipeline_event DROP CONSTRAINT IF EXISTS ck_pipeline_event_kind, "
+                f"ADD CONSTRAINT ck_pipeline_event_kind CHECK (kind IN ({allowed}))"
+            ))
+            logger.info("schema: widened pipeline_event.ck_pipeline_event_kind")
 
     def _add_missing_columns(self) -> None:
         """Add nullable columns introduced after a table already existed.
@@ -260,11 +306,13 @@ class MarketRepository:
         discrete_action: str,
         vix_at_decision: float | None,
         failsafe_triggered: bool = False,
+        failsafe_reason: str | None = None,
     ) -> str:
         """FR-19, NFR-07, NFR-11, I6: one autonomous action, attributable to
         the version that produced it. `failsafe_triggered` is stored rather
         than inferred, so a fail-safe activation is never confused with a
-        model decision in later analysis."""
+        model decision in later analysis; `failsafe_reason` says whether VIX
+        or an operator's halt (FR-23) fired it."""
         decision = TradingDecision(
             version_id=version_id,
             ticker=ticker,
@@ -272,6 +320,7 @@ class MarketRepository:
             discrete_action=discrete_action,
             vix_at_decision=vix_at_decision,
             failsafe_triggered=failsafe_triggered,
+            failsafe_reason=failsafe_reason,
         )
         with self.session() as session:
             with session.begin():
@@ -315,6 +364,7 @@ class MarketRepository:
                     "discrete_action": r.discrete_action,
                     "vix_at_decision": float(r.vix_at_decision) if r.vix_at_decision is not None else None,
                     "failsafe_triggered": r.failsafe_triggered,
+                    "failsafe_reason": r.failsafe_reason,
                 }
                 for r in rows
             ]
@@ -341,6 +391,7 @@ class MarketRepository:
                 "discrete_action": r.discrete_action,
                 "vix_at_decision": float(r.vix_at_decision) if r.vix_at_decision is not None else None,
                 "failsafe_triggered": r.failsafe_triggered,
+                "failsafe_reason": r.failsafe_reason,
                 "version_id": r.version_id,
                 "version_promoted_at": r.version.promoted_at,
                 "version_is_active": r.version.is_active,
@@ -391,9 +442,9 @@ class MarketRepository:
         cumulative_return: float | None = None,
         benchmark_equity: float | None = None,
     ) -> None:
-        """FR-13, FR-18: idempotent like `persist()` — the CT orchestrator
-        recomputes today's snapshot on every scheduled pass, so re-writing
-        the same date must update, not duplicate."""
+        """FR-13, FR-18: idempotent like `persist()`: writing a date twice
+        updates it. `CTOrchestrator._persist_snapshots` decides which dates
+        may be written, and writes each once."""
         snapshot_date = pd.Timestamp(snapshot_date).date()
         with self.session() as session:
             with session.begin():
@@ -415,6 +466,46 @@ class MarketRepository:
                     existing.max_drawdown = max_drawdown
                     existing.cumulative_return = cumulative_return
                     existing.benchmark_equity = benchmark_equity
+
+    def latest_snapshot(self) -> dict | None:
+        """The newest stored day, which the next one continues from (FR-13)."""
+        stmt = select(PortfolioSnapshot).order_by(PortfolioSnapshot.snapshot_date.desc()).limit(1)
+        with self.session() as session:
+            r = session.execute(stmt).scalars().first()
+            if r is None:
+                return None
+            return {
+                "date": r.snapshot_date,
+                "equity_value": float(r.equity_value),
+                "cumulative_return": float(r.cumulative_return) if r.cumulative_return is not None else None,
+                "benchmark_equity": float(r.benchmark_equity) if r.benchmark_equity is not None else None,
+            }
+
+    def placeholder_snapshot_dates(self, initial_cash: float) -> list[date]:
+        """D-20: stored days that say nothing, left by the old rewriting:
+        exactly the initial cash, no Sharpe, no drawdown. Only those followed
+        by another one, so the last (the level the next real day continues
+        from) stays, and so does a genuine first day."""
+        with self.session() as session:
+            rows = session.execute(
+                select(PortfolioSnapshot).order_by(PortfolioSnapshot.snapshot_date)
+            ).scalars().all()
+        blank = [
+            float(r.equity_value) == initial_cash and r.rolling_sharpe_30d is None
+            and (r.max_drawdown is None or float(r.max_drawdown) == 0.0)
+            and (r.benchmark_equity is None or float(r.benchmark_equity) == initial_cash)
+            for r in rows
+        ]
+        return [r.snapshot_date for r, here, nxt in zip(rows, blank, blank[1:]) if here and nxt]
+
+    def delete_snapshots(self, dates: list[date]) -> int:
+        with self.session() as session:
+            with session.begin():
+                for d in dates:
+                    row = session.get(PortfolioSnapshot, d)
+                    if row is not None:
+                        session.delete(row)
+        return len(dates)
 
     def list_snapshots(self, start: date | str, end: date | str) -> pd.DataFrame:
         """FR-18: the equity curve, rolling Sharpe and max drawdown series
@@ -484,12 +575,17 @@ class MarketRepository:
                 )
             ).scalar_one()
 
-    def promote_version(self, version_id: str) -> None:
+    def promote_version(self, version_id: str, restamp: bool = True) -> None:
         """FR-17: activate `version_id`, retiring whatever was active.
 
         Retiring rather than deleting the incumbent's record is deliberate
         — NFR-07 requires every past decision stay traceable to the version
         that produced it, including versions no longer serving.
+
+        `restamp=False` is an operator's rollback (FR-23) to a version that
+        has served before: it keeps that version's original `promoted_at`,
+        so its label ("October 2026 #2") and the promotion counts stay what
+        they were. The rollback itself is recorded as a pipeline event.
         """
         now = datetime.now(timezone.utc)
         with self.session() as session:
@@ -503,7 +599,9 @@ class MarketRepository:
                 if candidate is None:
                     raise ValueError(f"no such model_version: {version_id}")
                 candidate.is_active = True
-                candidate.promoted_at = now
+                candidate.retired_at = None
+                if restamp or candidate.promoted_at is None:
+                    candidate.promoted_at = now
 
     def get_cycle_stats(self, since: date | str) -> dict:
         """Training runs logged in the window, and how many were promoted
@@ -515,7 +613,24 @@ class MarketRepository:
         (`AUTONOMOUS_TRIGGERS`), and `autonomous_promoted` those of them
         that passed the FR-17 gate. Runs logged before `trigger_reason`
         existed are NULL and counted in neither autonomous figure — they
-        are unknown, not assumed autonomous.
+        are unknown, not assumed autonomous. `unlabelled_runs` counts them.
+
+        `distinct_candidates` counts different models, not attempts. Before
+        the loop began skipping identical retrains (D-15) the same candidate
+        could be trained hundreds of times, so `total_runs` and `rejected`
+        overstate how many models were judged. Runs count as the same
+        candidate when their windows and Sharpe match: training is
+        deterministic, so an identical run reproduces both exactly.
+
+        Validated against the real September 2026 history (2026-11-10):
+        this key collapses the 1,350 CT-loop runs of 17-27 Sep to 19
+        candidates where the D-15 audit hand-counted 20 (the hand count
+        included boundary rows this window clips), and one pair of
+        adjacent-day windows shares an identical Sharpe (-16.936414) — a
+        probable true duplicate the key counts twice. Treat the figure as
+        accurate to about +/-1 on real history, not exact: a window shift
+        that crosses no new bar can still retrain a genuinely identical
+        model under a different key.
         """
         since_ts = pd.Timestamp(since)
         with self.session() as session:
@@ -548,8 +663,26 @@ class MarketRepository:
                     ModelVersion.promoted_at.is_not(None),
                 )
             ).scalar_one()
+            distinct_candidates = session.execute(
+                select(func.count()).select_from(
+                    select(
+                        ModelRun.train_start, ModelRun.train_end,
+                        ModelRun.eval_start, ModelRun.eval_end, ModelRun.sharpe_ratio,
+                    )
+                    .where(ModelRun.created_at >= since_ts)
+                    .distinct()
+                    .subquery()
+                )
+            ).scalar_one()
+            unlabelled = session.execute(
+                select(func.count())
+                .select_from(ModelRun)
+                .where(ModelRun.created_at >= since_ts, ModelRun.trigger_reason.is_(None))
+            ).scalar_one()
         return {
             "total_runs": total,
+            "distinct_candidates": distinct_candidates,
+            "unlabelled_runs": unlabelled,
             "promoted": promoted,
             "rejected": rejected,
             "autonomous_runs": autonomous,
@@ -765,6 +898,43 @@ class MarketRepository:
                     return False
                 session.delete(user)
                 return True
+
+    # ------------------------------------------------------ operator controls
+    def get_controls(self) -> dict[str, dict]:
+        """FR-23: every operator switch's current state, keyed by name. A
+        switch that has never been used is reported off, with no setter."""
+        with self.session() as session:
+            rows = {r.name: r for r in session.execute(select(OperatorControl)).scalars().all()}
+            return {
+                name: {
+                    "name": name,
+                    "enabled": bool(rows[name].enabled) if name in rows else False,
+                    "reason": rows[name].reason if name in rows else None,
+                    "set_by": rows[name].set_by if name in rows else None,
+                    "set_at": rows[name].set_at if name in rows else None,
+                }
+                for name in OPERATOR_CONTROLS
+            }
+
+    def set_control(self, name: str, enabled: bool, reason: str | None, set_by: str) -> dict:
+        """FR-23: switch one control on or off, in one transaction. Raises on
+        an unknown name rather than storing it (CLAUDE.md §11)."""
+        if name not in OPERATOR_CONTROLS:
+            raise ValueError(f"unknown operator control: {name}")
+        now = datetime.now(timezone.utc)
+        reason = reason.strip()[:300] if reason and reason.strip() else None
+        set_by = set_by[:320]
+        with self.session() as session:
+            with session.begin():
+                row = session.get(OperatorControl, name)
+                if row is None:
+                    row = OperatorControl(name=name)
+                    session.add(row)
+                row.enabled = enabled
+                row.reason = reason
+                row.set_by = set_by
+                row.set_at = now
+        return {"name": name, "enabled": enabled, "reason": reason, "set_by": set_by, "set_at": now}
 
     def record_event(
         self,

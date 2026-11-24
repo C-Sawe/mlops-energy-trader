@@ -242,6 +242,17 @@ class PaperTradingConfig:
         return float(os.environ.get("PAPER_MIN_ORDER_NOTIONAL", "1.0"))
 
 
+@dataclass(frozen=True)
+class SimulationConfig:
+    """The pipeline simulation (src/simulation). Off by default: each session
+    is a second process that loads torch and trains. A property for the same
+    reason as `ServingConfig.bearer_token`."""
+
+    @property
+    def enabled(self) -> bool:
+        return os.environ.get("SIMULATION_ENABLED", "false").lower() in ("1", "true", "yes")
+
+
 AUTH_PROVIDERS: tuple[str, ...] = ("google", "microsoft", "github")
 
 
@@ -375,6 +386,7 @@ ENVIRONMENT = EnvironmentConfig()
 BROKER = BrokerConfig()
 SERVING = ServingConfig()
 PAPER = PaperTradingConfig()
+SIMULATION = SimulationConfig()
 AUTH = AuthConfig()
 ASSISTANT = AssistantConfig()
 NEWS = NewsConfig()

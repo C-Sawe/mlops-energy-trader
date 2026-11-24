@@ -456,6 +456,35 @@ def test_get_cycle_stats_counts_autonomous_runs_separately(repo):
     assert stats["total_runs"] == 5
     assert stats["autonomous_runs"] == 3
     assert stats["autonomous_promoted"] == 1
+    assert stats["unlabelled_runs"] == 1
+
+
+def test_get_cycle_stats_counts_repeated_runs_as_one_candidate(repo):
+    """D-15: an identical retrain is a new attempt but not a new model, so
+    it must not look like one. Different Sharpe or windows are different."""
+    def add_run(sharpe, eval_end="2023-12-31", created_at=None):
+        with repo.session() as session:
+            session.add(ModelRun(
+                train_start=pd.Timestamp("2020-01-01").date(),
+                train_end=pd.Timestamp("2022-12-31").date(),
+                eval_start=pd.Timestamp("2023-01-01").date(),
+                eval_end=pd.Timestamp(eval_end).date(),
+                sharpe_ratio=sharpe,
+                status="REJECTED",
+                created_at=created_at,
+            ))
+            session.commit()
+
+    for _ in range(4):
+        add_run(1.5)  # the same candidate, retrained four times
+    add_run(-0.7)  # same windows, another seed or settings
+    add_run(1.5, eval_end="2024-01-02")  # same Sharpe on a later window
+    add_run(9.9, created_at=pd.Timestamp("1999-01-01"))  # before the window
+
+    stats = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())
+    assert stats["total_runs"] == 6
+    assert stats["rejected"] == 6
+    assert stats["distinct_candidates"] == 3
 
 
 def test_create_schema_adds_a_column_missing_from_an_existing_table(tmp_path):
@@ -505,3 +534,37 @@ def test_latest_ingest_info_returns_most_recent_observation(repo):
 
 def test_latest_ingest_info_none_when_store_is_empty(repo):
     assert repo.latest_ingest_info() is None
+
+
+def test_blank_days_left_by_d20_are_found_and_nothing_else(repo, tmp_path, monkeypatch, capsys):
+    """Blank means exactly the initial cash, no Sharpe and no drawdown, and
+    followed by another such day: the level real days continue from stays."""
+    for d in ("2024-01-02", "2024-01-03", "2024-01-04"):
+        repo.record_snapshot(d, 100_000.0, max_drawdown=0.0, benchmark_equity=100_000.0)
+    repo.record_snapshot("2024-01-05", 100_500.0, rolling_sharpe_30d=1.0, max_drawdown=0.01)
+    # Exactly the initial cash, but measured: a model that stayed in cash.
+    repo.record_snapshot("2024-01-08", 100_000.0, rolling_sharpe_30d=0.0, max_drawdown=0.0)
+    repo.record_snapshot("2024-01-09", 100_000.0, rolling_sharpe_30d=0.0, max_drawdown=0.0)
+
+    dates = repo.placeholder_snapshot_dates(100_000.0)
+    assert [str(d) for d in dates] == ["2024-01-02", "2024-01-03"]
+
+    from scripts import clean_snapshot_history as script
+
+    monkeypatch.setattr(script, "MarketRepository", lambda: repo)
+    assert script.main([]) == 0  # a dry run changes nothing
+    assert len(repo.list_snapshots("2024-01-01", "2024-01-31")) == 6
+    assert "dry run" in capsys.readouterr().out
+    assert script.main(["--apply"]) == 0
+    assert list(repo.list_snapshots("2024-01-01", "2024-01-31")["date"].dt.strftime("%m-%d")) == [
+        "01-04", "01-05", "01-08", "01-09"]
+    assert repo.placeholder_snapshot_dates(100_000.0) == []
+
+
+def test_latest_snapshot_is_the_newest_day_or_none(repo):
+    assert repo.latest_snapshot() is None
+    repo.record_snapshot("2024-01-03", 101_000.0, cumulative_return=0.01)
+    repo.record_snapshot("2024-01-02", 100_000.0)
+    latest = repo.latest_snapshot()
+    assert str(latest["date"]) == "2024-01-03"
+    assert latest["benchmark_equity"] is None

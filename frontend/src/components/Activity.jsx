@@ -25,6 +25,8 @@ const KINDS = {
   candidate_rejected: { tone: "idle", label: "Candidate rejected" },
   retrain_failed: { tone: "crit", label: "Retrain failed" },
   paper_cycle: { tone: "idle", label: "Paper cycle" },
+  candidate_withheld: { tone: "warn", label: "Promotion withheld" },
+  operator_override: { tone: "crit", label: "Operator override" },
 };
 
 export const kindInfo = (kind) => KINDS[kind] ?? { tone: "idle", label: kind };

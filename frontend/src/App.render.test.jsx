@@ -25,6 +25,10 @@ vi.mock("./api.js", async (importOriginal) => {
     fetchAssistantStatus: vi.fn(),
     fetchNews: vi.fn(),
     triggerEvaluation: vi.fn(),
+    fetchOversight: vi.fn(),
+    setControl: vi.fn(),
+    rollbackModel: vi.fn(),
+    fetchSimulation: vi.fn(),
   };
 });
 
@@ -53,6 +57,8 @@ const statusRaw = (over = {}) => ({
   rejected_count: 6,
   autonomous_retrains: 5,
   autonomous_promoted: 1,
+  distinct_candidates: 3,
+  unlabelled_runs: 2,
   ingestion_status: "IDLE",
   last_ingestion_attempted_at: "2026-10-06T22:00:00Z",
   last_ingestion_ok: true,
@@ -137,6 +143,8 @@ beforeEach(() => {
   api.fetchEvents.mockResolvedValue(DOWN);
   api.fetchAssistantStatus.mockResolvedValue(DOWN);
   api.fetchNews.mockResolvedValue(DOWN);
+  api.fetchOversight.mockResolvedValue(DOWN);
+  api.fetchSimulation.mockResolvedValue(DOWN);
 });
 
 afterEach(() => {
@@ -283,7 +291,24 @@ describe("live equity benchmark and cycle history", () => {
     await renderApp("Pipeline");
 
     const meta = screen.getByText(/started by the CT loop/);
-    expect(meta.textContent).toMatch(/last 90 days · 5 started by the CT loop \(1 promoted\)/);
+    expect(meta.textContent).toMatch(/^5 started by the CT loop \(1 promoted\) · 2 older runs with no label$/);
+  });
+
+  it("shows different candidates next to runs, and calls rejections runs (D-15)", async () => {
+    backendUp();
+    await renderApp("Pipeline");
+
+    const meta = screen.getByText(/different candidates/);
+    expect(meta.textContent).toMatch(/last 90 days · 3 different candidates/);
+    expect(screen.getByText("6 runs held back")).toBeInTheDocument();
+  });
+
+  it("uses the singular for one candidate and one run", async () => {
+    backendUp({ status: statusRaw({ distinct_candidates: 1, rejected_count: 1 }) });
+    await renderApp("Pipeline");
+
+    expect(screen.getByText(/different candidate/).textContent).toMatch(/· 1 different candidate$/);
+    expect(screen.getByText("1 run held back")).toBeInTheDocument();
   });
 });
 
@@ -390,5 +415,124 @@ describe("sections (sidebar on wide screens, tab bar on narrow)", () => {
     api.fetchStatus.mockResolvedValue(ok(statusRaw({ status: "RETRAINING" })));
     await renderApp();
     expect(within(nav()).getByRole("link", { name: /Pipeline/ })).toHaveTextContent("(Retraining)");
+  });
+});
+
+describe("operator override (FR-23)", () => {
+  const control = (name, label, over = {}) => ({
+    name, label, enabled: false, reason: null, set_by: null, set_at: null, ...over,
+  });
+  const oversightRaw = (halt = {}) => ({
+    controls: [
+      control("halt_trading", "Trading halt", halt),
+      control("pause_retraining", "Retraining pause"),
+      control("pause_paper_trading", "Paper-trading pause"),
+    ],
+    versions: [
+      { version_id: "bf65de93-d5c1-4109-912d-23a547177a31", label: "October 2026 #1", promoted_at: "2026-10-01T00:00:00Z",
+        is_active: true, sharpe_ratio: 0.4, trigger_reason: "ct_decay" },
+      { version_id: "e4b696ff-0000-0000-0000-000000000000", label: "September 2026 #2", promoted_at: "2026-09-20T00:00:00Z",
+        is_active: false, sharpe_ratio: 1.2, trigger_reason: "ct_decay" },
+    ],
+    pipeline_status: "SERVING",
+  });
+  const halted = { enabled: true, reason: "VIX feed looks wrong", set_by: "ops@example.com", set_at: "2026-10-06T12:00:00Z" };
+
+  it("shows no banner while every control is off", async () => {
+    backendUp();
+    api.fetchOversight.mockResolvedValue(ok(oversightRaw()));
+    await renderApp();
+    expect(screen.queryByRole("status", { name: /operator overrides/i })).toBeNull();
+  });
+
+  it("names who halted trading, when and why, on every section", async () => {
+    backendUp();
+    api.fetchOversight.mockResolvedValue(ok(oversightRaw(halted)));
+    await renderApp();
+    const banner = screen.getByRole("status", { name: /operator overrides/i });
+    expect(banner).toHaveTextContent("Trading halted by ops@example.com");
+    expect(banner).toHaveTextContent("VIX feed looks wrong");
+    expect(screen.getByText("Operator halt")).toBeTruthy(); // on the status strip too
+
+    await openSection("Decisions");
+    expect(screen.getByRole("status", { name: /operator overrides/i })).toBeTruthy();
+  });
+
+  it("asks for a reason before switching a control on, then shows the new state", async () => {
+    backendUp();
+    api.fetchOversight.mockResolvedValue(ok(oversightRaw()));
+    api.setControl.mockResolvedValue(ok(oversightRaw(halted)));
+    await renderApp("Pipeline");
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch on trading halt…" }));
+    const confirm = screen.getByRole("button", { name: "Confirm" });
+    expect(confirm).toBeDisabled(); // no reason yet
+
+    fireEvent.change(screen.getByLabelText(/kept in the audit trail/), { target: { value: "VIX feed looks wrong" } });
+    fireEvent.click(confirm);
+    await advance();
+
+    expect(api.setControl).toHaveBeenCalledWith("halt_trading", true, "VIX feed looks wrong");
+    expect(screen.getByRole("status", { name: /operator overrides/i })).toHaveTextContent("Trading halted");
+    expect(screen.getByRole("button", { name: "Lift trading halt…" })).toBeTruthy();
+  });
+
+  it("shows the server's reason when a rollback is refused", async () => {
+    backendUp();
+    api.fetchOversight.mockResolvedValue(ok(oversightRaw()));
+    api.rollbackModel.mockResolvedValue({ ok: false, reason: "conflict",
+      detail: { detail: "the CT loop is retraining; try again when it is serving" } });
+    await renderApp("Pipeline");
+
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "e4b696ff-0000-0000-0000-000000000000" } });
+    fireEvent.change(screen.getByLabelText("Reason (required)"), { target: { value: "new model misbehaving" } });
+    fireEvent.click(screen.getByRole("button", { name: "Roll back" }));
+    await advance();
+
+    expect(api.rollbackModel).toHaveBeenCalledWith("e4b696ff-0000-0000-0000-000000000000", "new model misbehaving");
+    expect(screen.getByRole("alert")).toHaveTextContent("the CT loop is retraining");
+  });
+
+  it("labels an operator-halt decision differently from a VIX trip", async () => {
+    backendUp();
+    api.fetchDecisions.mockResolvedValue(ok({
+      ...decisionsRaw,
+      items: [{ ...decisionsRaw.items[1], failsafe_reason: "operator", vix_at_decision: 18.0 }],
+      total: 1,
+    }));
+    await renderApp("Decisions");
+    expect(screen.getByText("Operator halt")).toBeTruthy();
+    fireEvent.click(screen.getByText("CVX"));
+    await advance();
+    expect(screen.getByRole("dialog")).toHaveTextContent("An operator had halted trading");
+  });
+
+  it("shows the controls disabled on example data", async () => {
+    backendDown();
+    await renderApp("Pipeline");
+    expect(screen.getByText(/the controls work once the backend answers/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Switch on trading halt…" })).toBeDisabled();
+  });
+});
+
+describe("simulation section", () => {
+  it("is in the navigation only when the server offers it", async () => {
+    backendUp();
+    api.fetchSimulation.mockResolvedValue(ok({ enabled: false, scenarios: [], state: null }));
+    await renderApp();
+    expect(screen.queryByRole("link", { name: "Simulation" })).toBeNull();
+
+    api.fetchSimulation.mockResolvedValue(ok({ enabled: true, scenarios: [], state: { status: "idle", days: [], events: [] } }));
+    await advance(60000);
+    await openSection("Simulation");
+    expect(screen.getByText("Choose a scenario")).toBeTruthy();
+  });
+
+  it("isn't labelled example data when the rest of the dashboard has none", async () => {
+    backendDown();
+    api.fetchSimulation.mockResolvedValue(ok({ enabled: true, scenarios: [], state: { status: "idle", days: [], events: [] } }));
+    await renderApp("Simulation");
+    expect(screen.queryByText("Example data — not live results")).toBeNull();
+    expect(screen.queryByText(/generated example data/)).toBeNull();
   });
 });

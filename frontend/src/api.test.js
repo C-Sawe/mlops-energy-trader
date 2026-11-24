@@ -5,8 +5,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  AUTH_REQUIRED_EVENT, fetchDecisions, fetchStatus, fetchTelemetry, passwordLogin, poll, predict, signOut,
-  triggerEvaluation,
+  AUTH_REQUIRED_EVENT, fetchDecisions, fetchStatus, fetchTelemetry, passwordLogin, poll, predict, rollbackModel,
+  setControl, signOut, triggerEvaluation,
 } from "./api.js";
 
 function jsonResponse(status, body) {
@@ -173,5 +173,24 @@ describe("poll", () => {
     stop();
     await vi.advanceTimersByTimeAsync(5000);
     expect(fn).toHaveBeenCalledTimes(2); // no further ticks after unsubscribing
+  });
+});
+
+describe("operator override (FR-23)", () => {
+  it("switches a control with a PUT carrying the reason", async () => {
+    fetch.mockResolvedValue(jsonResponse(200, { controls: [] }));
+    const result = await setControl("halt_trading", true, "bad data");
+    const [url, init] = fetch.mock.calls[0];
+    expect(url).toMatch(/\/oversight\/controls\/halt_trading$/);
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body)).toEqual({ enabled: true, reason: "bad data" });
+    expect(result.ok).toBe(true);
+  });
+
+  it("reports a refused rollback as a conflict with the server's reason", async () => {
+    fetch.mockResolvedValue(jsonResponse(409, { detail: "the CT loop is retraining" }));
+    const result = await rollbackModel("v1", "why");
+    expect(fetch.mock.calls[0][1].method).toBe("POST");
+    expect(result).toEqual({ ok: false, reason: "conflict", detail: { detail: "the CT loop is retraining" } });
   });
 });

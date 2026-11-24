@@ -81,6 +81,9 @@ def main() -> int:
     os.chdir(tmp_dir)  # MLflow's artifact store defaults to a relative ./mlruns (CLAUDE.md §11)
     db_url = f"sqlite:///{tmp_dir}/test.db"
     os.environ["DATABASE_URL"] = db_url
+    # The API's start-up catch-up would otherwise download real prices into
+    # this synthetic store part-way through the measurement.
+    os.environ["INGESTION_CATCH_UP"] = "false"
 
     from src.config import DATA
     from src.dataops import processing as P

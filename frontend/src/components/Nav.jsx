@@ -17,6 +17,8 @@ export const SECTIONS = [
   { id: "pipeline", label: "Pipeline", sub: "How the continuous-training loop checks, retrains and promotes the model" },
   { id: "decisions", label: "Decisions", sub: "Every action, traced to the model version and data behind it" },
   { id: "trading", label: "Trading", sub: "Prices, headlines and the Alpaca paper account" },
+  // Shown only when the server offers it (SIMULATION_ENABLED).
+  { id: "simulation", label: "Simulation", sub: "A sandbox replay of the pipeline, one trading day at a time", optional: true },
 ];
 
 const IDS = SECTIONS.map((s) => s.id);
@@ -76,9 +78,16 @@ const ICONS = {
   ),
 };
 
+ICONS.simulation = (
+  <>
+    <path d="M5 4.5v15l7-7.5z" />
+    <path d="M13 4.5v15l7-7.5z" />
+  </>
+);
+
 const BUSY = { EVALUATING: "Evaluating", RETRAINING: "Retraining" };
 
-export function SectionNav({ current, onSelect, pipeline }) {
+export function SectionNav({ current, onSelect, pipeline, optional = [] }) {
   return (
     <nav className="sidenav" aria-label="Sections">
       <div className="side-brand">
@@ -86,7 +95,7 @@ export function SectionNav({ current, onSelect, pipeline }) {
         <span className="side-sub">Continuous training for RL trading</span>
       </div>
       <ul>
-        {SECTIONS.map((s) => (
+        {SECTIONS.filter((s) => !s.optional || optional.includes(s.id)).map((s) => (
           <li key={s.id}>
             <a
               href={`#${s.id}`}

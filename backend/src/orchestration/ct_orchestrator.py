@@ -1,4 +1,4 @@
-"""The Continuous Training loop (FR-13, FR-14, FR-15, FR-17, FR-20).
+"""The Continuous Training loop (FR-13, FR-14, FR-15, FR-17, FR-20, FR-23).
 
 This is the closed feedback loop CLAUDE.md §6 describes as the project's
 actual contribution: telemetry from serving feeds a drift evaluator, which
@@ -15,10 +15,15 @@ otherwise.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import multiprocessing
+import os
+import tempfile
 import threading
 from datetime import date, datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -28,6 +33,7 @@ from src.dataops.processing import normalize_rolling, partition_chronological
 from src.dataops.repository import MarketRepository
 from src.orchestration.evaluator import max_drawdown, sharpe_ratio
 from src.orchestration.events import emit, finite_or_none, fmt
+from src.orchestration.retrain_worker import train_and_evaluate_candidate
 from src.rlops.agent import PPOAgent
 from src.rlops.baselines import buy_and_hold, run_policy
 from src.rlops.environment import TradingEnvironment
@@ -46,6 +52,10 @@ def _evaluation_start(frame: pd.DataFrame) -> pd.Timestamp:
     could shorten the trigger's."""
     dates = pd.to_datetime(frame["date"]).drop_duplicates().sort_values()
     return dates.iloc[max(0, len(dates) - (RISK.sharpe_evaluation_window + 1))]
+
+
+class RollbackRefused(RuntimeError):
+    """FR-23: a rollback that can't be done safely right now, or at all."""
 
 
 class CTStatus(str, Enum):
@@ -67,6 +77,7 @@ class CTOrchestrator:
         retrain_timesteps: int = 20_000,
         retrain_n_steps: int = 2048,
         retrain_seed: int = 0,
+        train_in_subprocess: bool = True,
     ) -> None:
         self.inference_service = inference_service
         self.repo = repo or MarketRepository()
@@ -76,6 +87,13 @@ class CTOrchestrator:
         self.retrain_timesteps = retrain_timesteps
         self.retrain_n_steps = retrain_n_steps
         self.retrain_seed = retrain_seed
+        # NFR-02: train candidates in a spawned child process so the GIL-bound
+        # `learn()` cannot stall concurrent `/predict` calls (measured at +71%
+        # to +107% p95 degradation when it ran as a thread in this process —
+        # CLAUDE.md §3). Tests pass False so monkeypatching `PPOAgent.train`
+        # still reaches the training call; both modes run the identical
+        # `retrain_worker.train_and_evaluate_candidate`.
+        self.train_in_subprocess = train_in_subprocess
 
         self._lock = threading.RLock()
         self._status = CTStatus.SERVING
@@ -143,7 +161,7 @@ class CTOrchestrator:
 
     def evaluate(self, as_of: date | None = None, source: str = "scheduled") -> CTStatus:
         """FR-13: replay the incumbent over the most recent evaluation
-        window, persist a fresh snapshot per day (FR-18 reads these back),
+        window, append the new days to the stored history (FR-18 reads it back),
         and trigger a retrain (FR-14) if the resulting rolling Sharpe has
         fallen below target — or if there is no incumbent to begin with.
 
@@ -287,34 +305,97 @@ class CTOrchestrator:
 
         return self.status
 
+    def rollback(self, version_id: str) -> str | None:
+        """FR-23: an operator puts back a model that has served before.
+
+        Refused while an evaluation or retrain is in flight: a retrain
+        compares its candidate against the incumbent it read when it
+        started, so swapping the incumbent underneath it could let the
+        candidate be promoted over a model it was never compared with. The
+        orchestrator's lock is held for the swap, so no evaluation can
+        start halfway through. The version keeps its original promotion
+        time (`restamp=False`). Returns the version now active.
+
+        Rolling back doesn't stop the loop: if the restored model's rolling
+        Sharpe is below target, the next evaluation retrains as usual. To
+        keep it, pause retraining as well.
+        """
+        with self._lock:
+            if self._status != CTStatus.SERVING:
+                raise RollbackRefused(f"the CT loop is {self._status.value.lower()}; try again when it is serving")
+            versions = {v["version_id"]: v for v in self.repo.list_model_versions(limit=500)}
+            target = versions.get(version_id)
+            if target is None or target["promoted_at"] is None:
+                raise RollbackRefused("only a model version that has served before can be restored")
+            if target["is_active"]:
+                raise RollbackRefused("that model version is already serving")
+            previous = self.repo.get_active_version()
+            self.repo.promote_version(version_id, restamp=False)
+            try:
+                return self.inference_service.reload()
+            except Exception as exc:
+                # A missing or unreadable artifact: the old model is still
+                # loaded, so the record must go back to naming it.
+                logger.exception("rollback to %s failed to load", version_id)
+                if previous is not None:
+                    self.repo.promote_version(previous["version_id"], restamp=False)
+                raise RollbackRefused("that model could not be loaded; the current one is still serving") from exc
+
     def _persist_snapshots(
         self, env: TradingEnvironment, result: dict, benchmark_curve: np.ndarray | None = None
     ) -> None:
-        """FR-13/FR-18: one snapshot per simulated day, each computed only
-        from the days up to and including it — the dashboard's charts must
-        never show a metric that used information from a future day.
-        `benchmark_curve` is buy-and-hold over the same slice; it is the
-        same length as the incumbent's curve because both episodes run the
-        same environment to its end."""
-        dates = env._dates[: len(result["equity_curve"])]
-        equity_curve = result["equity_curve"]
-        returns = result["returns"]
+        """FR-13/FR-18: appends the days not yet in the stored history.
 
-        for i, equity in enumerate(equity_curve):
-            window = equity_curve[: i + 1]
-            window_returns = returns[:i][-RISK.sharpe_evaluation_window :]
+        The replay covers the newest `sharpe_evaluation_window` returns and
+        starts from the initial cash every time, so its days can't be stored
+        as they are: until 2026-11-24 each check rewrote all of them, and a
+        day was left, as it aged to the first row of the window, at exactly
+        the initial cash with no Sharpe and no drawdown (D-20). Now a day is
+        written once, by the first check that sees it, and never again: the
+        equity continues from the last stored value by that day's replayed
+        return, so a model promoted later (chosen on those same days) can't
+        rewrite the record of the one it replaced.
+
+        The drawdown and the Sharpe are the check's own: over the replay up to
+        that day, with no Sharpe unless it covers the full window. Days missed
+        while nothing was running are filled from the replay, so they have no
+        Sharpe; the first day of a window after a longer gap is skipped,
+        because the replay measures no return for it.
+
+        `benchmark_curve` is buy-and-hold over the same slice, chained the
+        same way. Where the history has none yet it starts level with the
+        agent's equity."""
+        dates = env._dates[: len(result["equity_curve"])]
+        equity_curve, returns = result["equity_curve"], result["returns"]
+        window = RISK.sharpe_evaluation_window
+        previous = self.repo.latest_snapshot()
+
+        for i, ts in enumerate(dates):
+            day = pd.Timestamp(ts).date()
+            if previous is not None and (day <= previous["date"] or i == 0):
+                continue
+            has_benchmark = benchmark_curve is not None and i < len(benchmark_curve)
+            if previous is None:
+                equity, cumulative = float(equity_curve[0]), 0.0
+                benchmark = float(benchmark_curve[0]) if has_benchmark else None
+            else:
+                growth = float(equity_curve[i] / equity_curve[i - 1])
+                equity = previous["equity_value"] * growth
+                cumulative = (1.0 + (previous["cumulative_return"] or 0.0)) * growth - 1.0
+                base = previous["benchmark_equity"]
+                base = previous["equity_value"] if base is None else base
+                benchmark = base * float(benchmark_curve[i] / benchmark_curve[i - 1]) if has_benchmark else None
+            recent = returns[:i][-window:]
             self.repo.record_snapshot(
-                pd.Timestamp(dates[i]).date(),
-                float(equity),
-                rolling_sharpe_30d=sharpe_ratio(window_returns) if len(window_returns) >= 2 else None,
-                max_drawdown=max_drawdown(window),
-                cumulative_return=float(equity / equity_curve[0] - 1.0),
-                benchmark_equity=(
-                    float(benchmark_curve[i])
-                    if benchmark_curve is not None and i < len(benchmark_curve)
-                    else None
-                ),
+                day,
+                equity,
+                rolling_sharpe_30d=sharpe_ratio(recent) if len(recent) == window else None,
+                max_drawdown=max_drawdown(equity_curve[: i + 1]),
+                cumulative_return=cumulative,
+                benchmark_equity=benchmark,
             )
+            previous = {"date": day, "equity_value": equity, "cumulative_return": cumulative,
+                        "benchmark_equity": benchmark}
 
     def _trigger_retrain(
         self,
@@ -328,7 +409,37 @@ class CTOrchestrator:
         ("analysis" from measurement scripts that force a retrain) —
         recorded on the candidate's `model_run` row with the Sharpe and VIX
         the decision was made on, so autonomous retrains are queryable
-        (NFR-07)."""
+        (NFR-07).
+
+        FR-23: while an operator has paused retraining, nothing is trained,
+        whichever path asked. The pause is checked here rather than in each
+        caller so that no path (bootstrap, decay, a script's forced retrain)
+        can get around it. It is a deferral, like the VIX one: the next
+        evaluation after the pause is lifted decides afresh."""
+        controls = self.inference_service.controls
+        if controls.is_on("pause_retraining"):
+            pause = controls.get("pause_retraining")
+            logger.info("retrain (%s) not started: retraining is paused by %s", reason, pause["set_by"])
+            with self._lock:
+                self._last_retrain_deferred_at = datetime.now(timezone.utc)
+                if self._status != CTStatus.RETRAINING:
+                    self._status = CTStatus.SERVING
+            because = (
+                f"rolling Sharpe {fmt(rolling_sharpe)} is below the {fmt(RISK.target_sharpe_threshold)} target"
+                if reason == "ct_decay" else "no model is serving yet" if reason == "ct_bootstrap"
+                else f"a retrain was requested ({reason})"
+            )
+            emit(
+                self.repo, "retrain_deferred",
+                f"A retrain is due ({because}), but an operator has paused retraining: "
+                "the current model keeps serving",
+                source=source,
+                detail={"reason": "operator_paused", "trigger": reason,
+                        "rolling_sharpe": finite_or_none(rolling_sharpe), "vix": vix,
+                        "paused_by": pause["set_by"]},
+                version_id=self.inference_service.active_version_id,
+            )
+            return
         with self._lock:
             if self._status == CTStatus.RETRAINING:
                 return
@@ -362,10 +473,14 @@ class CTOrchestrator:
         vix: float | None = None,
         source: str = "scheduled",
     ) -> None:
-        """FR-15: runs in its own thread — `InferenceService.predict()` is
-        untouched while this executes, since it only ever reads the
-        currently-loaded agent under `InferenceService`'s own lock, and this
-        method does not touch that lock until (and unless) promotion.
+        """FR-15: runs in its own thread, and the CPU-bound training itself
+        runs in a separate *process* (`retrain_worker`, NFR-02) — a thread
+        alone kept serving available (NFR-03) but not fast, because PPO's
+        `learn()` holds the GIL: measured +71% to +107% p95 degradation with
+        in-thread training. `InferenceService.predict()` is untouched while
+        this executes; this method does not touch its lock until (and
+        unless) promotion. The FR-17 decision, `log_run` and promotion all
+        stay in this process — the child only trains and evaluates.
         """
         try:
             end = pd.Timestamp(as_of or date.today())
@@ -382,16 +497,51 @@ class CTOrchestrator:
             train_end = eval_start - pd.Timedelta(days=1)
             train_start = train_end - pd.Timedelta(days=self.retrain_train_days)
 
-            frame = self._load_normalised_frame(train_start, eval_end)
-            train_df, eval_df = partition_chronological(frame, train_start, train_end, eval_start, eval_end)
+            # Only the incumbent's replay needs data in this process; the
+            # worker loads and partitions its own copy, so the heavy lifting
+            # (normalise + train + candidate replay) all happens in the
+            # child when `train_in_subprocess` is on.
+            # 200 days is the lookback evaluate() uses: the window itself plus
+            # the z-score warm-up. Loading the two training years here too
+            # competed with requests for this interpreter (NFR-02).
+            recent_start = max(train_start, eval_start - pd.Timedelta(days=200))
+            frame = self._load_normalised_frame(recent_start, eval_end)
+            _, eval_df = partition_chronological(frame, recent_start, train_end, eval_start, eval_end)
 
-            candidate_env = TradingEnvironment(train_df, tickers=self.tickers)
-            candidate = PPOAgent(candidate_env, n_steps=self.retrain_n_steps, seed=self.retrain_seed)
-            candidate.train(total_timesteps=self.retrain_timesteps)
-
-            eval_env_candidate = TradingEnvironment(eval_df, tickers=self.tickers)
-            [candidate_result] = candidate.evaluate(eval_env_candidate, n_episodes=1)
-            candidate_sharpe = sharpe_ratio(candidate_result["returns"])
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                model_path = str(Path(tmp_dir) / "candidate.zip")
+                worker_kwargs = dict(
+                    db_url=self.repo.url,
+                    tickers=tuple(self.tickers),
+                    train_start=str(train_start.date()),
+                    train_end=str(train_end.date()),
+                    eval_start=str(pd.Timestamp(eval_start).date()),
+                    eval_end=str(pd.Timestamp(eval_end).date()),
+                    n_steps=self.retrain_n_steps,
+                    timesteps=self.retrain_timesteps,
+                    seed=self.retrain_seed,
+                    model_path=model_path,
+                )
+                if self.train_in_subprocess:
+                    # `spawn`, never `fork`: this process holds live threads,
+                    # SQLAlchemy pools and torch state. A child exception is
+                    # re-raised here, so the except below records a training
+                    # crash exactly as it did for in-thread training.
+                    ctx = multiprocessing.get_context("spawn")
+                    # Below the serving process's priority, so requests get the
+                    # CPU first (NFR-02): on a one-core server they share it.
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=1, mp_context=ctx, initializer=os.nice, initargs=(10,)
+                    ) as pool:
+                        worker_result = pool.submit(train_and_evaluate_candidate, **worker_kwargs).result()
+                    logger.info("candidate trained in child process %s", worker_result["pid"])
+                else:
+                    worker_result = train_and_evaluate_candidate(**worker_kwargs)
+                candidate = PPOAgent.load(model_path)
+                # A loaded agent has empty hyperparameters; restore the
+                # trainer's own so `log_run` records them (FR-08/NFR-07).
+                candidate.hyperparameters = worker_result["hyperparameters"]
+            candidate_sharpe = worker_result["sharpe"]
 
             incumbent = self.inference_service.get_agent()
             if incumbent is not None:
@@ -406,6 +556,12 @@ class CTOrchestrator:
             )
 
             accepted = candidate_sharpe > incumbent_sharpe
+            # FR-23: a pause switched on while this candidate was training
+            # still stops it being promoted. It is logged as WITHHELD, not
+            # REJECTED, because the FR-17 gate didn't turn it down: an
+            # operator did, and counting it as a gate rejection would
+            # overstate the gate (the D-15 lesson).
+            withheld = accepted and self.inference_service.controls.is_on("pause_retraining")
             # Every trained candidate is logged, win or lose — FR-17's
             # "abort promotion" must still leave a record that a candidate
             # was tried and rejected, or "how many candidates were held
@@ -417,11 +573,27 @@ class CTOrchestrator:
                 eval_start,
                 eval_end,
                 {"sharpe_ratio": candidate_sharpe},
-                status="COMPLETED" if accepted else "REJECTED",
+                status="WITHHELD" if withheld else "COMPLETED" if accepted else "REJECTED",
                 trigger_reason=reason,
                 trigger_rolling_sharpe=rolling_sharpe,
                 trigger_vix=vix,
             )
+
+            if withheld:
+                logger.info("candidate beat the incumbent, but retraining is paused; promotion withheld")
+                emit(
+                    self.repo, "candidate_withheld",
+                    f"Candidate beat the current model out of sample (Sharpe {fmt(candidate_sharpe)} vs "
+                    f"{fmt(incumbent_sharpe)}), but an operator paused retraining while it trained: "
+                    "not promoted, current model kept",
+                    source=source,
+                    detail={"candidate_sharpe": finite_or_none(candidate_sharpe),
+                            "incumbent_sharpe": finite_or_none(incumbent_sharpe), "reason": reason},
+                    run_id=run_id,
+                )
+                # Not recorded as a finished FR-17 decision: once the pause is
+                # lifted, the gate gets to decide this window properly.
+                return
 
             if accepted:
                 from src.dataops.models import ModelRun

@@ -90,6 +90,8 @@ export const metrics = {
   heldBack: 1,
   autonomous: 3,
   autonomousPromoted: 2,
+  distinctCandidates: 3,
+  unlabelled: 0,
 };
 
 // ------------------------------------------------------------ paper trading

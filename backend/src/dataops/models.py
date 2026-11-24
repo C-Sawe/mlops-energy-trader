@@ -6,6 +6,9 @@ Entity-to-requirement mapping:
   model_version       -> DR-09, NFR-07
   trading_decision    -> FR-19, NFR-07, NFR-11
   portfolio_snapshot  -> FR-13, FR-18
+  operator_control    -> FR-23 (human override): the current state of each
+                         operator switch, kept in the database so a
+                         restart can't silently lift a halt
   paper_cycle / paper_order / paper_account_snapshot
                       -> CLAUDE.md §7's Alpaca deviation (forward paper
                          trading); paper_order.decision_id extends I6 to
@@ -195,6 +198,10 @@ class TradingDecision(Base):
     failsafe_triggered: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
     )
+    # What fired it (FAILSAFE_REASONS): the VIX threshold, or an operator's
+    # halt (FR-23). NULL when the fail-safe didn't fire, and on rows written
+    # before this column existed (those were all "vix", but are not guessed).
+    failsafe_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     version: Mapped[ModelVersion] = relationship(back_populates="decisions")
 
@@ -207,8 +214,42 @@ class TradingDecision(Base):
     )
 
 
+FAILSAFE_REASONS = ("vix", "operator")
+
+# FR-23: the operator's switches. Each one can only restrain the system; none
+# can make it trade, train or promote where it otherwise wouldn't.
+#   halt_trading         /predict returns capital preservation, like FR-12
+#   pause_retraining     the CT loop keeps evaluating but never trains or promotes
+#   pause_paper_trading  the daily paper cycle skips instead of placing orders
+OPERATOR_CONTROLS = ("halt_trading", "pause_retraining", "pause_paper_trading")
+
+
+class OperatorControl(Base):
+    """The current state of one operator switch (FR-23). One row per
+    control, written only through `MarketRepository.set_control`. A missing
+    row means the switch has never been used, i.e. off. The history of who
+    switched what is the `operator_override` pipeline events; this table is
+    what the running system obeys, so it survives a restart (NFR-04)."""
+
+    __tablename__ = "operator_control"
+
+    name: Mapped[str] = mapped_column(String(32), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    set_by: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    set_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "name IN (" + ", ".join(f"'{c}'" for c in OPERATOR_CONTROLS) + ")",
+            name="ck_operator_control_name",
+        ),
+    )
+
+
 class PortfolioSnapshot(Base):
-    """Daily portfolio telemetry driving FR-13 and FR-18."""
+    """Daily portfolio telemetry driving FR-13 and FR-18. Each day is written
+    once, by the first check that sees it (`CTOrchestrator._persist_snapshots`)."""
 
     __tablename__ = "portfolio_snapshot"
 
@@ -318,6 +359,8 @@ PIPELINE_EVENT_KINDS = (
     "candidate_rejected",
     "retrain_failed",
     "paper_cycle",
+    "candidate_withheld",
+    "operator_override",
 )
 EVENT_SOURCES = ("scheduled", "manual")
 

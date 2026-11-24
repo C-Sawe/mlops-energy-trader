@@ -1,10 +1,11 @@
-"""Inference service: fail-safe, action mapping, hot reload (FR-11, FR-12, FR-16).
+"""Inference service: fail-safe, action mapping, hot reload (FR-11, FR-12, FR-16, FR-23).
 
 I5: the VIX fail-safe lives here, in the serving layer — not in the agent,
 not in the model — because it must survive model promotion. A component
 that promotion replaces (the loaded PPOAgent) cannot be where a safety
 mechanism lives, or promoting a new model would silently promote away the
-fail-safe with it.
+fail-safe with it. The operator's trading halt (FR-23,
+`src/serving/oversight.py`) lives here for the same reason.
 """
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from src.dataops.processing import normalize_rolling
 from src.dataops.repository import MarketRepository
 from src.rlops.agent import PPOAgent
 from src.rlops.environment import FEATURE_COLUMNS
+from src.serving.oversight import OperatorControls
 
 # Calendar days of trailing history to fetch for one prediction. Needs to
 # comfortably clear the zscore_window (60 trading days, DR-07) plus the
@@ -40,6 +42,20 @@ class InferenceService:
         self._lock = threading.RLock()
         self._agent: PPOAgent | None = None
         self._active_version_id: str | None = None
+        # FR-23: the operator's switches, read by predict() below and by the
+        # CT orchestrator and paper trader through this service.
+        self.controls = OperatorControls(self.repo)
+        # NFR-01: (key, frame, vix) from the last _load_recent_frame. Loading
+        # and rolling-normalising 200 days of history dominated every
+        # /predict (p95 ~17-23 ms); with daily bars the result only changes
+        # when a new bar lands. The key is each ticker's newest stored date,
+        # so a new bar refreshes the cache by itself; `invalidate_cache()`
+        # covers the rare revision that rewrites values under unchanged
+        # dates (the ingestion tick's trailing-window upsert).
+        self._frame_cache: tuple[tuple, pd.DataFrame, float | None] | None = None
+        # Raised by every invalidation, so a load that began before one can't
+        # put its stale rows back afterwards (the VIX fail-safe reads them).
+        self._cache_generation = 0
         self.reload()
 
     def reload(self) -> str | None:
@@ -67,7 +83,18 @@ class InferenceService:
             )
             self._agent = PPOAgent.load(local_path)
             self._active_version_id = active["version_id"]
+            self._frame_cache = None  # belt-and-braces; data did not change
             return self._active_version_id
+
+    def invalidate_cache(self) -> None:
+        """Drop the cached feature frame. Called after an ingestion tick:
+        the tick's trailing-window upsert can revise *values* under dates
+        that already existed (late corrections, refreshed dividend
+        adjustments), which the date-tuple cache key cannot see. A new bar
+        needs no call — it changes the key on its own."""
+        with self._lock:
+            self._frame_cache = None
+            self._cache_generation += 1
 
     @property
     def active_version_id(self) -> str | None:
@@ -94,8 +121,19 @@ class InferenceService:
         if not latest_states:
             raise NoActiveModelError("no market data ingested yet")
         end = max(s["date"] for s in latest_states)
-        start = end - pd.Timedelta(days=_LOOKBACK_DAYS)
 
+        # NFR-01: the per-ticker latest-date queries above stay in the path
+        # (they are the cache key); only the heavy load + normalise is
+        # skipped while no ticker has a newer bar. Callers only read the
+        # returned frame, so sharing one DataFrame between requests is safe.
+        key = tuple(pd.Timestamp(s["date"]) for s in latest_states)
+        with self._lock:
+            if self._frame_cache is not None and self._frame_cache[0] == key:
+                _, frame, latest_vix = self._frame_cache
+                return frame, latest_vix
+            generation = self._cache_generation
+
+        start = end - pd.Timedelta(days=_LOOKBACK_DAYS)
         raw = self.repo.load_partition(start, end, tickers=self.tickers)
         frame = normalize_rolling(raw)
 
@@ -103,6 +141,9 @@ class InferenceService:
         if not frame.empty:
             latest_row = frame.sort_values("date").iloc[-1]
             latest_vix = float(latest_row["vix"]) if pd.notna(latest_row["vix"]) else None
+        with self._lock:
+            if generation == self._cache_generation:
+                self._frame_cache = (key, frame, latest_vix)
         return frame, latest_vix
 
     def _observation_from_frame(
@@ -122,7 +163,8 @@ class InferenceService:
         return np.asarray(features + position_weights + [cash_weight], dtype=np.float32)
 
     def _failsafe_decisions(self) -> list[dict]:
-        """FR-12: bypass inference entirely and return capital-preservation."""
+        """FR-12 (and FR-23's halt): bypass inference entirely and return
+        capital-preservation."""
         return [
             {"ticker": t, "raw_weight": None, "discrete_action": "LIQUIDATE"} for t in self.tickers
         ]
@@ -144,8 +186,25 @@ class InferenceService:
         on `src.serving.schemas` — the API layer adapts it, not the other
         way around.
         """
-        frame, vix = self._load_recent_frame()
-        failsafe = vix is not None and vix >= RISK.vix_critical_threshold
+        halted = self.controls.is_on("halt_trading")
+        try:
+            frame, vix = self._load_recent_frame()
+        except Exception:  # noqa: BLE001 - re-raised unless halted
+            # A halt must hold when the market data can't be read: that may
+            # be why it was switched on. It needs neither the frame nor VIX.
+            if not halted:
+                raise
+            frame, vix = None, None
+        # FR-23 before FR-12: an operator's halt and a VIX trip give the same
+        # answer, but the halt is named as the reason when both hold, since
+        # it is the decision someone actually made. Neither consults the model.
+        if halted:
+            failsafe_reason = "operator"
+        elif vix is not None and vix >= RISK.vix_critical_threshold:
+            failsafe_reason = "vix"
+        else:
+            failsafe_reason = None
+        failsafe = failsafe_reason is not None
 
         if failsafe:
             decisions = self._failsafe_decisions()
@@ -174,11 +233,13 @@ class InferenceService:
                     decision["discrete_action"],
                     vix,
                     failsafe_triggered=failsafe,
+                    failsafe_reason=failsafe_reason,
                 )
 
         return {
             "decisions": decisions,
             "failsafe_triggered": failsafe,
+            "failsafe_reason": failsafe_reason,
             "vix_at_decision": vix,
             "version_id": version_id,
             "decided_at": decided_at,
