@@ -613,7 +613,24 @@ class MarketRepository:
         (`AUTONOMOUS_TRIGGERS`), and `autonomous_promoted` those of them
         that passed the FR-17 gate. Runs logged before `trigger_reason`
         existed are NULL and counted in neither autonomous figure — they
-        are unknown, not assumed autonomous.
+        are unknown, not assumed autonomous. `unlabelled_runs` counts them.
+
+        `distinct_candidates` counts different models, not attempts. Before
+        the loop began skipping identical retrains (D-15) the same candidate
+        could be trained hundreds of times, so `total_runs` and `rejected`
+        overstate how many models were judged. Runs count as the same
+        candidate when their windows and Sharpe match: training is
+        deterministic, so an identical run reproduces both exactly.
+
+        Validated against the real September 2026 history (2026-11-10):
+        this key collapses the 1,350 CT-loop runs of 17-27 Sep to 19
+        candidates where the D-15 audit hand-counted 20 (the hand count
+        included boundary rows this window clips), and one pair of
+        adjacent-day windows shares an identical Sharpe (-16.936414) — a
+        probable true duplicate the key counts twice. Treat the figure as
+        accurate to about +/-1 on real history, not exact: a window shift
+        that crosses no new bar can still retrain a genuinely identical
+        model under a different key.
         """
         since_ts = pd.Timestamp(since)
         with self.session() as session:
@@ -646,8 +663,26 @@ class MarketRepository:
                     ModelVersion.promoted_at.is_not(None),
                 )
             ).scalar_one()
+            distinct_candidates = session.execute(
+                select(func.count()).select_from(
+                    select(
+                        ModelRun.train_start, ModelRun.train_end,
+                        ModelRun.eval_start, ModelRun.eval_end, ModelRun.sharpe_ratio,
+                    )
+                    .where(ModelRun.created_at >= since_ts)
+                    .distinct()
+                    .subquery()
+                )
+            ).scalar_one()
+            unlabelled = session.execute(
+                select(func.count())
+                .select_from(ModelRun)
+                .where(ModelRun.created_at >= since_ts, ModelRun.trigger_reason.is_(None))
+            ).scalar_one()
         return {
             "total_runs": total,
+            "distinct_candidates": distinct_candidates,
+            "unlabelled_runs": unlabelled,
             "promoted": promoted,
             "rejected": rejected,
             "autonomous_runs": autonomous,

@@ -456,6 +456,35 @@ def test_get_cycle_stats_counts_autonomous_runs_separately(repo):
     assert stats["total_runs"] == 5
     assert stats["autonomous_runs"] == 3
     assert stats["autonomous_promoted"] == 1
+    assert stats["unlabelled_runs"] == 1
+
+
+def test_get_cycle_stats_counts_repeated_runs_as_one_candidate(repo):
+    """D-15: an identical retrain is a new attempt but not a new model, so
+    it must not look like one. Different Sharpe or windows are different."""
+    def add_run(sharpe, eval_end="2023-12-31", created_at=None):
+        with repo.session() as session:
+            session.add(ModelRun(
+                train_start=pd.Timestamp("2020-01-01").date(),
+                train_end=pd.Timestamp("2022-12-31").date(),
+                eval_start=pd.Timestamp("2023-01-01").date(),
+                eval_end=pd.Timestamp(eval_end).date(),
+                sharpe_ratio=sharpe,
+                status="REJECTED",
+                created_at=created_at,
+            ))
+            session.commit()
+
+    for _ in range(4):
+        add_run(1.5)  # the same candidate, retrained four times
+    add_run(-0.7)  # same windows, another seed or settings
+    add_run(1.5, eval_end="2024-01-02")  # same Sharpe on a later window
+    add_run(9.9, created_at=pd.Timestamp("1999-01-01"))  # before the window
+
+    stats = repo.get_cycle_stats(pd.Timestamp("2000-01-01").date())
+    assert stats["total_runs"] == 6
+    assert stats["rejected"] == 6
+    assert stats["distinct_candidates"] == 3
 
 
 def test_create_schema_adds_a_column_missing_from_an_existing_table(tmp_path):

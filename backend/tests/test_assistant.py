@@ -132,7 +132,8 @@ def test_model_history_and_training_tools(seeded):
     assert version["version_id"] == ids["version_id"] and version["is_active"] and version["sharpe_ratio"] == 1.25
     training = tools.run("get_training_activity", {"days": 3650})
     assert training.visual["stats"]["total_runs"] == 1
-    assert "not distinct models" in training.result["note"]  # D-15 stated, not hidden
+    assert "attempts, not models" in training.result["note"]  # D-15 stated, not hidden
+    assert training.result["distinct_candidates"] == 1
 
 
 def test_market_tool_draws_stored_candles_and_rejects_other_tickers(seeded):

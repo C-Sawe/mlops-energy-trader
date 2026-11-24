@@ -260,7 +260,8 @@ class PipelineTools:
         keys = ["status", "active_model_label", "active_version_id", "rolling_sharpe", "target_sharpe_threshold",
                 "current_vix", "vix_critical_threshold", "last_ingest_date", "next_ingestion_at",
                 "last_evaluated_at", "cycle_window_days", "training_runs", "promoted_count", "rejected_count",
-                "autonomous_retrains", "autonomous_promoted", "last_retrain_failed_at", "last_retrain_deferred_at"]
+                "autonomous_retrains", "autonomous_promoted", "distinct_candidates", "unlabelled_runs",
+                "last_retrain_failed_at", "last_retrain_deferred_at"]
         result = {k: s.get(k) for k in keys}
         return ToolOutcome(result, {"type": "status", "status": result})
 
@@ -345,9 +346,9 @@ class PipelineTools:
         days = _int_arg(args, "days", 90, 1, 365)
         stats = self.repo.get_cycle_stats(date.today() - timedelta(days=days))
         result = {"days": days, **stats,
-                  "note": "Retrains re-fire every few minutes while the model stays below target, so one "
-                          "candidate can be retrained and rejected many times on unchanged data; counts are "
-                          "runs, not distinct models."}
+                  "note": "Older runs can repeat one candidate many times on unchanged data, so run and "
+                          "rejection counts are attempts, not models; distinct_candidates counts models. "
+                          "unlabelled_runs have no recorded trigger: who started them is unknown."}
         return ToolOutcome(result, {"type": "training", "days": days, "stats": stats})
 
     def _get_market_prices(self, args: dict) -> ToolOutcome:
@@ -411,8 +412,8 @@ window. The candidate replaces the current model only if it scores higher.
 - If VIX is at or above {RISK.vix_critical_threshold}, a fail-safe outside the model forces LIQUIDATE (go to \
 cash), and retraining is deferred until volatility falls.
 - Every decision traces to the model version that made it, the training run, and that run's data windows.
-- While a model stays below target the loop retrains every few minutes on unchanged data, so most training \
-runs repeat the same candidate. Never present run, rejection or promotion counts as evidence the gate is strict.
+- The loop used to retrain every few minutes on unchanged data, so most older training runs repeat the same \
+candidate; it now waits for a new bar. Never present run, rejection or promotion counts as evidence the gate is strict.
 - Everything is simulated (optionally mirrored to a paper-trading account): no real money. The thesis claims \
 the architecture works, not that the strategy is profitable; the project's own evaluation found no strategy \
 that reliably beats simply holding the stocks after correcting for the number of models tried.

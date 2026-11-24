@@ -201,6 +201,17 @@ describe("adaptMetrics", () => {
   it("leaves the autonomous count unknown for a backend that does not report it", () => {
     const metrics = adaptMetrics({ training_runs: 12 }, { lastMaxDrawdown: null });
     expect(metrics.autonomous).toBeNull();
+    expect(metrics.distinctCandidates).toBeNull();
+    expect(metrics.unlabelled).toBeNull();
+  });
+
+  it("passes through different candidates and unlabelled runs, keeping a real zero", () => {
+    const metrics = adaptMetrics(
+      { training_runs: 12, distinct_candidates: 4, unlabelled_runs: 0 },
+      { lastMaxDrawdown: null }
+    );
+    expect(metrics.distinctCandidates).toBe(4);
+    expect(metrics.unlabelled).toBe(0);
   });
 
   it("null-guards when no snapshot has ever been recorded", () => {
