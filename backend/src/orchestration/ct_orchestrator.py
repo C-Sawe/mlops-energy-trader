@@ -18,6 +18,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import multiprocessing
+import os
 import tempfile
 import threading
 from datetime import date, datetime, timezone
@@ -500,8 +501,12 @@ class CTOrchestrator:
             # worker loads and partitions its own copy, so the heavy lifting
             # (normalise + train + candidate replay) all happens in the
             # child when `train_in_subprocess` is on.
-            frame = self._load_normalised_frame(train_start, eval_end)
-            _train_df, eval_df = partition_chronological(frame, train_start, train_end, eval_start, eval_end)
+            # 200 days is the lookback evaluate() uses: the window itself plus
+            # the z-score warm-up. Loading the two training years here too
+            # competed with requests for this interpreter (NFR-02).
+            recent_start = max(train_start, eval_start - pd.Timedelta(days=200))
+            frame = self._load_normalised_frame(recent_start, eval_end)
+            _, eval_df = partition_chronological(frame, recent_start, train_end, eval_start, eval_end)
 
             with tempfile.TemporaryDirectory() as tmp_dir:
                 model_path = str(Path(tmp_dir) / "candidate.zip")
@@ -523,7 +528,11 @@ class CTOrchestrator:
                     # re-raised here, so the except below records a training
                     # crash exactly as it did for in-thread training.
                     ctx = multiprocessing.get_context("spawn")
-                    with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+                    # Below the serving process's priority, so requests get the
+                    # CPU first (NFR-02): on a one-core server they share it.
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=1, mp_context=ctx, initializer=os.nice, initargs=(10,)
+                    ) as pool:
                         worker_result = pool.submit(train_and_evaluate_candidate, **worker_kwargs).result()
                     logger.info("candidate trained in child process %s", worker_result["pid"])
                 else:

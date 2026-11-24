@@ -314,6 +314,34 @@ def test_retrain_survives_a_genuine_crash_and_leaves_incumbent_active(tmp_path, 
 
 
 # --------------------------------------------------------------- NFR-02 (out-of-process training)
+def test_candidate_and_incumbent_are_judged_on_identical_rows(tmp_path, monkeypatch):
+    """The serving process loads only the rows it needs (NFR-02) while the
+    worker loads two years; the gate is only fair if both give the same
+    normalised evaluation rows."""
+    repo, as_of = _seed_repo(tmp_path, n_days=900)
+    _promote_initial_model(repo, tmp_path, monkeypatch, as_of)
+    service = InferenceService(repo=repo)
+    registry = ModelRegistry(tracking_uri=f"sqlite:///{tmp_path / 'mlruns.db'}", repo=repo)
+    orchestrator = CTOrchestrator(service, repo=repo, registry=registry, retrain_train_days=730,
+                                  retrain_timesteps=64, retrain_n_steps=64, train_in_subprocess=False)
+    seen = []
+    real = PPOAgent.evaluate
+
+    def spy(self, env, *args, **kwargs):
+        seen.append((env._features.copy(), env._prices.copy(), list(env._dates)))
+        return real(self, env, *args, **kwargs)
+
+    monkeypatch.setattr(PPOAgent, "evaluate", spy)
+    orchestrator._trigger_retrain(as_of, "analysis")
+    _join_retrain(orchestrator)
+    assert orchestrator.last_retrain_failed_at is None, orchestrator.last_retrain_error
+
+    (cand, cand_prices, cand_dates), (inc, inc_prices, inc_dates) = seen
+    assert cand_dates == inc_dates and len(cand_dates) == RISK.sharpe_evaluation_window + 1
+    np.testing.assert_allclose(inc, cand, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(inc_prices, cand_prices)
+
+
 def test_retrain_worker_trains_in_a_genuinely_separate_process(tmp_path, monkeypatch):
     """NFR-02's fix is only real if training leaves this process: run the
     worker under the same spawn executor production uses and prove the work
